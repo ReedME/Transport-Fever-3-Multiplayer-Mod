@@ -69,7 +69,10 @@ preserved before recovery rewrites or snapshot cleanup; a startup preflight
 checks every room log first and refuses unidentified/damaged first records too.
 The CLI checks before writing a certificate or invite key. Byte-preservation
 fixtures cover mixed versions, quarantined logs, compaction files and damaged
-headers; an actual CLI refusal fixture covers identity files. No migration is
+headers; an actual CLI refusal fixture covers identity files. For an open
+Windows store, the empty lock sentinel is proved by exact zero length because
+the active byte lock prohibits reading it; all saved payloads remain
+byte-compared. No migration is
 implemented. Keep old binaries, secret, logs and
 snapshots together and use fresh fork rooms/data directories. This candidate
 has not passed a migration of running upstream sessions.

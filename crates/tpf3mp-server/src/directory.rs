@@ -573,10 +573,17 @@ mod tests {
                 if path.is_dir() {
                     read(&path, root, files);
                 } else {
-                    files.insert(
-                        path.strip_prefix(root).unwrap().to_owned(),
-                        fs::read(&path).unwrap(),
-                    );
+                    let relative = path.strip_prefix(root).unwrap();
+                    let bytes = if relative == Path::new("lock") {
+                        // The store's root lock is an empty sentinel. Windows
+                        // prohibits reading it while this process holds its
+                        // byte lock, so prove its empty contents by length.
+                        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+                        Vec::new()
+                    } else {
+                        fs::read(&path).unwrap()
+                    };
+                    files.insert(relative.to_owned(), bytes);
                 }
             }
         }
