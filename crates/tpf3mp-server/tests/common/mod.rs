@@ -308,6 +308,13 @@ impl Player {
         &self.test.client
     }
 
+    pub fn world_epoch(&self) -> u64 {
+        self.follower
+            .as_ref()
+            .expect("following a stream")
+            .world_epoch()
+    }
+
     /// Handles events until `done` holds.
     pub async fn play_until(&mut self, mut done: impl FnMut(&Player) -> bool) {
         tokio::time::timeout(WAIT, async {
@@ -341,7 +348,16 @@ impl Player {
                 self.start = Some(start);
                 if self.reports_progress {
                     // Loaded (or resumed) at the executed step.
-                    let _ = self.test.client.report_progress(self.executed).await;
+                    let _ = self
+                        .test
+                        .client
+                        .report_loaded(self.world_epoch(), self.executed)
+                        .await;
+                    let _ = self
+                        .test
+                        .client
+                        .report_progress(self.world_epoch(), self.executed)
+                        .await;
                 }
             }
             ClientEvent::Turn(turn) => {
@@ -386,10 +402,18 @@ impl Player {
             }
         }
         for (step, lanes) in checkpoints {
-            let _ = self.test.client.report_checkpoint(step, lanes).await;
+            let _ = self
+                .test
+                .client
+                .report_checkpoint(follower.world_epoch(), step, lanes)
+                .await;
         }
         if self.reports_progress {
-            let _ = self.test.client.report_progress(self.executed).await;
+            let _ = self
+                .test
+                .client
+                .report_progress(follower.world_epoch(), self.executed)
+                .await;
         }
     }
 }

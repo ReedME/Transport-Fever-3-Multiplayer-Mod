@@ -486,11 +486,13 @@ function data()
 			-- every game (tpf3mp/registry.lua), or at the first update since
 			-- the registry gained a kind.
 			local saved = state and state.get and state:get()
+			local status = l:room() and l:status()
+			local roomId = status and status.room_id
+			local bindRoom = l:room() and companies.roomNeedsBind(type(saved) == "table" and saved.companies, roomId)
 			local begin = l:room() and (type(saved) ~= "table" or registry.incomplete(saved.registry))
 			local quitTutorial = l:room() and tutorialActive()
-			-- A month begun since the companies' loans were last charged.
-			local month = companies.monthNow(api)
-			local monthly = l:room() and type(saved) == "table" and companies.due(saved.companies, month)
+			-- Each loan's own interval since borrowing or its last payment.
+			local loanPayments = l:room() and type(saved) == "table" and companies.loansDue(saved.companies, api)
 			-- Founded companies keep their own offers: initialize old rosters
 			-- once and refresh each independent cooldown when it expires.
 			local loanInit = l:room() and type(saved) == "table"
@@ -507,13 +509,13 @@ function data()
 			local subsidies = l:room() and type(saved) == "table" and companies.subsidiesDue(saved.companies, day)
 			-- The entities the hook's edge watch reads in this update.
 			local watch = l:edgewatch()
-			if not actions and not checkpoint and not begin and not monthly and not sample and not subsidies
+			if not actions and not checkpoint and not begin and not bindRoom and not loanPayments and not sample and not subsidies
 				and not loanInit and not loanRefresh and not quitTutorial
 				and not watch and not scanStep then
 				return nil
 			end
 			return { actions = actions, origins = origins, seals = seals, checkpoint = checkpoint, scanStep = scanStep,
-				begin = begin, monthly = monthly and month or nil, sample = sample and quarter or nil,
+				begin = begin, bindRoom = bindRoom and roomId or nil, loanPayments = loanPayments, sample = sample and quarter or nil,
 				subsidies = subsidies and day or nil, loanInit = loanInit, loanRefresh = loanRefresh, watch = watch,
 				quitTutorial = quitTutorial }
 		end,
@@ -533,13 +535,21 @@ function data()
 					l:log("tutorial: Quit Tutorial cleanup failed: " .. tutorialError)
 				end
 			end
-			if work.actions or work.begin or work.monthly or work.sample or work.loanInit or work.loanRefresh then
+			if work.actions or work.begin or work.bindRoom or work.loanPayments or work.sample or work.loanInit or work.loanRefresh then
 				local saved = state:get()
 				if type(saved) ~= "table" then saved = {} end
 				local reg, _, failed = registry.sync(saved.registry)
 				-- The room's companies: begun at its first update, as the
 				-- registry, the same in every game (tpf3mp/companies.lua).
 				local roster = companies.ensure(saved.companies, api)
+				if work.bindRoom then
+					local cleared = companies.bindRoom(roster, work.bindRoom)
+					if cleared and cleared > 0 then l:log("companies: " .. companies.passwordNotice(roster)) end
+				end
+				local migrated = companies.migrateLoans(roster, api)
+				if migrated > 0 then
+					l:log("loans: migrated " .. migrated .. " saved annuity loan(s); outstanding principal kept, next payment after a full interval")
+				end
 				if work.loanInit then
 					local ok, why = pcall(companies.ensureLoanOffers, roster, api)
 					if not ok then l:log("the companies' loan offers were not initialized: " .. tostring(why)) end
@@ -629,8 +639,8 @@ function data()
 				if lastBuild then
 					l:note(modbuild.NOTE, modbuild.noted(l:note(modbuild.NOTE), lastBuild == "mine"))
 				end
-				if work.monthly then
-					local ok, why = pcall(companies.chargeMonths, roster, work.monthly, apply.send, api)
+				if work.loanPayments then
+					local ok, why = pcall(companies.chargeLoans, roster, apply.send, api)
 					if not ok then l:log("the companies' loans were not charged: " .. tostring(why)) end
 				end
 				if work.loanRefresh then

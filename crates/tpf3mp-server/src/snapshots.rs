@@ -286,8 +286,8 @@ pub(crate) struct Saves {
     pub(crate) previous: Option<Agreed>,
     /// When the last save was sealed.
     pub(crate) last_save: Option<Instant>,
-    /// Where the last save was sealed, to skip saving a world that has not
-    /// changed.
+    /// Where the last attempted save was sealed. Only `current` suppresses
+    /// another save of an unchanged world, so failed attempts can retry.
     pub(crate) last_point: Option<SavePoint>,
     /// Someone needs a world the current snapshot cannot give.
     pub(crate) wanted: bool,
@@ -310,10 +310,12 @@ impl Saves {
         if !self.rounds.is_empty() || self.upload.is_some() {
             return false;
         }
-        let changed = self.current.is_none()
-            || self.last_point.is_none_or(|point| {
-                sealed_through > point.sealed_through || next_event > point.event + 1
-            });
+        // Only a successfully agreed world suppresses another attempt.
+        // Failed attempts still observe last_save's minimum retry gap.
+        let changed = self.current.as_ref().is_none_or(|agreed| {
+            let point = agreed.point;
+            sealed_through > point.sealed_through || next_event > point.event.saturating_add(1)
+        });
         if !changed {
             return false;
         }
@@ -419,7 +421,13 @@ impl Pointer {
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        fs::rename(&partial, &path)
+        fs::rename(&partial, &path)?;
+        // A synced file alone does not make the rename survive a power cut
+        // on Unix. Keep the old world's hold until the directory entry is
+        // durable too. Windows does not offer File::open on a directory.
+        #[cfg(unix)]
+        File::open(dir)?.sync_all()?;
+        Ok(())
     }
 
     /// Reads a room's pointer, if it has a readable one.
@@ -442,6 +450,43 @@ impl Pointer {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => warn!(path = %path.display(), %error, "cannot remove a snapshot pointer"),
         }
+    }
+}
+
+/// One room's serialized pointer commits. Obsolete blocking jobs cannot
+/// overwrite the latest request, and dropped slot holds remain until that
+/// request is durable. A failed write therefore preserves the old pointer's
+/// world rather than collecting the only restartable snapshot.
+#[derive(Default)]
+pub(crate) struct PointerWrites {
+    latest: Option<Pointer>,
+    releases: Vec<ManifestId>,
+}
+
+impl PointerWrites {
+    pub(crate) fn request(&mut self, pointer: Pointer, releases: Vec<ManifestId>) {
+        self.latest = Some(pointer);
+        self.releases.extend(releases);
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        pointer: Pointer,
+        dir: Option<&Path>,
+        room: &RoomId,
+    ) -> io::Result<Vec<ManifestId>> {
+        if self.latest != Some(pointer) {
+            return Ok(Vec::new());
+        }
+        if let Some(dir) = dir {
+            pointer.write(dir, room)?;
+        }
+        Ok(std::mem::take(&mut self.releases))
+    }
+
+    pub(crate) fn cancel(&mut self) -> Vec<ManifestId> {
+        self.latest = None;
+        std::mem::take(&mut self.releases)
     }
 }
 
@@ -496,6 +541,50 @@ mod tests {
         assert_eq!(order, [1, 3]);
         assert_eq!(diverged.len(), 1);
         assert_eq!(diverged[0].0, PlayerId(FixedBytes([2; 32])));
+    }
+
+    #[test]
+    fn cyclic_lane_majorities_cannot_supply_a_complete_snapshot() {
+        // Each lane has a strict majority of 1, but every real save differs
+        // in one lane. Voting cannot manufacture the missing complete world.
+        let mut reports = [
+            save(1, 1, Some(1)),
+            save(2, 1, Some(2)),
+            save(3, 1, Some(3)),
+        ];
+        for (report, values) in reports.iter_mut().zip([[0, 1, 1], [1, 0, 1], [1, 1, 0]]) {
+            report.report.lanes = values
+                .into_iter()
+                .enumerate()
+                .map(|(lane, value)| LaneDigest {
+                    lane: u16::try_from(lane).unwrap(),
+                    digest: FixedBytes([value; 32]),
+                })
+                .collect();
+        }
+        let judged: Vec<Report> = reports.iter().map(|save| save.report.clone()).collect();
+        let (verdict, _) = verdict::decide(&judged);
+        assert_eq!(
+            verdict.values().copied().collect::<Vec<_>>(),
+            [FixedBytes([1; 32]); 3]
+        );
+        assert!(
+            reports.iter().all(|save| save.world.is_some()),
+            "all players saved successfully"
+        );
+        let (candidates, diverged) = decide(&reports);
+        assert!(
+            candidates.is_empty(),
+            "no real snapshot matches the combined verdict; promote none"
+        );
+        assert_eq!(
+            diverged,
+            vec![
+                (PlayerId(FixedBytes([1; 32])), vec![0]),
+                (PlayerId(FixedBytes([2; 32])), vec![1]),
+                (PlayerId(FixedBytes([3; 32])), vec![2]),
+            ]
+        );
     }
 
     #[test]
@@ -624,6 +713,99 @@ mod tests {
             !saves.failed.contains(&player(0)),
             "the oldest are forgotten"
         );
+    }
+
+    #[test]
+    fn failed_demanded_paused_save_retries_after_the_gap_until_agreed() {
+        let start = Instant::now();
+        let old = point();
+        let attempted = SavePoint {
+            event: 15,
+            sealed_through: 30,
+            ..old
+        };
+        let mut saves = Saves {
+            current: Some(Agreed {
+                manifest: Arc::new(
+                    Manifest::compute(&[1u8; 10][..], tpf3mp_snapshot::ChunkParams::DEFAULT)
+                        .unwrap(),
+                ),
+                point: old,
+            }),
+            last_point: Some(attempted),
+            last_save: Some(start),
+            wanted: true,
+            ..Saves::default()
+        };
+        let due = |saves: &Saves, secs| {
+            saves.due(
+                start + Duration::from_secs(secs),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+                start,
+                (30, 16),
+            )
+        };
+        assert!(!due(&saves, 59));
+        assert!(
+            due(&saves, 60),
+            "failed attempt must not suppress a demanded retry while paused"
+        );
+        saves.current.as_mut().unwrap().point = attempted;
+        assert!(
+            !due(&saves, 600),
+            "a successfully agreed unchanged world needs no retry"
+        );
+    }
+
+    #[test]
+    fn reversed_pointer_jobs_preserve_the_latest_frontier_and_defer_release_until_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId(FixedBytes([1; 16]));
+        let old = Pointer::new(SnapshotId(FixedBytes([1; 32])), point());
+        let new = Pointer::new(
+            SnapshotId(FixedBytes([2; 32])),
+            SavePoint {
+                event: 20,
+                after_turn: 10,
+                sealed_through: 40,
+                ..point()
+            },
+        );
+        let released = bulk::manifest_id(&old.snapshot);
+        let writes = Arc::new(Mutex::new(PointerWrites::default()));
+        writes.lock().unwrap().request(old, vec![released]);
+        let (run, wait) = std::sync::mpsc::channel();
+        let old_writes = Arc::clone(&writes);
+        let old_dir = dir.path().to_owned();
+        let old_job = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            old_writes
+                .lock()
+                .unwrap()
+                .commit(old, Some(&old_dir), &room)
+                .unwrap()
+        });
+        let mut state = writes.lock().unwrap();
+        state.request(new, Vec::new());
+        assert!(
+            state
+                .commit(new, Some(&dir.path().join("missing")), &room)
+                .is_err()
+        );
+        assert_eq!(
+            state.releases,
+            [released],
+            "failed persistence keeps the previous world held"
+        );
+        assert_eq!(
+            state.commit(new, Some(dir.path()), &room).unwrap(),
+            [released]
+        );
+        drop(state);
+        run.send(()).unwrap();
+        assert!(old_job.join().unwrap().is_empty());
+        assert_eq!(Pointer::read(dir.path(), &room), Some(new));
     }
 
     #[test]

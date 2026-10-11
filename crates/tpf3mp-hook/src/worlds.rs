@@ -306,6 +306,10 @@ impl GameControl for GuiWorlds {
         lua::set_me(player);
     }
 
+    fn set_room(&mut self, room: tpf3mp_proto::RoomId) {
+        lua::set_room(room);
+    }
+
     fn set_mods(&mut self, mods: Option<tpf3mp_bridge::ModLists>) {
         lua::set_mods(mods);
     }

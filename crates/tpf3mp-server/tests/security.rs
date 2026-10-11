@@ -481,7 +481,10 @@ async fn divergences_reported_to_cat(attack: bool) -> Vec<(u64, Vec<u16>)> {
             // opens a fresh round that no other member will ever complete,
             // until MAX_OPEN_ROUNDS (64) is reached.
             for step in (1..=72).map(|k| k * 10) {
-                let _ = mallory.client().report_checkpoint(step, lanes(1)).await;
+                let _ = mallory
+                    .client()
+                    .report_checkpoint(mallory.world_epoch(), step, lanes(1))
+                    .await;
             }
         }
     }

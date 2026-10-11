@@ -129,7 +129,7 @@ use std::{
 
 use tpf3mp_bridge::{ModLists, Notice, Plan, RoomInfo};
 use tpf3mp_proto::{
-    ChatText, MAX_PREVIEW, Payload, PlayerId, Seal, Secret, Text,
+    ChatText, MAX_PREVIEW, Payload, PlayerId, RoomId, Seal, Secret, Text,
     action::{Action, CompanyOp},
     lua::{LuaValue, MAX_DEPTH, MAX_NODES, action_from_lua, action_to_lua},
 };
@@ -365,6 +365,8 @@ struct Shared {
 /// What the Multiplayer window shows of the room: `status()` and `chat()`.
 struct RoomStatus {
     info: Option<RoomInfo>,
+    /// The server's stable room ID, not its display name or invite.
+    id: Option<RoomId>,
     /// The local player.
     me: Option<PlayerId>,
     /// The room's speed, in percent.
@@ -414,6 +416,7 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     started: None,
     room: RoomStatus {
         info: None,
+        id: None,
         me: None,
         speed: None,
         diverged: None,
@@ -1418,6 +1421,7 @@ pub fn notice(notice: &Notice) {
         }
         Notice::Ended(_) => {
             room.info = None;
+            room.id = None;
             room.diverged = None;
             crate::previews::clear();
         }
@@ -1589,6 +1593,11 @@ unsafe extern "C-unwind" fn native_previews(l: State) -> c_int {
 /// The local player, as the room's `Begin` names it.
 pub fn set_me(player: PlayerId) {
     shared().room.me = Some(player);
+}
+
+/// The room identity from Begin, kept across world replacements.
+pub fn set_room(room: RoomId) {
+    shared().room.id = Some(room);
 }
 
 /// The mods the room's worlds load with, as the room's `Begin` gives them:
@@ -1852,6 +1861,12 @@ fn room_status() -> Option<LuaValue> {
         ),
         (LuaValue::string("players"), players),
     ];
+    if let Some(id) = room.id {
+        fields.push((
+            LuaValue::string("room_id"),
+            LuaValue::string(&id.to_string()),
+        ));
+    }
     if let Some(invite) = invite {
         fields.push((LuaValue::string("invite"), LuaValue::string(&invite)));
     }
@@ -2787,7 +2802,7 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// The tests share the link's statics: one at a time.
+    /// Tests of the Lua link, seeds and driver share process-wide state.
     pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
 
     // Lua 5.1's C API, as the link calls Lua 5.2's.
@@ -3039,6 +3054,7 @@ pub(crate) mod tests {
         shared.request = None;
         shared.room = RoomStatus {
             info: None,
+            id: None,
             me: None,
             speed: None,
             diverged: None,
@@ -3740,6 +3756,7 @@ my_timetables";
             "nothing before the room's game"
         );
         set_me(player(2));
+        set_room(RoomId(tpf3mp_proto::FixedBytes([7; 16])));
         notice(&Notice::Room(RoomInfo {
             name: Text::new("Sunday line").unwrap(),
             owner: player(1),
@@ -3764,6 +3781,10 @@ my_timetables";
             .unwrap(),
         }));
         notice(&Notice::Speed(Speed(200)));
+        assert_eq!(
+            lua.run("return tpf3mp_native.status().room_id"),
+            Ok("r-07070707070707070707070707070707".into())
+        );
         notice(&Notice::Chat {
             from: Text::new("Julian").unwrap(),
             text: Text::new("the bus is late").unwrap(),
@@ -3792,6 +3813,11 @@ my_timetables";
         assert_eq!(
             lua.run("return tostring(tpf3mp_native.status().diverged)"),
             Ok("nil".into())
+        );
+        assert_eq!(
+            lua.run("return tpf3mp_native.status().room_id"),
+            Ok("r-07070707070707070707070707070707".into()),
+            "a same-room world replacement retains its stable identity"
         );
         notice(&Notice::Chat {
             from: Text::new("Sam").unwrap(),

@@ -51,6 +51,7 @@ pub enum Gated {
     Load {
         file: Option<Text<MAX_PATH>>,
         next_step: u64,
+        world_epoch: u64,
     },
     /// Show a chat message.
     Chat { from: Text<32>, text: ChatText },
@@ -193,9 +194,17 @@ impl Gate {
                 self.ended = true;
                 Ok(Gated::Ended(reason))
             }
-            ToHook::Load { file, next_step } => {
+            ToHook::Load {
+                file,
+                next_step,
+                world_epoch,
+            } => {
                 self.loading = true;
-                Ok(Gated::Load { file, next_step })
+                Ok(Gated::Load {
+                    file,
+                    next_step,
+                    world_epoch,
+                })
             }
             ToHook::Chat { from, text } => Ok(Gated::Chat { from, text }),
             ToHook::Room(room) => Ok(Gated::Room(room)),
@@ -334,10 +343,12 @@ mod tests {
         let file = Text::new("saves/save-40.sav").unwrap();
         assert_eq!(
             gate.on_message(ToHook::Load {
+                world_epoch: 1,
                 file: Some(file.clone()),
                 next_step: 300
             }),
             Ok(Gated::Load {
+                world_epoch: 1,
                 file: Some(file),
                 next_step: 300
             })
@@ -372,6 +383,7 @@ mod tests {
             })
         );
         gate.on_message(ToHook::Load {
+            world_epoch: 1,
             file: None,
             next_step: 1,
         })

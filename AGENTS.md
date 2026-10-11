@@ -1,4 +1,11 @@
-# Working on TPF3-MP
+# Working on the ReedME TPF3-MP fork
+
+This repository is ReedME's fork. ReedME is its owner; upstream decisions
+and contributor attribution below remain historical context. The user
+authorized implementing the 2026-10-11 review, including the scoped Proton
+installer exception recorded in `docs/DECISIONS.md`. Build and test changes
+on a feature branch and keep native game verification and signed releases
+as separate gates. Do not deploy to or configure the upstream project.
 
 How changes are made and released, for people and coding agents alike. Read
 this before changing anything. [README.md](README.md) says what the project
@@ -162,7 +169,7 @@ starting any task, check it against that page and
   Part 3).
 - **Keep the plan current.** Tick an item in the change that finishes it.
   A new decision goes into DECISIONS.md first, then the plan follows.
-- **Decisions are the owner's.** Only the owner (Juliansgith) makes or
+- **Decisions are the owner's.** Only this fork's owner (ReedME) makes or
   changes a decision, or settles a question the plan leaves open for
   them. Propose one in a pull request into `dev`: GitHub asks the owner
   to approve any change to `docs/DECISIONS.md` or `docs/PLAN.md`

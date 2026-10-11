@@ -1,0 +1,163 @@
+{
+  "recorded_utc": "2026-10-11T01:51:45.077622+00:00",
+  "repository": "ReedME/Transport-Fever-3-Multiplayer-Mod",
+  "baseline_commit": "538733611cc5e4c8ea30d48513d5b0df761db05a",
+  "candidate_branch": "codex/proton-competitive-fixes",
+  "candidate_version": "1.3.2-reedme.1",
+  "code_tree_sha256": "146fd6b1cfe88c32f2069b6b30bdf12543682b59dc4f6a792299afe1172f17f2",
+  "code_tree_scope": "sorted tracked and task-untracked files under crates/mod/profiles/tools/.github/deploy plus root Cargo/toolchain files; path+NUL+raw file SHA256",
+  "protocol": 20,
+  "bridge": 29,
+  "persisted_format": 9,
+  "findings": {
+    "R01": "implemented_with_focused_regression",
+    "R02": "implemented_with_focused_regression",
+    "R03": "implemented_with_focused_regression",
+    "R04": "implemented_with_focused_regression",
+    "R05": "implemented_with_focused_regression",
+    "R06": "implemented_with_focused_regression",
+    "R07": "implemented_with_focused_regression",
+    "R08": "implemented_with_focused_regression"
+  },
+  "local_checks": {
+    "fmt": "passed",
+    "git_diff_check": "passed",
+    "linux_workspace_all_targets_clippy": "passed",
+    "windows_gnu_workspace_all_targets_clippy": "passed",
+    "workspace_tests": {
+      "passed": 1727,
+      "failed": 0,
+      "ignored": 9
+    },
+    "optimized_build": "passed",
+    "tpfre_checks": {
+      "passed": 49,
+      "ignored": 1
+    },
+    "python_tools": "passed",
+    "unix_installer": "passed",
+    "launcher_page_syntax": "passed",
+    "regression_model": {
+      "passed_runs": 39,
+      "failed_runs": 0,
+      "repeat": 3,
+      "replicas": 3,
+      "speed": 800,
+      "parallel": 2
+    },
+    "load_cases": [
+      {
+        "scenario": "paced",
+        "arguments": [
+          "--rooms",
+          "10",
+          "--bots",
+          "8",
+          "--steps",
+          "1500",
+          "--paced"
+        ],
+        "exit_code": 0,
+        "passed": true
+      },
+      {
+        "scenario": "bad-network",
+        "arguments": [
+          "--rooms",
+          "4",
+          "--bots",
+          "4",
+          "--steps",
+          "1000",
+          "--paced",
+          "--latency-ms",
+          "60",
+          "--jitter-ms",
+          "20",
+          "--loss-percent",
+          "2"
+        ],
+        "exit_code": 0,
+        "passed": true
+      },
+      {
+        "scenario": "tunnel",
+        "arguments": [
+          "--rooms",
+          "4",
+          "--bots",
+          "4",
+          "--steps",
+          "1000",
+          "--paced",
+          "--tunneled"
+        ],
+        "exit_code": 0,
+        "passed": true
+      },
+      {
+        "scenario": "compaction",
+        "arguments": [
+          "--rooms",
+          "8",
+          "--bots",
+          "4",
+          "--steps",
+          "1500",
+          "--data-dir",
+          "target/reedme-loadtest-data",
+          "--compact-log-kib",
+          "8"
+        ],
+        "exit_code": 0,
+        "passed": true
+      }
+    ]
+  },
+  "proton_synthetic": {
+    "runtime": "experimental-11.0-20261001-x86_64",
+    "disposable_prefix": true,
+    "windows_fake_game": true,
+    "real_transport_fever_game": false,
+    "players": 2,
+    "steps_each": 1200,
+    "divergences": 0,
+    "all_final_lanes_equal": true,
+    "initial_world_loaded_by_both": true,
+    "plain_udp_fallback_observed": true,
+    "applicable_windows_installer_tests_passed": 7,
+    "binary_sha256": {
+      "target/cross-windows/x86_64-pc-windows-gnu/debug/tpf3mp-rig.exe": "b6414108cf0f2b876a2de0639533b89add4bb64c130f50e60fda3eb9a779def1",
+      "target/cross-windows/x86_64-pc-windows-gnu/debug/tpf3mp-fakegame.exe": "792cc54ac19909b5d29c2809f6507f817af3b219ca5e5da3a21c0f1b4a0606dd"
+    }
+  },
+  "github_setup": {
+    "public_fork": true,
+    "issue_tracker_enabled": true,
+    "dev_acceptance_main_protected": true,
+    "codeowner": "ReedME",
+    "protected_signing_environment_configured": true,
+    "public_update_key_configured": true,
+    "release_dispatched": false,
+    "public_server_configured": false,
+    "private_game_runner_configured": false,
+    "private_windows_archive_configured": false
+  },
+  "hosted_validation": "CI, acceptance and branch-image publication to be dispatched after this commit; current results belong to the PR/run records",
+  "real_game_runtime_verified": false,
+  "game_install_modified": false,
+  "steam_configuration_modified": false,
+  "player_release_published": false,
+  "remaining_inputs": [
+    "supported Windows 40420 executable and actual Proton prefix",
+    "genuine private Windows archives and verifier runner",
+    "operated public server/domain before player publication"
+  ],
+  "policy_limits": [
+    "trusted-friends native competition; no authoritative anti-cheat economy",
+    "room log format8 cannot migrate to9; use fresh rooms",
+    "legacy locked saves without room provenance reset seals once",
+    "composite lane verdict may require manual recovery",
+    "Windows crash durability and real engine determinism need runtime acceptance"
+  ]
+}

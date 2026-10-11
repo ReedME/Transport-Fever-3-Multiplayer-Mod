@@ -3,9 +3,11 @@
 //! "Snapshots" in `docs/PROTOCOL.md`.
 
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::{self, BufReader},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -31,6 +33,72 @@ pub struct Worlds {
     saves: PathBuf,
     /// Where received worlds are put together for the game to load.
     received: PathBuf,
+    retention: Arc<Mutex<Retention>>,
+    /// Serialize collectors without making metadata publication wait for GC.
+    cleanup: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Default)]
+struct Retention {
+    keep: HashSet<ManifestId>,
+    /// Completed disk work not yet published to the bridge's live set.
+    pending: HashMap<ManifestId, usize>,
+    pins: HashMap<ManifestId, usize>,
+    /// Ingest has no manifest ID until its reader is exhausted. Defer root
+    /// releases while such work runs; its pending hold is published on exit.
+    active_ingests: usize,
+}
+
+struct WorldIngest {
+    retention: Arc<Mutex<Retention>>,
+    completed: Option<ManifestId>,
+}
+
+impl Drop for WorldIngest {
+    fn drop(&mut self) {
+        let mut state = self
+            .retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(id) = self.completed {
+            *state.pending.entry(id).or_default() += 1;
+        }
+        state.active_ingests -= 1;
+    }
+}
+
+struct WorldPin {
+    retention: Arc<Mutex<Retention>>,
+    id: ManifestId,
+}
+
+/// Owns one already-counted completion hold until its result is published
+/// or dropped. A closed bridge channel cannot leak unpublished holds.
+#[derive(Debug)]
+pub(crate) struct PendingWorld {
+    worlds: Worlds,
+    id: ManifestId,
+}
+
+impl Drop for PendingWorld {
+    fn drop(&mut self) {
+        self.worlds.discard_pending(self.id);
+    }
+}
+
+impl Drop for WorldPin {
+    fn drop(&mut self) {
+        let mut state = self
+            .retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = state.pins.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                state.pins.remove(&self.id);
+            }
+        }
+    }
 }
 
 impl Worlds {
@@ -50,6 +118,8 @@ impl Worlds {
             store,
             saves,
             received,
+            retention: Arc::default(),
+            cleanup: Arc::default(),
         })
     }
 
@@ -80,6 +150,9 @@ impl Worlds {
     /// Cuts a copy of a save into the store and leaves the file alone: a
     /// player's own save, such as the one a room starts from. Blocking.
     pub fn ingest_copy(&self, file: &Path) -> io::Result<(Manifest, SavedWorld)> {
+        // Disk work never holds the bridge's publication lock. Collection
+        // defers release until this guard atomically publishes a pending hold.
+        let mut ingest = self.begin_ingest();
         let source = BufReader::new(fs::File::open(file)?);
         let manifest = self
             .store
@@ -89,13 +162,111 @@ impl Worlds {
             snapshot: bulk::snapshot_id(&manifest.id()),
             size: manifest.total_size(),
         };
+        ingest.completed = Some(manifest.id());
         Ok((manifest, world))
+    }
+
+    fn begin_ingest(&self) -> WorldIngest {
+        self.retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active_ingests += 1;
+        WorldIngest {
+            retention: Arc::clone(&self.retention),
+            completed: None,
+        }
+    }
+
+    fn pin(&self, id: ManifestId) -> WorldPin {
+        let mut state = self
+            .retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *state.pins.entry(id).or_default() += 1;
+        WorldPin {
+            retention: Arc::clone(&self.retention),
+            id,
+        }
+    }
+
+    fn retain_pending(&self, id: ManifestId) {
+        *self
+            .retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .entry(id)
+            .or_default() += 1;
+    }
+
+    pub(crate) fn discard_pending(&self, id: ManifestId) {
+        Self::consume_pending(
+            &mut self
+                .retention
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            id,
+        );
+    }
+
+    pub(crate) fn pending_result(&self, id: ManifestId) -> PendingWorld {
+        PendingWorld {
+            worlds: self.clone(),
+            id,
+        }
+    }
+
+    fn consume_pending(state: &mut Retention, id: ManifestId) {
+        if let Some(count) = state.pending.get_mut(&id) {
+            *count -= 1;
+            if *count == 0 {
+                state.pending.remove(&id);
+            }
+        }
+    }
+
+    /// Publish the latest live set synchronously, before scheduling disk work.
+    pub(crate) fn set_keep(&self, keep: &[ManifestId]) {
+        self.publish(keep, None);
+    }
+
+    pub(crate) fn publish(&self, keep: &[ManifestId], claimed: Option<ManifestId>) {
+        let mut state = self
+            .retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.keep = keep.iter().copied().collect();
+        if let Some(id) = claimed {
+            Self::consume_pending(&mut state, id);
+        }
     }
 
     /// Stops keeping snapshots other than `keep`, drops transfers that no
     /// fetch is running any more, deletes received world files other than
     /// those of `keep`, and collects unused chunks. Blocking.
     pub fn keep_only(&self, keep: &[ManifestId]) -> io::Result<()> {
+        self.set_keep(keep);
+        self.collect()
+    }
+
+    /// Every queued cleanup reads the current live set under the same lock
+    /// as publication. Pending results and active transfers retain their roots.
+    pub(crate) fn collect(&self) -> io::Result<()> {
+        let _cleanup = self.cleanup.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = self
+            .retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.active_ingests != 0 {
+            return Ok(());
+        }
+        let keep: HashSet<ManifestId> = state
+            .keep
+            .iter()
+            .chain(state.pending.keys())
+            .chain(state.pins.keys())
+            .copied()
+            .collect();
         self.store
             .abandon_idle_transfers()
             .map_err(io::Error::other)?;
@@ -111,6 +282,9 @@ impl Worlds {
                 let _ = fs::remove_file(entry.path());
             }
         }
+        // ChunkStore serializes GC against ingest/transfer/assembly itself.
+        // The expensive chunk scan must not block live-set publication.
+        drop(state);
         self.store.gc([]).map_err(io::Error::other)?;
         Ok(())
     }
@@ -143,6 +317,8 @@ pub async fn fetch_world(
     offer: WorldOffer,
     progress: impl FnMut(Progress),
 ) -> Result<(PathBuf, Manifest), BulkError> {
+    let id = bulk::manifest_id(&offer.snapshot);
+    let _pin = worlds.pin(id);
     let file = worlds.received_file(&offer.snapshot);
     let (mut send, mut recv) = opener
         .open(BulkOpen::Fetch {
@@ -159,6 +335,7 @@ pub async fn fetch_world(
         progress,
     )
     .await?;
+    worlds.retain_pending(id);
     Ok((file, manifest))
 }
 
@@ -180,6 +357,7 @@ pub async fn upload_world_with_progress(
     snapshot: SnapshotId,
     mut progress: impl FnMut(u8),
 ) -> Result<Served, BulkError> {
+    let _pin = worlds.pin(bulk::manifest_id(&snapshot));
     let store = worlds.store.clone();
     let id = bulk::manifest_id(&snapshot);
     let manifest = tokio::task::spawn_blocking(move || store.manifest(&id))
@@ -203,4 +381,108 @@ pub async fn upload_world_with_progress(
     .await;
     let _ = send.finish();
     served
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_active_ingest_defers_collection_without_locking_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let worlds = Worlds::open(dir.path(), 1 << 20).unwrap();
+        let file = worlds.saves().join("world.sav");
+        fs::write(&file, [4u8; 1000]).unwrap();
+        let mut ingest = worlds.begin_ingest();
+        let manifest = worlds
+            .store
+            .ingest(
+                BufReader::new(fs::File::open(&file).unwrap()),
+                ChunkParams::DEFAULT,
+            )
+            .unwrap();
+        worlds.publish(&[], None);
+        // The manifest exists but its result has not yet been published.
+        worlds.collect().unwrap();
+        assert!(worlds.store.manifest(&manifest.id()).is_ok());
+        ingest.completed = Some(manifest.id());
+        drop(ingest);
+        worlds.collect().unwrap();
+        assert!(worlds.store.manifest(&manifest.id()).is_ok());
+        worlds.discard_pending(manifest.id());
+        worlds.collect().unwrap();
+        assert!(worlds.store.manifest(&manifest.id()).is_err());
+    }
+
+    #[test]
+    fn delayed_cleanup_reads_the_latest_retention_and_keeps_unpublished_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let worlds = Worlds::open(dir.path(), 1 << 20).unwrap();
+        let file = worlds.saves().join("a.sav");
+        fs::write(&file, [1u8; 1000]).unwrap();
+        let (a, _) = worlds.ingest_copy(&file).unwrap();
+        worlds.publish(&[a.id()], Some(a.id()));
+        let (run, wait) = std::sync::mpsc::channel();
+        let old_worlds = worlds.clone();
+        let old_cleanup = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            old_worlds.collect().unwrap();
+        });
+        // Disk work completes after the old cleanup was queued. It has not
+        // yet reached the bridge; its pending hold protects both root and file.
+        fs::write(&file, [2u8; 1000]).unwrap();
+        let (b, saved) = worlds.ingest_copy(&file).unwrap();
+        let received = worlds.received_file(&saved.snapshot);
+        fs::write(&received, [2u8; 1000]).unwrap();
+        worlds.collect().unwrap();
+        assert!(worlds.store().manifest(&b.id()).is_ok());
+        assert!(received.exists());
+        // Publication then changes the desired set before the old job runs.
+        worlds.publish(&[b.id()], Some(b.id()));
+        worlds.collect().unwrap();
+        run.send(()).unwrap();
+        old_cleanup.join().unwrap();
+        assert_eq!(worlds.store().retained().unwrap(), [b.id()]);
+        assert!(worlds.store().missing(&b).unwrap().is_empty());
+        assert!(received.exists());
+    }
+
+    #[test]
+    fn active_world_transfer_is_pinned_until_its_guard_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let worlds = Worlds::open(dir.path(), 1 << 20).unwrap();
+        let file = worlds.saves().join("world.sav");
+        fs::write(&file, [3u8; 1000]).unwrap();
+        let (manifest, _) = worlds.ingest_copy(&file).unwrap();
+        worlds.publish(&[manifest.id()], Some(manifest.id()));
+        let pin = worlds.pin(manifest.id());
+        worlds.set_keep(&[]);
+        worlds.collect().unwrap();
+        assert!(worlds.store().missing(&manifest).unwrap().is_empty());
+        drop(pin);
+        worlds.collect().unwrap();
+        assert!(worlds.store().manifest(&manifest.id()).is_err());
+        assert!(!worlds.store().missing(&manifest).unwrap().is_empty());
+    }
+
+    #[test]
+    fn discarding_one_same_snapshot_result_does_not_release_another_pending_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let worlds = Worlds::open(dir.path(), 1 << 20).unwrap();
+        let file = worlds.saves().join("same.sav");
+        fs::write(&file, [4u8; 1000]).unwrap();
+        let (a, _) = worlds.ingest_copy(&file).unwrap();
+        let (b, _) = worlds.ingest_copy(&file).unwrap();
+        assert_eq!(a.id(), b.id());
+        worlds.discard_pending(a.id());
+        worlds.collect().unwrap();
+        assert!(worlds.store().missing(&b).unwrap().is_empty());
+        assert!(worlds.store().manifest(&b.id()).is_ok());
+        worlds.publish(&[b.id()], Some(b.id()));
+        worlds.collect().unwrap();
+        assert!(worlds.store().manifest(&b.id()).is_ok());
+        worlds.set_keep(&[]);
+        worlds.collect().unwrap();
+        assert!(worlds.store().manifest(&b.id()).is_err());
+    }
 }

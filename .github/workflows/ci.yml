@@ -106,6 +106,8 @@ jobs:
       # The Discord release announcement (announce.yml).
       - run: python tools/github/test_announce_release.py
       - run: python tools/github/test_release_server_validation.py
+      - run: python tools/github/test_verify_game_build.py
+      - run: python tools/github/test_setup_update_key.py
 
   page:
     name: launcher page

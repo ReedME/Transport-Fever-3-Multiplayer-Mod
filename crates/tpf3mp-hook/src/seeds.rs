@@ -1121,9 +1121,9 @@ mod native {
 mod tests {
     use super::*;
 
-    /// The tests that touch the process-wide roster and batch run one at a
-    /// time.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    // Seeds, the step driver and the Lua link share CURRENT_STEP: use one
+    // guard for every test that changes the process-wide step or batch.
+    use crate::lua::tests::SERIAL;
 
     #[test]
     fn the_seed_is_a_pure_function_of_step_and_salt_in_the_mt_and_minstd_range() {

@@ -1,5 +1,30 @@
 # The team's plan, from release day on
 
+## ReedME review work (2026-10-11)
+
+This fork's owner authorized the review implementation (D30). The upstream
+plan below is retained as context; this checklist tracks our validation.
+
+- [x] R01: verified Proton portable installation and game-closed checks.
+- [x] R02: producing-world report epochs and stale completion rejection.
+- [x] R03: per-loan timing without retroactive charges.
+- [x] R04: native finance accounting and facade match the game's model.
+- [x] R05: Linux Steam library paths resolved by the Windows Proton client.
+- [x] R06: cleanup cannot remove newly retained or in-flight worlds.
+- [x] R07: ordered durable snapshot pointers and recovery retention.
+- [x] R08: failed demanded saves retry while paused with backoff.
+- [x] Rehosting password policy and its save/reload regressions.
+- [x] ReedME branch protections and protected update-signing environment.
+- [x] Fork server/image/update defaults and portable private verifier tested.
+- [x] Local source checks, Windows crosscheck and synthetic room acceptance.
+- [ ] Cross-platform CI and full acceptance workflow on the pushed candidate.
+- [ ] Exact supported Windows archive and private verifier runner available.
+- [ ] Real two-player Proton competitive/recovery session.
+
+Detailed setup and outstanding environmental inputs are in `REEDME_SETUP.md`.
+
+## Upstream plan
+
 What the team works on from Transport Fever 3's release (2026-09-29), in
 order, and who takes what. It is the team's plan as agreed on 2026-09-27,
 with the review's changes worked in; each change says why. Tick an item

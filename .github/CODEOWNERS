@@ -1,7 +1,8 @@
 # The project's decisions and its plan are the owner's: a pull request
 # that changes them needs the owner's approval (dev's protection,
 # tools/github/protect-branches.sh; AGENTS.md "Before starting a task").
-/docs/DECISIONS.md @Juliansgith
-/docs/PLAN.md @Juliansgith
-/.github/CODEOWNERS @Juliansgith
-/tools/github/protect-branches.sh @Juliansgith
+/docs/DECISIONS.md @ReedME
+/docs/PLAN.md @ReedME
+/.github/CODEOWNERS @ReedME
+/tools/github/protect-branches.sh @ReedME
+/.github/workflows/ @ReedME

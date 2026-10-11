@@ -790,27 +790,39 @@ impl Client {
         self.send(GameMessage::Loading(stage)).await
     }
 
-    pub async fn report_progress(&self, step: u64) -> Result<(), ClientError> {
-        self.send(GameMessage::Progress { step }).await
+    pub async fn report_progress(&self, world_epoch: u64, step: u64) -> Result<(), ClientError> {
+        self.send(GameMessage::Progress { world_epoch, step }).await
+    }
+
+    pub async fn report_loaded(&self, world_epoch: u64, step: u64) -> Result<(), ClientError> {
+        self.send(GameMessage::Loaded { world_epoch, step }).await
     }
 
     pub async fn report_checkpoint(
         &self,
+        world_epoch: u64,
         step: u64,
         lanes: Vec<LaneDigest>,
     ) -> Result<(), ClientError> {
-        self.send(GameMessage::Checkpoint { step, lanes }).await
+        self.send(GameMessage::Checkpoint {
+            world_epoch,
+            step,
+            lanes,
+        })
+        .await
     }
 
     /// Reports the world saved at the save event `event`: its lanes, and
     /// the snapshot this client holds of it, if saving worked.
     pub async fn report_saved(
         &self,
+        world_epoch: u64,
         event: u64,
         lanes: Vec<LaneDigest>,
         world: Option<SavedWorld>,
     ) -> Result<(), ClientError> {
         self.send(GameMessage::Saved {
+            world_epoch,
             event,
             lanes,
             world,

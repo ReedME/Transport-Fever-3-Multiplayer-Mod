@@ -49,7 +49,7 @@
 --                                   -- own actions since the last call,
 --                                   -- { { ticket =, ok =, entity =, why = } }
 --     status  = function(),         -- the room, for the Multiplayer window, or
---                                   -- nil before its game: { room =, speed =,
+--                                   -- nil before its game: { room = (display), room_id = (stable), speed =,
 --                                   -- diverged =, me_id =, players = { {
 --                                   -- name =, connected =, owner =, me =,
 --                                   -- id = } } }
@@ -221,7 +221,7 @@ function Link:results()
 	return results
 end
 
--- The room, for the Multiplayer window: { room =, speed =, diverged =,
+-- The room, for the Multiplayer window: { room = (display), room_id = (stable), speed =, diverged =,
 -- players = { { name =, connected =, owner =, me = } } }, or nil before its
 -- game.
 function Link:status()

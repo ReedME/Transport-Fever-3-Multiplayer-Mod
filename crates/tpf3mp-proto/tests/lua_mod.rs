@@ -10005,7 +10005,7 @@ fn what_a_player_does_is_booked_to_their_company() {
         A, B = string.rep("a", 64), string.rep("b", 64)
         HOOK.batch = { { CompanyOp = { Create = { name = 'Rival' } } } } HOOK.origins = { A }
         UPDATE({}, STATE, 0.2)
-        -- A's loan, for Rival: 1200 over 12 months at 12 % a year; and B's,
+        -- A's loan, for Rival: 1200 over 12 months at 12 % total interest; and B's,
         -- who plays for the first company, through the game's loan script.
         OFFER = { type = 'Small', amount = 1200, duration = 12000, percentage = 0.12 }
         STATE.value.companies.loanOffers = { { company = 1, availableLoans = { OFFER } } }
@@ -10043,15 +10043,15 @@ fn what_a_player_does_is_booked_to_their_company() {
         .eval()
         .unwrap();
     assert_eq!(
-        sent, "Rival,LOAN1200@901,Obtain,INTEREST-12@901,LOAN-95@901",
+        sent, "Rival,LOAN1200@901,Obtain,LOAN-100@901,INTEREST-12@901",
         "the company; Rival's loan booked to it, B's through the loan script; \
-         a month later Rival's instalment of 107: 12 interest, 95 paid down"
+         a month later Rival's native instalment of 112: 100 principal, 12 interest"
     );
     let loan: String = lua
         .load("local l = STATE.value.companies.loans[1] return l.remaining .. ' ' .. l.paid .. '/' .. l.months")
         .eval()
         .unwrap();
-    assert_eq!(loan, "1105 1/12");
+    assert_eq!(loan, "1100 1/12");
 }
 
 /// The GUI's "my company" is the player's: api.engine.util.getPlayer answers
@@ -11883,7 +11883,7 @@ fn only_the_company_that_borrowed_pays_its_loan() {
         HOOK.batch = { { CompanyOp = { Create = { name = 'Ann' } } }, { CompanyOp = { Create = { name = 'Bob' } } } }
         HOOK.origins = { A, B }
         UPDATE({}, STATE, 0.2)
-        -- Ann (901) borrows 1200 over 12 months at 12 % a year.
+        -- Ann (901) borrows 1200 over 12 months at 12 % total interest.
         OFFER = { type = 'Small', amount = 1200, duration = 12000, percentage = 0.12 }
         STATE.value.companies.loanOffers = { { company = 1, availableLoans = { OFFER } } }
         HOOK.batch = { { Loan = { Take = { next = OFFER, offer = OFFER } } } } HOOK.origins = { A }
@@ -11913,7 +11913,7 @@ fn only_the_company_that_borrowed_pays_its_loan() {
     let booked: String = lua.load("return BOOKED()").eval().unwrap();
     assert_eq!(
         booked,
-        "INTEREST-12@901,LOAN-95@901,INTEREST-11@901,LOAN-96@901,INTEREST-10@901,LOAN-97@901"
+        "LOAN-100@901,INTEREST-12@901,LOAN-100@901,INTEREST-12@901,LOAN-100@901,INTEREST-12@901"
     );
     // The finance window's Repay of the first company's loan 1 (another
     // amount) is refused; Ann's own, from the Multiplayer window, goes.
@@ -11942,7 +11942,7 @@ fn only_the_company_that_borrowed_pays_its_loan() {
         ]
     );
     let booked: String = lua.load("return BOOKED()").eval().unwrap();
-    assert_eq!(booked, "LOAN-912@901");
+    assert_eq!(booked, "LOAN-900@901");
     // Four loans at once, as the game's loan script allows: a fifth is
     // refused.
     let why: String = lua
@@ -12100,6 +12100,428 @@ fn founded_company_loan_offers_are_checked_consumed_and_company_scoped() {
         refreshed,
         (1300, 1300, None, 2),
         "both slots refresh independently after cooldown"
+    );
+}
+
+/// A millisecond game clock and two companies, through the actual mod
+/// update/postUpdate path. The amounts have exact native installments:
+/// loan_util.tl (build 40408), 1200 / 12 principal and 12% of that interest.
+const COMPANY_LOAN_CLOCK: &str = r#"
+GAME_T = 0
+api.type.ComponentType.GAME_TIME = 99
+api.engine.util.getWorld = function() return 1 end
+api.engine.getComponent = function(e, kind)
+    if kind == 99 then return { gameTime = GAME_T } end
+end
+api.util = { getDefaultMonthDuration = function() return 1000 end }
+api.type.JournalEntry = { new = function() return { category = {} } end,
+                          Type = { LOAN = 'LOAN', INTEREST = 'INTEREST' } }
+api.cmd.makeJournalBookAssetCmd = function(e, entry) return { journal = entry, entity = e } end
+A, B = string.rep('a', 64), string.rep('b', 64)
+HOOK.room = true
+HOOK.batch = { { CompanyOp = { Create = { name = 'Ann' } } },
+               { CompanyOp = { Create = { name = 'Bob' } } } }
+HOOK.origins = { A, B }
+UPDATE({}, STATE, 0.2)
+OFFERS = {
+    Small = { type = 'Small', amount = 1200, duration = 12000, percentage = 0.12 },
+    Medium = { type = 'Medium', amount = 1200, duration = 12000, percentage = 0.12 },
+}
+STATE.value.companies.loanOffers = {
+    { company = 1, availableLoans = { OFFERS.Small, OFFERS.Medium } },
+    { company = 2, availableLoans = { OFFERS.Small, OFFERS.Medium } },
+}
+function TAKE(player, kind)
+    local offer = OFFERS[kind]
+    HOOK.batch = { { Loan = { Take = { next = offer, offer = offer } } } }
+    HOOK.origins = { player }
+    UPDATE({}, STATE, 0.2)
+    assert(HOOK.applied[#HOOK.applied].ok, HOOK.applied[#HOOK.applied].why)
+end
+function BOOKED()
+    local out = {}
+    for _, c in ipairs(SENT) do
+        if c.journal then out[#out + 1] = c.journal.category.type .. c.journal.amount .. '@' .. c.entity end
+    end
+    SENT = {}
+    return table.concat(out, ',')
+end
+C = ug_require('tpf3mp_1::/scripts/tpf3mp/companies.lua')
+SENT = {}
+"#;
+
+#[test]
+fn company_password_seals_survive_same_room_reload_but_reset_on_import() {
+    let (lua, _) = engine();
+    lua.load(COMPANY_LOAN_CLOCK).exec().unwrap();
+    lua.load(
+        r#"
+        ROOM_A, ROOM_B = 'r-' .. string.rep('1', 32), 'r-' .. string.rep('2', 32)
+        local r = STATE.value.companies
+        RIVAL = r.list[2]
+        r.passwordRoom = ROOM_A
+        RIVAL.lock = { scope = 1, tag = string.rep('c', 64) }
+        RIVAL.closed = true
+        RIVAL.access = { { company = 2, allowed = false } }
+        OLD_LIST, OLD_MEMBERS, OLD_ACCESS = r.list, r.members, RIVAL.access
+        HOOK.status = { room = 'Same display name', room_id = ROOM_A, players = {} }
+        -- An ordinary same-room save/replacement rebuilds the registry.
+        STATE.value.registry = nil
+        UPDATE({}, STATE, 0.2)
+        assert(RIVAL.lock.tag == string.rep('c', 64))
+        assert(C.passwordNotice(r) == nil)
+        -- Different stable IDs must be detected even with equal names.
+        HOOK.status.room_id = ROOM_B
+        UPDATE({}, STATE, 0.2)
+        assert(RIVAL.lock == nil and r.passwordRoom == ROOM_B)
+        assert(r.list == OLD_LIST and r.members == OLD_MEMBERS and RIVAL.access == OLD_ACCESS)
+        assert(RIVAL.closed and RIVAL.entity == 901 and C.of(r, A).id == 1 and C.of(r, B).id == 2)
+        "#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(lua.load("return BOOKED()").eval::<String>().unwrap(), "");
+    let notice: String = lua
+        .load("return C.passwordNotice(STATE.value.companies)")
+        .eval()
+        .unwrap();
+    assert!(notice.contains("different room"), "{notice}");
+    assert!(notice.contains("must be set again: Ann"), "{notice}");
+    let logged: String = lua
+        .load("return table.concat(HOOK.logged, ';')")
+        .eval()
+        .unwrap();
+    assert!(logged.contains(&notice), "{logged}");
+    lua.load(
+        "local r = STATE.value.companies \
+         assert(C.run(r, A, { Lock = 1 }, function() error('no asset command expected') end, api, \
+             { scope = 1, tag = string.rep('d', 64) })) \
+         assert(C.passwordNotice(r) == nil) \
+         STATE.value.registry = nil UPDATE({}, STATE, 0.2) \
+         assert(RIVAL.lock.tag == string.rep('d', 64)) \
+         HOOK.status.room = 'Renamed room' UPDATE({}, STATE, 0.2) \
+         assert(RIVAL.lock.tag == string.rep('d', 64))",
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn legacy_company_password_provenance_resets_once_and_requires_a_stable_id() {
+    let (lua, _) = engine();
+    lua.load(COMPANY_LOAN_CLOCK).exec().unwrap();
+    lua.load(
+        r#"
+        local r = STATE.value.companies
+        r.list[2].lock = { scope = 1, tag = string.rep('c', 64) }
+        HOOK.status = { room = 'display name', invite = 'K7QM2X', players = {} }
+        UPDATE({}, STATE, 0.2)
+        assert(r.list[2].lock ~= nil and r.passwordRoom == nil)
+        assert(not C.roomNeedsBind(r, HOOK.status.room))
+        assert(C.bindRoom(r, HOOK.status.invite) == nil)
+        HOOK.status.room_id = 'r-' .. string.rep('3', 32)
+        UPDATE({}, STATE, 0.2)
+        assert(r.list[2].lock == nil)
+        assert(C.passwordNotice(r):find('older save', 1, true))
+        assert(C.run(r, A, { Lock = 1 }, function() end, api, { scope = 1, tag = string.rep('e', 64) }))
+        assert(C.passwordNotice(r) == nil)
+        STATE.value.registry = nil UPDATE({}, STATE, 0.2)
+        assert(r.list[2].lock.tag == string.rep('e', 64))
+        "#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let logged: String = lua
+        .load("return table.concat(HOOK.logged, ';')")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        logged
+            .matches("Previous company passwords were cleared")
+            .count(),
+        1
+    );
+    assert_eq!(lua.load("return BOOKED()").eval::<String>().unwrap(), "");
+}
+
+#[test]
+fn the_company_window_displays_an_imported_save_password_reset_notice() {
+    let lua = gui();
+    lua.load(FAKE_HOOK).exec().unwrap();
+    lua.load(FAKE_CMD).exec().unwrap();
+    lua.load(
+        r#"
+        local C = ug_require('tpf3mp_1::/scripts/tpf3mp/companies.lua')
+        ROSTER = { list = { { id = 0, entity = 25, name = 'First', color = {1,0,0} },
+                           { id = 1, entity = 901, name = 'Ann', color = {0,0,1}, founder = 'me' } },
+                   members = { { player = 'me', company = 1 } },
+                   passwordReset = { legacy = false, companies = { 1 } } }
+        api.engine = api.engine or {}
+        api.engine.util = { getPlayer = function() return 25 end }
+        api.util = { getDefaultMonthDuration = function() return 1000 end }
+        api.engine.system = api.engine.system or {}
+        api.engine.system.gameScriptSystem = { getEntityForGameScript = function(name)
+            if name == 'tpf3mp_1::/tpf3mp_sim/tpf3mp_sim.gs' then return 77 end return -1 end }
+        api.type = api.type or {}
+        api.type.ComponentType = api.type.ComponentType or {}
+        api.type.ComponentType.GAME_SCRIPT = 7
+        api.engine.getComponent = function(e, kind)
+            if e == 77 and kind == 7 then return { state = { companies = ROSTER } } end
+        end
+        api.type.Vec3f = { new = function(x, y, z) return { x = x, y = y, z = z } end }
+        HOOK.room = true
+        HOOK.status = { room = 'New room', me_id = 'me', players = { { id = 'me', name = 'Ann', me = true } } }
+        BAR = mount(loadPlugin())
+        for _ = 1, 20 do BAR.step() end
+        BAR.render() views(BAR.layout)[1].params.onClick()
+        assert(WINDOWS.Tpf3mpWindow, table.concat(HOOK.logged, ';') .. logText())
+        WINDOWS.Tpf3mpWindow.step()
+        "#,
+    )
+    .exec()
+    .unwrap();
+    let visible: String = lua
+        .load("local out = {} for _, v in ipairs(views(WINDOWS.Tpf3mpWindow.render())) do \
+               if v.view == 'TextView' then out[#out + 1] = v.params.text end end return table.concat(out, ' ')")
+        .eval()
+        .unwrap();
+    let visible = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(visible.contains("Previous company passwords"), "{visible}");
+    assert!(visible.contains("must be set again: Ann"), "{visible}");
+}
+
+#[test]
+fn a_new_loan_does_not_pay_for_an_earlier_debt_free_gap() {
+    let (lua, _) = engine();
+    lua.load(COMPANY_LOAN_CLOCK).exec().unwrap();
+    lua.load(
+        "TAKE(A, 'Small') GAME_T = 3000 UPDATE({}, STATE, 0.2) \
+         HOOK.batch = { { Loan = { Repay = { loan = { type = 'Small', amount = 1200, duration = 12000, percentage = 0.12, id = 1 } } } } } \
+         HOOK.origins = { A } UPDATE({}, STATE, 0.2) \
+         assert(#STATE.value.companies.loans == 0) BOOKED() \
+         GAME_T = 10000 UPDATE({}, STATE, 0.2) TAKE(A, 'Medium')",
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN1200@901",
+        "the new principal only, with no payments from the debt-free gap"
+    );
+    lua.load("GAME_T = 10001 UPDATE({}, STATE, 0.2) GAME_T = 10999 UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(lua.load("return BOOKED()").eval::<String>().unwrap(), "");
+    lua.load("GAME_T = 11000 UPDATE({}, STATE, 0.2) UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN-100@901,INTEREST-12@901",
+        "one installment, one full interval after this loan was taken"
+    );
+    assert_eq!(
+        lua.load(
+            "local l = STATE.value.companies.loans[1] return l.remaining, l.paid, l.lastPayDay"
+        )
+        .eval::<(i64, i64, i64)>()
+        .unwrap(),
+        (1100, 1, 11000)
+    );
+}
+
+#[test]
+fn staggered_loans_keep_their_own_origins_across_calendar_boundaries() {
+    let (lua, _) = engine();
+    lua.load(COMPANY_LOAN_CLOCK).exec().unwrap();
+    lua.load("GAME_T = 990 TAKE(A, 'Small') BOOKED() GAME_T = 1000 UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(lua.load("return BOOKED()").eval::<String>().unwrap(), "");
+    lua.load("GAME_T = 1010 TAKE(B, 'Small') BOOKED() GAME_T = 1989 UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(lua.load("return BOOKED()").eval::<String>().unwrap(), "");
+    lua.load("GAME_T = 1990 UPDATE({}, STATE, 0.2) GAME_T = 2000 UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN-100@901,INTEREST-12@901"
+    );
+    lua.load("GAME_T = 2010 UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN-100@902,INTEREST-12@902"
+    );
+    // Native loan.script.tl charges one installment and resets lastPayDay
+    // to now after a delayed update; it does not back-charge every month.
+    lua.load("GAME_T = 10000 UPDATE({}, STATE, 0.2) UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN-100@901,INTEREST-12@901,LOAN-100@902,INTEREST-12@902"
+    );
+}
+
+#[test]
+fn borrowing_on_another_loans_due_update_does_not_charge_the_new_loan() {
+    let (lua, _) = engine();
+    lua.load(COMPANY_LOAN_CLOCK).exec().unwrap();
+    lua.load("TAKE(A, 'Small') BOOKED() GAME_T = 1000 TAKE(B, 'Small')")
+        .exec()
+        .unwrap();
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN1200@902,LOAN-100@901,INTEREST-12@901"
+    );
+    assert_eq!(
+        lua.load(
+            "local l = STATE.value.companies.loans[2] return l.paid, l.remaining, l.lastPayDay"
+        )
+        .eval::<(i64, i64, i64)>()
+        .unwrap(),
+        (0, 1200, 1000)
+    );
+}
+
+#[test]
+fn saved_annuity_loans_migrate_once_without_money_or_retroactive_payments() {
+    let (lua, _) = engine();
+    lua.load(COMPANY_LOAN_CLOCK).exec().unwrap();
+    lua.load(
+        r#"
+        local r = STATE.value.companies
+        r.month, r.nextLoan = 3, 2
+        r.loans = { { id = 1, company = 1, amount = 1200, remaining = 912,
+                      months = 12, paid = 3, rate = 0.01, payment = 107, type = 'Small' } }
+        GAME_T = 10000
+        -- A GUI must not claim the native payoff for an unconverted annuity.
+        assert(not pcall(C.loanTable, r, 1, {}, 1000))
+        UPDATE({}, STATE, 0.2)
+        "#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "",
+        "migration never books money or charges the old global month gap"
+    );
+    assert_eq!(
+        lua.load("local l = STATE.value.companies.loans[1] return l.amount, l.remaining, l.months, l.paid, l.lastPayDay, l.legacy.amount, l.legacy.paid")
+            .eval::<(i64, i64, i64, i64, i64, i64, i64)>()
+            .unwrap(),
+        (912, 912, 9, 0, 10000, 1200, 3)
+    );
+    assert_eq!(
+        lua.load("return C.migrateLoans(STATE.value.companies, api)")
+            .eval::<i64>()
+            .unwrap(),
+        0,
+        "reloading a converted schedule never migrates it twice"
+    );
+    lua.load("GAME_T = 11000 UPDATE({}, STATE, 0.2) UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN-101@901,INTEREST-12@901"
+    );
+    let payoff = lua
+        .load(
+            "local r = STATE.value.companies local l = C.loanTable(r, 1, {}, 1000).obtainedLoans[1] \
+             local n = math.floor(l.duration / 1000 + 0.5) \
+             local monthly = math.floor(l.amount / n + 0.5) \
+             local nativePayoff = (n - l.timesPaid) * monthly + l.amount - n * monthly \
+             return l.amount, nativePayoff, r.loans[1].remaining",
+        )
+        .eval::<(i64, i64, i64)>()
+        .unwrap();
+    assert_eq!(payoff, (912, 811, 811));
+    // A stale GUI loan's old amount cannot silently repay changed terms.
+    let stale = lua
+        .load("local ok = C.repay(STATE.value.companies, 1, { id = 1, amount = 1200 }, function(c) SENT[#SENT + 1] = c end, api) return ok")
+        .eval::<bool>()
+        .unwrap();
+    assert!(!stale);
+    assert_eq!(lua.load("return BOOKED()").eval::<String>().unwrap(), "");
+    lua.load(
+        "local l = C.loanTable(STATE.value.companies, 1, {}, 1000).obtainedLoans[1] \
+         assert(C.repay(STATE.value.companies, 1, l, function(c) SENT[#SENT + 1] = c end, api))",
+    )
+    .exec()
+    .unwrap();
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN-811@901",
+        "the facade's native payoff equals the actual debit"
+    );
+}
+
+#[test]
+fn founded_company_loans_use_native_final_rounding_and_payoff() {
+    let (lua, _) = engine();
+    lua.load(COMPANY_LOAN_CLOCK).exec().unwrap();
+    lua.load(
+        "OFFERS.Small.amount, OFFERS.Small.duration, OFFERS.Small.percentage = 1000, 3000, 0.10 \
+         TAKE(A, 'Small') BOOKED() \
+         GAME_T = 1000 UPDATE({}, STATE, 0.2) GAME_T = 2000 UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap();
+    // Reference vectors from native loan_util.tl: round(1000/3)=333,
+    // round(100/3)=33; the final corrections are one unit each.
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN-333@901,INTEREST-33@901,LOAN-333@901,INTEREST-33@901"
+    );
+    assert_eq!(
+        lua.load("local r = STATE.value.companies local l = C.loanTable(r, 1, {}, 1000).obtainedLoans[1] \
+                  return l.amount, l.timesPaid, r.loans[1].remaining")
+            .eval::<(i64, i64, i64)>()
+            .unwrap(),
+        (1000, 2, 334),
+        "native full payoff includes its principal rounding correction"
+    );
+    lua.load("GAME_T = 3000 UPDATE({}, STATE, 0.2) UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN-334@901,INTEREST-34@901"
+    );
+    assert_eq!(
+        lua.load("return #STATE.value.companies.loans")
+            .eval::<i64>()
+            .unwrap(),
+        0
+    );
+    // Native rounding can repay all principal before the final installment,
+    // which still carries an interest correction. Migration/cleanup must
+    // not drop that pending payment merely because remaining is zero.
+    lua.load(
+        "OFFERS.Medium.amount, OFFERS.Medium.duration, OFFERS.Medium.percentage = 10, 6000, 0.10 \
+         GAME_T = 3001 TAKE(A, 'Medium') BOOKED() \
+         for i = 1, 5 do GAME_T = 3001 + i * 1000 UPDATE({}, STATE, 0.2) end BOOKED()",
+    )
+    .exec()
+    .unwrap();
+    assert_eq!(
+        lua.load("local l = STATE.value.companies.loans[1] return l.remaining, l.paid")
+            .eval::<(i64, i64)>()
+            .unwrap(),
+        (0, 5)
+    );
+    lua.load("GAME_T = 9001 UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    assert_eq!(
+        lua.load("return BOOKED()").eval::<String>().unwrap(),
+        "LOAN-0@901,INTEREST-1@901"
     );
 }
 
@@ -14179,8 +14601,9 @@ fn the_finance_window_shows_a_founded_companys_own_loans() {
                        { type = "Small", amount = 5000000, duration = 3000, percentage = 0.03 },
                        { type = "Medium", amount = 5000, duration = 6000, percentage = 0.05 },
                    } } },
-                   loans = { { id = 2, company = 1, amount = 1200, remaining = 1105, months = 12, paid = 1,
-                               rate = 0.01, payment = 107, type = "Small" },
+                   loans = { { id = 2, company = 1, amount = 1200, remaining = 1100, months = 12, paid = 1,
+                               duration = 12000, percentage = 0.12, lastPayDay = 1000,
+                               accounting = "native-v1", payment = 112, type = "Small" },
                              { id = 1, company = 7, amount = 99, remaining = 99, months = 1, paid = 0,
                                rate = 0, payment = 99 } } }
         LOANS = { availableLoans = { { type = "Small", amount = 5000000, duration = 3000, percentage = 0.03 },
@@ -14241,6 +14664,22 @@ fn the_finance_window_shows_a_founded_companys_own_loans() {
         board, "Small:5000000 Medium:5000 | 2:1200:12000:0.12:1",
         "Rival's player: Rival's one loan, the offers it can take"
     );
+    // The active getComponent override supplies the actual terms to the
+    // game's native GUI arithmetic (loan_util.tl, 109-110 and 169-175).
+    // Its displayed monthly installment and Repay affordability amount
+    // must agree with the stored schedule, rather than an annuity facade.
+    let finance_math = lua
+        .load(
+            "local l = api.engine.getComponent(40, 7).state.obtainedLoans[1] \
+             local n = math.floor(l.duration / 1000 + 0.5) \
+             local principal = math.floor(l.amount / n + 0.5) \
+             local payment = math.floor((l.amount / n) * (1 + l.percentage) + 0.5) \
+             local payoff = (n - l.timesPaid) * principal + l.amount - n * principal \
+             return payment, payoff, ROSTER.loans[1].payment, ROSTER.loans[1].remaining",
+        )
+        .eval::<(i64, i64, i64, i64)>()
+        .unwrap();
+    assert_eq!(finance_math, (112, 1100, 112, 1100));
     let refreshed: String = lua
         .load(
             "api = FRESH_API(); assert(package.loaded['tpf3mp.follow'].ensure(api)); return BOARD()",

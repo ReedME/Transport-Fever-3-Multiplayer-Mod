@@ -1390,3 +1390,48 @@ there), D4 (trust in the project, fail closed). PLAN.md, Part 3: a new item.
 Not covered yet: the room's terms on the wire (an additive field of the
 content declaration, with a protocol version bump), the launcher's page for
 native mods, and Big Maps itself as the first package.
+
+## D30 (2026-10-11): ReedME fork review implementation
+
+ReedME authorized carrying out all items in the fork's
+`investigation/REEDME_DEEP_REVIEW_2026-10-11.md`. This entry applies to the
+ReedME fork; earlier owner decisions and contributor provenance remain
+upstream history.
+
+- Windows game builds through Proton are the initial client target.
+  The portable Windows ZIP uses a transactional Rust mod installer and
+  native process checks. This is a scoped D9 exception because Wine's
+  PowerShell stub returns success without executing scripts. Native Windows
+  keeps readable scripts, whose installed bytes and record must verify.
+  Managed standalone installation is refused clearly under Wine.
+- Native company loans use the game's fixed principal and full-term
+  interest, with per-loan payment origins. Legacy annuity loans preserve
+  outstanding principal and existing journals; a one-time remaining-term
+  schedule transition starts at the current game time and exposes those
+  exact terms in the finance window. It creates no money and charges no
+  periods before that transition.
+- New rooms imported from multiplayer saves discard previous-room company
+  password seals with a visible reset notice. Same-room reconnect, reload
+  and restoration retain seals; company membership, assets and station
+  permissions remain. New passwords can be set by company heads afterward.
+  Locked legacy saves without stable room provenance reset once on first
+  upgraded room load with a distinct legacy notice; unknown identity never
+  triggers a reset.
+- Checkpoint/save reports identify their producing world. Stale background
+  completions cannot affect another world, and snapshot retention and
+  pointer persistence protect live/recoverable worlds.
+  Per-lane votes without any complete matching replica promote no save. Keep
+  the last agreed world and report this recovery limit; restoring that world
+  requires owner intervention. Do not invent a composite world or silently
+  select an arbitrary divergent replica.
+- The fork uses its own repository/update trust and server images.
+  Unconfigured developer launchers use loopback, never upstream production.
+  Public packages need deliberately configured operated servers. Native
+  archive verification and protected signed updates remain release gates.
+- The first competitive scope is trusted players on identical Windows game
+  builds. Native sequencing is not an authoritative anti-cheat economy.
+  No real-game or public-release acceptance is implied by synthetic tests.
+
+This authorization covers focused fixes, regressions, local test tooling
+and fork governance. It does not replace missing game inputs with fabricated
+verification or authorize publishing an unverified release.

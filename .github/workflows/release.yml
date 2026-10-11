@@ -23,12 +23,15 @@ name: release
 #   Without one the launcher never updates itself, so no release is
 #   drafted: manual runs still build packages to try.
 # - TPF3MP_GAME_ARCHIVE: a complete private tpfre archive on the dedicated
-#   self-hosted Windows runner labelled `tpf3mp-game-builds`. Missing input
+#   self-hosted runner labelled `tpf3mp-game-builds`. Missing input
 #   or a failed check stops packages unless an owner explicitly dispatches
 #   a fast-track release of an already validated native bundle.
 # - TPF3MP_UPDATED_GAME_ARCHIVE: the separate private 40420 archive. The
 #   selected native bundle chooses which archive is checked; the old archive
 #   remains available to verify the released 40408 commit.
+# - TPF3MP_GAME_RUNNER_LABELS: optional JSON array of private runner labels,
+#   default ["self-hosted","Windows","X64","tpf3mp-game-builds"]. A Linux
+#   verifier needs Python, Git and the pinned Rust toolchain, no Windows game run.
 # - TPF3MP_CANDIDATE_GAME_ARCHIVE: optional private archive for static candidate
 #   signature checks on update feature branches; never selects a native bundle.
 #
@@ -91,10 +94,9 @@ jobs:
     name: verify selected game build
     if: ${{ !inputs.fast_track }}
     needs: version
-    # This one update branch has a private one-job verifier. Give it a unique
-    # label so it cannot consume older release checks queued for the shared
-    # runner; all long-lived branches keep their existing runner selection.
-    runs-on: ${{ github.ref == 'refs/heads/feat/game-update-40420' && 'tpf3mp-40420-validation' || fromJSON('["self-hosted","Windows","X64","tpf3mp-game-builds"]') }}
+    # tpfre checks Windows PE archives without running the game. A private
+    # Windows or Linux runner can verify them; its labels are repository config.
+    runs-on: ${{ fromJSON(vars.TPF3MP_GAME_RUNNER_LABELS || '["self-hosted","Windows","X64","tpf3mp-game-builds"]') }}
     timeout-minutes: 30
     env:
       TPF3MP_GAME_ARCHIVE: ${{ vars.TPF3MP_GAME_ARCHIVE }}
@@ -103,65 +105,19 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify the compiled native bundle against the private archive
-        shell: powershell
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Path target -Force | Out-Null
-          $reportPath = Join-Path $pwd 'target/game-build-verification.json'
-          Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
-          $selectedBuild = (Get-Content profiles/native-build.txt -Raw).Trim()
-          $archive = & ./tools/github/select-game-archive.ps1 -SelectedBuild $selectedBuild `
-            -ReleaseArchive $env:TPF3MP_GAME_ARCHIVE -UpdatedArchive $env:TPF3MP_UPDATED_GAME_ARCHIVE
-          $quietCargo = Join-Path $env:USERPROFILE '.claude/tools/quiet-cargo/quiet-cargo.cmd'
-          if (-not (Test-Path -LiteralPath $quietCargo -PathType Leaf)) {
-            throw 'Install quiet-cargo on the private runner before enabling game verification'
-          }
-          if (-not $env:RUNNER_TOOL_CACHE) { throw 'Runner tool cache is not configured' }
-          # Keep compilation artifacts outside checkout's git clean. Cargo
-          # still rebuilds changed sources; every run checks the live archive.
-          $verificationTarget = Join-Path $env:RUNNER_TOOL_CACHE 'tpfre-game-verification'
-          # Windows PowerShell treats native stderr as errors; Cargo progress
-          # is stderr too. Check the exit code explicitly before verification.
-          $ErrorActionPreference = 'Continue'
-          & $quietCargo build --release --locked --manifest-path tools/tpfre/Cargo.toml --target-dir $verificationTarget -j 2
-          $buildExit = $LASTEXITCODE
-          $ErrorActionPreference = 'Stop'
-          if ($buildExit -ne 0) { throw 'Could not build the game verification tool' }
-          $verificationTool = Join-Path $verificationTarget 'release/tpfre.exe'
-          $report = & $verificationTool verify-build --repo . --archive $archive --json
-          $verificationExit = $LASTEXITCODE
-          if ($report.Count -gt 0) {
-            [System.IO.File]::WriteAllLines($reportPath, [string[]]$report, [System.Text.UTF8Encoding]::new($false))
-          }
-          if ($verificationExit -ne 0) { throw 'Selected game build verification failed; no package is built; inspect the static report artifact when available' }
-          $verification = ($report -join "`n") | ConvertFrom-Json
-          if ($verification.source_commit -ne $env:GITHUB_SHA -or $verification.source_dirty -ne $false -or $verification.review_required -or $verification.runtime_verified) {
-            throw 'Verification must describe this exact checkout and its static check only'
-          }
-      - name: Verify all candidate signatures against the private archive
-        if: (startsWith(github.ref, 'refs/heads/feat/game-update-') || startsWith(github.ref, 'refs/heads/feat/upstream-update-')) && env.TPF3MP_CANDIDATE_GAME_ARCHIVE != ''
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $reportPath = Join-Path $pwd 'target/game-candidate-verification.json'
-          Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
-          if (-not (Test-Path -LiteralPath $env:TPF3MP_CANDIDATE_GAME_ARCHIVE -PathType Container)) {
-            throw 'Configured candidate source archive is missing'
-          }
-          $verificationTool = Join-Path $env:RUNNER_TOOL_CACHE 'tpfre-game-verification/release/tpfre.exe'
-          $ErrorActionPreference = 'Continue'
-          $report = & $verificationTool verify $env:TPF3MP_CANDIDATE_GAME_ARCHIVE --profiles ./profiles --json
-          $verificationExit = $LASTEXITCODE
-          $ErrorActionPreference = 'Stop'
-          if ($report.Count -gt 0) {
-            [System.IO.File]::WriteAllLines($reportPath, [string[]]$report, [System.Text.UTF8Encoding]::new($false))
-          }
-          if ($verificationExit -ne 0) { throw 'Candidate signature verification failed; inspect the static report when available' }
-          $candidate = ($report -join "`n") | ConvertFrom-Json
-          if ($candidate.kind -ne 'profile_verification' -or $candidate.targets.Count -eq 0 -or $candidate.review_required -or $candidate.runtime_verified) {
-            throw 'Candidate report must contain successful static signature checks only'
-          }
-          Write-Host ('Candidate signatures matched: {0}; native bundle selection unchanged' -f $candidate.targets.Count)
+          set -euo pipefail
+          cache="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/tpfre-game-verification"
+          candidate=()
+          case "$GITHUB_REF" in
+            refs/heads/feat/game-update-*|refs/heads/feat/upstream-update-*)
+              if [ -n "$TPF3MP_CANDIDATE_GAME_ARCHIVE" ]; then
+                candidate=(--candidate "$TPF3MP_CANDIDATE_GAME_ARCHIVE")
+              fi
+              ;;
+          esac
+          python tools/github/verify_game_build.py --repo . --cache "$cache" "${candidate[@]}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

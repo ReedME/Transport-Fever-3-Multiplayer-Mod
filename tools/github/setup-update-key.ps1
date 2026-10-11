@@ -14,7 +14,7 @@
 # acts as you, through your signed-in `gh`. It refuses when the repository
 # already trusts an update key: replacing it would leave every launcher
 # built since unable to update.
-param([string]$Repo = "Juliansgith/Transport-Fever-3-Multiplayer-Mod", [string]$KeyDir = "")
+param([string]$Repo = "ReedME/Transport-Fever-3-Multiplayer-Mod", [string]$KeyDir = "")
 # Not "Stop": Windows PowerShell 5 treats a native command's stderr as an
 # error even when redirected; every step checks $LASTEXITCODE instead.
 $ErrorActionPreference = "Continue"

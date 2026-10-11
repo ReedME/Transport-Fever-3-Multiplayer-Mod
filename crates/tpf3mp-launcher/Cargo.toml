@@ -22,10 +22,12 @@ serde.workspace = true
 serde_json.workspace = true
 skrifa.workspace = true
 tar.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tpf3mp-agent.workspace = true
 tpf3mp-ipc.workspace = true
+tpf3mp-launch.workspace = true
 # Signatures and checked downloads, shared with native mods (D29).
 tpf3mp-nativemods = { workspace = true, features = ["install"] }
 tpf3mp-proto.workspace = true
@@ -39,6 +41,8 @@ zip.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_UI_WindowsAndMessaging",
 ] }
