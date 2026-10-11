@@ -183,7 +183,12 @@ impl Bot {
                     // A new stream always hears where this replica stands.
                     let executed = self.executed();
                     self.reported = Some(executed);
-                    self.client.report_progress(executed).await?;
+                    self.client
+                        .report_loaded(start.world_epoch, executed)
+                        .await?;
+                    self.client
+                        .report_progress(start.world_epoch, executed)
+                        .await?;
                 }
                 ClientEvent::Turn(turn) => {
                     let follower = self.follower.as_mut().ok_or(BotError::NoStream)?;
@@ -265,7 +270,9 @@ impl Bot {
         }
         let executed = follower.executed();
         for (step, lanes) in checkpoints {
-            self.client.report_checkpoint(step, lanes).await?;
+            self.client
+                .report_checkpoint(follower.world_epoch(), step, lanes)
+                .await?;
         }
         for command in commands {
             let seq = self.next_seq;
@@ -276,7 +283,9 @@ impl Bot {
         }
         if self.reported != Some(executed) {
             self.reported = Some(executed);
-            self.client.report_progress(executed).await?;
+            self.client
+                .report_progress(follower.world_epoch(), executed)
+                .await?;
         }
         Ok(())
     }

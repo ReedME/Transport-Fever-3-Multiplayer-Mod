@@ -13,6 +13,7 @@ pub mod icon;
 pub mod installation;
 pub mod installed;
 pub mod logs;
+mod mod_install;
 pub mod notes;
 pub mod probe;
 pub mod theme;

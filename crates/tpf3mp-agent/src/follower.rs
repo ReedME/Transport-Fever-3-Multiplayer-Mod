@@ -57,6 +57,7 @@ pub struct TurnFollower {
     queued_bytes: usize,
     /// The history of the turns accepted, as the latest stream named it.
     history: u64,
+    world_epoch: u64,
 }
 
 impl TurnFollower {
@@ -73,6 +74,7 @@ impl TurnFollower {
             queue: VecDeque::new(),
             queued_bytes: 0,
             history: start.history,
+            world_epoch: start.world_epoch,
         }
     }
 
@@ -80,6 +82,12 @@ impl TurnFollower {
     /// pick up exactly where this follower left off. It may name a newer
     /// history: the server only resumes a client on turns both share.
     pub fn restart(&mut self, start: &TurnStart) -> Result<(), FollowError> {
+        if start.world_epoch != self.world_epoch {
+            return Err(FollowError::RestartMismatch {
+                expected: self.world_epoch,
+                got: start.world_epoch,
+            });
+        }
         if start.next_turn != self.next_turn {
             return Err(FollowError::RestartMismatch {
                 expected: self.next_turn,
@@ -106,9 +114,14 @@ impl TurnFollower {
     /// where the stream started if none was.
     pub fn resume_point(&self) -> Resume {
         Resume {
+            world_epoch: self.world_epoch,
             after_turn: self.next_turn.saturating_sub(1),
             history: self.history,
         }
+    }
+
+    pub fn world_epoch(&self) -> u64 {
+        self.world_epoch
     }
 
     /// Checks a turn against the invariants and queues its events. On error
@@ -231,6 +244,7 @@ mod tests {
 
     fn start() -> TurnStart {
         TurnStart {
+            world_epoch: 1,
             room: RoomId(FixedBytes([0; 16])),
             rules: tpf3mp_proto::Text::new("native").unwrap(),
             next_turn: 1,
@@ -364,6 +378,7 @@ mod tests {
         assert_eq!(
             follower.resume_point(),
             Resume {
+                world_epoch: 1,
                 after_turn: 1,
                 history: 7
             }
@@ -396,6 +411,7 @@ mod tests {
         assert_eq!(
             follower.resume_point(),
             Resume {
+                world_epoch: 1,
                 after_turn: 40,
                 history: 7
             },

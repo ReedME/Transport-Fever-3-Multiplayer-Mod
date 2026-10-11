@@ -82,7 +82,7 @@ pub use session::{Begin, Game, Load, Notice, SaveOrder, Session, SessionError, S
 /// listed server in [`LobbyAction::Join`]; 28 the release's trusted servers
 /// in [`LobbyView::servers`] before a room list
 /// is fetched, so the game's invite form can ask for an explicit region.
-pub const BRIDGE_VERSION: u32 = 28;
+pub const BRIDGE_VERSION: u32 = 29;
 /// Most servers the room list names ([`LobbyRoomList::servers`]).
 pub const MAX_LOBBY_SERVERS: usize = 8;
 /// The link name the agent creates and the hook opens, unless told
@@ -107,6 +107,7 @@ pub enum ToHook {
     /// local player, as the room's events name the actor: the hook knows its
     /// own commands by it when the room orders them.
     Begin {
+        room: tpf3mp_proto::RoomId,
         rules: RulesName,
         steps_per_second: u16,
         checkpoint_interval: u32,
@@ -146,6 +147,7 @@ pub enum ToHook {
     Load {
         file: Option<Text<MAX_PATH>>,
         next_step: u64,
+        world_epoch: u64,
     },
     /// A member of the room said something; `from` is their name.
     Chat { from: Text<32>, text: ChatText },
@@ -655,7 +657,7 @@ pub enum ToAgent {
     /// The first message after the link opens.
     Hello { version: u32, build: Text<64> },
     /// The world is loaded, and `next_step` is the first step it will run.
-    Loaded { next_step: u64 },
+    Loaded { next_step: u64, world_epoch: u64 },
     /// The local player did something: have the room order it, with the
     /// password it needs, if any (a company's), which the room seals.
     Command {
@@ -663,9 +665,13 @@ pub enum ToAgent {
         secret: Option<Secret>,
     },
     /// The game ran this step.
-    Ran { step: u64 },
+    Ran { step: u64, world_epoch: u64 },
     /// The world's digests at a checkpoint step, taken after running it.
-    Checkpoint { step: u64, lanes: Vec<LaneDigest> },
+    Checkpoint {
+        step: u64,
+        lanes: Vec<LaneDigest>,
+        world_epoch: u64,
+    },
     /// A line for the agent's log.
     Log { message: Text<256> },
     /// The world was saved at the save event `event`, into `file`, or
@@ -674,6 +680,7 @@ pub enum ToAgent {
         event: u64,
         lanes: Vec<LaneDigest>,
         file: Option<Text<MAX_PATH>>,
+        world_epoch: u64,
     },
     /// The player says something to the room.
     Chat { text: ChatText },
@@ -768,6 +775,7 @@ mod tests {
             to_hook
         );
         let to_agent = ToAgent::Checkpoint {
+            world_epoch: 1,
             step: 50,
             lanes: vec![LaneDigest {
                 lane: 2,
@@ -806,7 +814,11 @@ mod tests {
 
     #[test]
     fn malformed_and_oversized_messages_are_refused() {
-        let mut bytes = encode(&ToAgent::Ran { step: 5 }).unwrap();
+        let mut bytes = encode(&ToAgent::Ran {
+            world_epoch: 1,
+            step: 5,
+        })
+        .unwrap();
         bytes.push(0);
         assert!(matches!(
             decode::<ToAgent>(&bytes),

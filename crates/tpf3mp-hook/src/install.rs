@@ -1240,6 +1240,7 @@ mod tests {
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -1306,6 +1307,7 @@ mod tests {
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -1458,6 +1460,7 @@ mod tests {
         let mut script = Script::default();
         script.begin.extend([None, None, Some(begin())]);
         script.gates.push_back(StepGate::Load(Load {
+            world_epoch: 1,
             file: Some(room.clone()),
             next_step: 9,
         }));
@@ -1584,6 +1587,7 @@ mod tests {
         let mut script = Script::default();
         script.begin.extend([None, Some(begin())]);
         script.gates.push_back(StepGate::Load(Load {
+            world_epoch: 1,
             file: Some(room.clone()),
             next_step: 9,
         }));

@@ -1,0 +1,254 @@
+{
+  "recorded_utc": "2026-10-11T02:53:35.376464+00:00",
+  "repository": "ReedME/Transport-Fever-3-Multiplayer-Mod",
+  "baseline_commit": "538733611cc5e4c8ea30d48513d5b0df761db05a",
+  "candidate_branch": "codex/proton-competitive-fixes",
+  "candidate_version": "1.3.2-reedme.1",
+  "code_tree_sha256": "2d0c1000f0d09072bc5f4b37a6aaa249bbb66f0acdbf5afa2071fa2f245fed34",
+  "code_tree_scope": "sorted tracked and task-untracked files under crates/mod/profiles/tools/.github/deploy plus root Cargo/toolchain files; path+NUL+raw file SHA256",
+  "protocol": 20,
+  "bridge": 29,
+  "persisted_format": 9,
+  "findings": {
+    "R01": "implemented_with_focused_regression",
+    "R02": "implemented_with_focused_regression",
+    "R03": "implemented_with_focused_regression",
+    "R04": "implemented_with_focused_regression",
+    "R05": "implemented_with_focused_regression",
+    "R06": "implemented_with_focused_regression",
+    "R07": "implemented_with_focused_regression",
+    "R08": "implemented_with_focused_regression"
+  },
+  "local_checks": {
+    "fmt": "passed",
+    "git_diff_check": "passed",
+    "linux_workspace_all_targets_clippy": "passed",
+    "windows_gnu_workspace_all_targets_clippy": "passed",
+    "workspace_tests": {
+      "passed": 1735,
+      "failed": 0,
+      "ignored": 9
+    },
+    "optimized_build": "passed",
+    "tpfre_checks": {
+      "passed": 49,
+      "ignored": 1
+    },
+    "python_tools": "passed",
+    "unix_installer": "passed",
+    "launcher_page_syntax": "passed",
+    "regression_model": {
+      "passed_runs": 39,
+      "failed_runs": 0,
+      "repeat": 3,
+      "replicas": 3,
+      "speed": 800,
+      "parallel": 2
+    },
+    "load_cases": [
+      {
+        "scenario": "paced",
+        "arguments": [
+          "--rooms",
+          "10",
+          "--bots",
+          "8",
+          "--steps",
+          "1500",
+          "--paced"
+        ],
+        "exit_code": 0,
+        "passed": true
+      },
+      {
+        "scenario": "bad-network",
+        "arguments": [
+          "--rooms",
+          "4",
+          "--bots",
+          "4",
+          "--steps",
+          "1000",
+          "--paced",
+          "--latency-ms",
+          "60",
+          "--jitter-ms",
+          "20",
+          "--loss-percent",
+          "2"
+        ],
+        "exit_code": 0,
+        "passed": true
+      },
+      {
+        "scenario": "tunnel",
+        "arguments": [
+          "--rooms",
+          "4",
+          "--bots",
+          "4",
+          "--steps",
+          "1000",
+          "--paced",
+          "--tunneled"
+        ],
+        "exit_code": 0,
+        "passed": true
+      },
+      {
+        "scenario": "compaction",
+        "arguments": [
+          "--rooms",
+          "8",
+          "--bots",
+          "4",
+          "--steps",
+          "1500",
+          "--data-dir",
+          "/home/reedme/Documents/ChatGPT/TransportFever3/target/reedme-final-load-data/compaction",
+          "--compact-log-kib",
+          "8"
+        ],
+        "exit_code": 0,
+        "passed": true
+      }
+    ],
+    "followup_net": {
+      "passed": 37,
+      "bulk_regressions": 12,
+      "old_opener_mutation_fails": true
+    }
+  },
+  "proton_synthetic": {
+    "runtime": "experimental-11.0-20261001-x86_64",
+    "disposable_prefix": true,
+    "windows_fake_game": true,
+    "real_transport_fever_game": false,
+    "players": 2,
+    "steps_each": 1200,
+    "divergences": 0,
+    "all_final_lanes_equal": true,
+    "initial_world_loaded_by_both": true,
+    "plain_udp_fallback_observed": true,
+    "applicable_windows_installer_tests_passed": 7,
+    "binary_sha256": {
+      "target/optimized-candidate/release/tpf3mp-server": "748ee458d76727537b1ac3fc11ffedbc669d6e62c981e4b7d35171a616f4a1f3",
+      "target/cross-windows/x86_64-pc-windows-gnu/debug/tpf3mp-rig.exe": "635bd4ad819c66abbe87bb9242be3979ae28afc113a65ffb729f34d899000dd2",
+      "target/cross-windows/x86_64-pc-windows-gnu/debug/tpf3mp-fakegame.exe": "8faac2d900f5a4e857e11677155c2db1d8963ab26a7bf70e6bf8c1b709fc5ffe"
+    },
+    "windows_steam_discovery": {
+      "passed": 11,
+      "ignored": 1
+    },
+    "native_linux_server_with_windows_clients": true,
+    "cross_stack_result": {
+      "native_linux_server": true,
+      "windows_clients_under_proton": true,
+      "real_game": false,
+      "players": 2,
+      "steps_each": 1200,
+      "divergences": 0,
+      "all_final_lane_digests_equal": true,
+      "exit_code": 0,
+      "binary_sha256": {
+        "target/optimized-candidate/release/tpf3mp-server": "748ee458d76727537b1ac3fc11ffedbc669d6e62c981e4b7d35171a616f4a1f3",
+        "target/cross-windows/x86_64-pc-windows-gnu/debug/tpf3mp-rig.exe": "635bd4ad819c66abbe87bb9242be3979ae28afc113a65ffb729f34d899000dd2",
+        "target/cross-windows/x86_64-pc-windows-gnu/debug/tpf3mp-fakegame.exe": "8faac2d900f5a4e857e11677155c2db1d8963ab26a7bf70e6bf8c1b709fc5ffe"
+      }
+    },
+    "snapshot_scenarios": {
+      "windows_gnu_under_proton": true,
+      "real_game": false,
+      "tests_passed": [
+        "a_player_joins_a_running_game_from_the_rooms_world",
+        "a_player_behind_a_udp_block_joins_late_through_the_tunnel",
+        "a_restored_room_still_hands_on_its_world"
+      ],
+      "tests_failed": 0
+    },
+    "windows_store_preservation": {
+      "windows_gnu_under_proton": true,
+      "directory_preservation_tests_passed": 4,
+      "failed": 0,
+      "production_changes": false
+    }
+  },
+  "github_setup": {
+    "public_fork": true,
+    "issue_tracker_enabled": true,
+    "dev_acceptance_main_protected": true,
+    "codeowner": "ReedME",
+    "protected_signing_environment_configured": true,
+    "public_update_key_configured": true,
+    "release_dispatched": false,
+    "public_server_configured": false,
+    "private_game_runner_configured": false,
+    "private_windows_archive_configured": false
+  },
+  "hosted_validation": "Exact candidate CI, acceptance and branch image results are recorded on PR #1 and its run records; protected release and private game verification gates remain separate.",
+  "real_game_runtime_verified": false,
+  "game_install_modified": false,
+  "steam_configuration_modified": false,
+  "player_release_published": false,
+  "remaining_inputs": [
+    "supported Windows 40420 executable and actual Proton prefix",
+    "genuine private Windows archives and verifier runner",
+    "operated public server/domain before player publication"
+  ],
+  "policy_limits": [
+    "trusted-friends native competition; no authoritative anti-cheat economy",
+    "room log format8 cannot migrate to9; use fresh rooms",
+    "legacy locked saves without room provenance reset seals once",
+    "composite lane verdict may require manual recovery",
+    "Windows crash durability and real engine determinism need runtime acceptance",
+    "Windows dedicated-server log replacement under Wine has a known AccessDenied compaction failure; initial topology uses native Linux server with Windows Proton clients"
+  ],
+  "followup_repairs": {
+    "startup_preflight": "all known room headers checked before identity/store/recovery mutations; unsupported, damaged or unidentified first records refuse startup without changing saved data",
+    "replacement_fetch": "bounded asynchronous exclusive-claim retry; resume missing/damaged state from validated offer; other failures propagate",
+    "restored_room_fixture": "real load and server-rebind milestones replace restart scheduling assumptions; original world/load count assertions remain",
+    "diagnostics": "hosted scenario failures retain first bridge/server connection and load fault"
+  },
+  "local_evidence": {
+    "target/reedme-workspace-tests.log": {
+      "sha256": "3c76d3c61ec73fa28235877c2582ed3125801b6926cd2e74e050e72621c57c9a",
+      "bytes": 149883
+    },
+    "target/reedme-linux-clippy.log": {
+      "sha256": "0f3a33fbd95db39fcb246e54cbd8ea4fff4f2d05692c47e4372ee0db84cf9db7",
+      "bytes": 743
+    },
+    "target/reedme-windows-clippy.log": {
+      "sha256": "7eb40e3d0de50e0c595a05424538b0a85c13ffc1663c0ab75d2f26c4761c0ac7",
+      "bytes": 1024
+    },
+    "target/reedme-release-build.log": {
+      "sha256": "b019c937fab28174cb6c07560770b98c83a61dec93ddab1cc3baab2850e6556b",
+      "bytes": 626
+    },
+    "target/reedme-regress.log": {
+      "sha256": "b32bc1ee77834add831ed48c2c4a96b087f42d001495ec02288de023e9c815b2",
+      "bytes": 3277
+    },
+    "target/reedme-proton-rig/final-validated-candidate/linux-server/clients.txt": {
+      "sha256": "5ba18b006df7047e826696d14fdd3acc245e7efc1eab8448ec61bdfd76fe32d2",
+      "bytes": 1683
+    },
+    "target/reedme-proton-rig/final-validated-candidate/scenarios.json": {
+      "sha256": "ba8fb916cb66d934a827f8b185d85d3fe750cee2e4b49a176694a2cfa9ff21ab",
+      "bytes": 277
+    },
+    "target/reedme-proton-preservation.log": {
+      "sha256": "541229e83cde6dc33b685786ecbce92bc00042f8301f7e68a19c02de867a786e",
+      "bytes": 502
+    },
+    "/tmp/tpf3mp-net-final-tests.log": {
+      "sha256": "64d3bc353b2ed36a79a5834a09c05c918f70464eff6a5da576b21d5baba3df2f",
+      "bytes": 3475
+    },
+    "/tmp/tpf3mp-bulk-mutation-proof.log": {
+      "sha256": "b7144fa2a6d96a782e18fc137a93fba20bf8b06036101d3313c6ac28bc9f32b8",
+      "bytes": 1510
+    }
+  }
+}

@@ -92,7 +92,7 @@ pub use turn::{Event, EventBody, Seal, Turn, TurnMessage, TurnStart};
 /// ([`ServerMessage::RoomMods`]) and how each member's game differs
 /// ([`MemberView::differs`]); version 19 checks an invite on a server without
 /// joining its room ([`Request::ResolveInvite`], [`Response::InviteMatch`]).
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Application protocol name negotiated during the TLS handshake.
 pub const ALPN: &[u8] = b"tpf3mp";
@@ -293,10 +293,13 @@ mod tests {
 
     #[test]
     fn game_message_wire_format_is_stable() {
-        let progress = ClientMessage::Game(GameMessage::Progress { step: 300 });
+        let progress = ClientMessage::Game(GameMessage::Progress {
+            world_epoch: 1,
+            step: 300,
+        });
         let frame = encode_frame(&progress, CONTROL_MAX_FRAME).unwrap();
         // Game variant, Progress variant, varint 300.
-        assert_eq!(frame, [4, 0, 0, 0, 2, 1, 0xac, 0x02]);
+        assert_eq!(frame, [5, 0, 0, 0, 2, 1, 1, 0xac, 0x02]);
         // Version 12: a member's loading progress, the last variant.
         let loading = ClientMessage::Game(GameMessage::Loading(Some(LoadingStage::Fetching {
             percent: 42,
@@ -383,8 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn invite_resolution_round_trips_at_protocol_19() {
-        assert_eq!(PROTOCOL_VERSION, 19);
+    fn invite_resolution_round_trips_at_protocol_20() {
+        assert_eq!(PROTOCOL_VERSION, 20);
         let request = ClientMessage::Request {
             id: 7,
             request: Request::ResolveInvite {

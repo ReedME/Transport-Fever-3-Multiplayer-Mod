@@ -134,11 +134,13 @@ pub struct Load {
     /// The first step the loaded world runs: pass it to
     /// [`Session::loaded`].
     pub next_step: u64,
+    pub world_epoch: u64,
 }
 
 /// A game the room began.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Begin {
+    pub room: tpf3mp_proto::RoomId,
     /// The rules the room is played by (see `ToHook::Begin`).
     pub rules: RulesName,
     pub steps_per_second: u16,
@@ -183,6 +185,7 @@ pub struct Session {
     pending_load: Option<Load>,
     /// A save the room ordered that the game has not reported.
     pending_save: Option<SaveOrder>,
+    world_epoch: u64,
     saves: PathBuf,
     checkpoint_interval: u64,
     /// How long the agent's heartbeat may stand still.
@@ -255,6 +258,7 @@ impl Session {
         };
         let build = Text::lossy(build);
         let mut session = Self {
+            world_epoch: 0,
             agent_beat: (link.peer_heartbeat(), Instant::now()),
             generation: link.session(),
             link,
@@ -350,6 +354,7 @@ impl Session {
             }
             match message {
                 ToHook::Begin {
+                    room,
                     rules,
                     steps_per_second,
                     checkpoint_interval,
@@ -361,6 +366,7 @@ impl Session {
                     self.saves = PathBuf::from(saves.as_str());
                     self.lobby = Lobby::Begun;
                     return Ok(Some(Begin {
+                        room,
                         rules,
                         steps_per_second,
                         checkpoint_interval,
@@ -436,9 +442,13 @@ impl Session {
                 got: next_step,
             });
         }
+        self.world_epoch = load.world_epoch;
         self.pending_load = None;
         self.gate.loaded(next_step);
-        self.send(&ToAgent::Loaded { next_step })
+        self.send(&ToAgent::Loaded {
+            next_step,
+            world_epoch: self.world_epoch,
+        })
     }
 
     /// Without blocking: handles what the agent sent, applying events, and
@@ -513,6 +523,7 @@ impl Session {
             }
         };
         self.send(&ToAgent::Saved {
+            world_epoch: self.world_epoch,
             event: order.event,
             lanes,
             file,
@@ -589,10 +600,17 @@ impl Session {
     /// world's lanes at checkpoint steps. Returns the step.
     pub fn after_step(&mut self, game: &mut impl Game) -> Result<u64, SessionError> {
         let step = self.gate.ran()?;
-        self.send(&ToAgent::Ran { step })?;
+        self.send(&ToAgent::Ran {
+            step,
+            world_epoch: self.world_epoch,
+        })?;
         if step % self.checkpoint_interval == 0 {
             let lanes = game.lanes();
-            self.send(&ToAgent::Checkpoint { step, lanes })?;
+            self.send(&ToAgent::Checkpoint {
+                step,
+                lanes,
+                world_epoch: self.world_epoch,
+            })?;
         }
         Ok(step)
     }
@@ -800,14 +818,21 @@ impl Session {
             Gated::Apply(event) if matches!(event.body, EventBody::Save) => {
                 self.pending_save = Some(SaveOrder {
                     event: event.seq,
-                    file: self.saves.join(format!("save-{}.sav", event.seq)),
+                    file: self
+                        .saves
+                        .join(format!("save-{}-{}.sav", self.world_epoch, event.seq)),
                 });
             }
             Gated::Apply(event) => game.apply(&event),
-            Gated::Load { file, next_step } => {
+            Gated::Load {
+                file,
+                next_step,
+                world_epoch,
+            } => {
                 self.pending_load = Some(Load {
                     file: file.map(|file| PathBuf::from(file.as_str())),
                     next_step,
+                    world_epoch,
                 });
             }
             Gated::Speed(speed) => game.notice(Notice::Speed(speed)),
@@ -926,6 +951,7 @@ mod tests {
         say(
             &agent,
             &ToHook::Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             },
@@ -960,6 +986,7 @@ mod tests {
 
     fn begin(checkpoint_interval: u32) -> ToHook {
         ToHook::Begin {
+            room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
             rules: RulesName::new("native").unwrap(),
             steps_per_second: 5,
             checkpoint_interval,
@@ -1191,6 +1218,7 @@ mod tests {
         say(
             &agent,
             &ToHook::Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             },
@@ -1227,7 +1255,13 @@ mod tests {
     #[test]
     fn a_closed_world_can_leave_past_unrun_steps_without_reporting_them() {
         let (mut session, agent, mut world) = playing("menu-departure", 50);
-        assert_eq!(heard_now(&agent), Some(ToAgent::Loaded { next_step: 1 }));
+        assert_eq!(
+            heard_now(&agent),
+            Some(ToAgent::Loaded {
+                world_epoch: 1,
+                next_step: 1
+            })
+        );
         say(&agent, &ToHook::Release { through: 1 });
         assert_eq!(session.poll_step(&mut world).unwrap(), StepGate::Run);
         session.lobby_act(LobbyAction::Leave).unwrap();
@@ -1437,6 +1471,7 @@ mod tests {
         say(
             &agent,
             &ToHook::Begin {
+                room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
                 rules: RulesName::new("native").unwrap(),
                 steps_per_second: 5,
                 checkpoint_interval: 50,
@@ -1452,6 +1487,46 @@ mod tests {
             matches!(heard(&agent), ToAgent::Log { .. }),
             "no world up once the room began"
         );
+    }
+
+    #[test]
+    fn a_replayed_save_event_uses_a_different_file_after_reloading() {
+        let (mut session, agent, mut world) = playing("save-epochs", 50);
+        let save = ToHook::Apply(Event {
+            seq: 5,
+            step: 1,
+            body: EventBody::Save,
+        });
+        say(&agent, &save);
+        let first = match session.poll_step(&mut world).unwrap() {
+            StepGate::Save(order) => order.file,
+            other => panic!("expected first save, got {other:?}"),
+        };
+        session.saved(&mut world, Err("not needed".into())).unwrap();
+        say(
+            &agent,
+            &ToHook::Load {
+                file: None,
+                next_step: 1,
+                world_epoch: 2,
+            },
+        );
+        assert!(matches!(
+            session.poll_step(&mut world).unwrap(),
+            StepGate::Load(_)
+        ));
+        session.loaded(1).unwrap();
+        say(&agent, &save);
+        let second = match session.poll_step(&mut world).unwrap() {
+            StepGate::Save(order) => order.file,
+            other => panic!("expected replayed save, got {other:?}"),
+        };
+        assert_ne!(
+            first, second,
+            "old disk work cannot read or delete the new save"
+        );
+        assert!(first.ends_with("save-1-5.sav"));
+        assert!(second.ends_with("save-2-5.sav"));
     }
 
     #[test]
@@ -1472,7 +1547,7 @@ mod tests {
         };
         assert_eq!(order.event, 5);
         assert!(
-            order.file.ends_with("save-5.sav"),
+            order.file.ends_with("save-1-5.sav"),
             "{}",
             order.file.display()
         );
@@ -1524,6 +1599,7 @@ mod tests {
             matches!(
                 report,
                 ToAgent::Saved {
+                    world_epoch: 1,
                     event: 9,
                     file: None,
                     ..
@@ -1556,6 +1632,7 @@ mod tests {
             matches!(
                 report,
                 ToAgent::Saved {
+                    world_epoch: 1,
                     event: 3,
                     file: None,
                     ..

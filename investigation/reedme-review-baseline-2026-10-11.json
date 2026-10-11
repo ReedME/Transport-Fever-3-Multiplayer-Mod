@@ -1,0 +1,56 @@
+{
+  "review_date": "2026-10-11",
+  "target": "Competitive separate companies; Windows game through Proton",
+  "fork": {
+    "repository": "ReedME/Transport-Fever-3-Multiplayer-Mod",
+    "url": "https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod",
+    "public": true,
+    "parent": "Juliansgith/Transport-Fever-3-Multiplayer-Mod",
+    "actions_runs_at_inspection": 0,
+    "actions_variables_at_inspection": 0,
+    "actions_secrets_at_inspection": 0,
+    "self_hosted_runners_at_inspection": 0,
+    "dev_protected_at_inspection": false
+  },
+  "source": {
+    "commit": "538733611cc5e4c8ea30d48513d5b0df761db05a",
+    "release": "v1.3.1",
+    "release_published_utc": "2026-10-11T00:55:01Z",
+    "local_branch": "codex/deep-review",
+    "game_internal_build": 40420,
+    "windows_game_executable_sha256": "74861ac43b041aebc5179154345b3cf1ec83154c8e6cc58e0d9e02ff5fa602e4",
+    "protocol_version": 19,
+    "upstream_ci_success_observed": true,
+    "upstream_static_game_verification_success_observed": true,
+    "upstream_acceptance_run_for_this_sha_attested_by_review": false
+  },
+  "proton_static_evidence": {
+    "installed_version": "1790839227 experimental-11.0-20261001-x86_64",
+    "powershell_relative_path": "files/lib/wine/x86_64-windows/powershell.exe",
+    "powershell_sha256": "908e040a604f41025f0dfd196bd2bf20ddfb361dfc561c2f8aea010c02c2136e",
+    "diagnostic_strings_match_wine_stub": true,
+    "primary_source": "https://raw.githubusercontent.com/ValveSoftware/wine/bleeding-edge/programs/powershell/main.c",
+    "binary_executed": false
+  },
+  "review_actions": {
+    "source_review": true,
+    "github_read_only_inspection": true,
+    "runtime_validation": false,
+    "builds_run": false,
+    "tests_run": false,
+    "game_launched": false,
+    "workflow_dispatched": false,
+    "gameplay_code_changed": false,
+    "review_pushed": false
+  },
+  "findings": [
+    { "id": "R01", "priority": "P1", "area": "Proton setup", "basis": "Source and bundled-binary static evidence" },
+    { "id": "R02", "priority": "P1", "area": "World-generation attribution", "basis": "Source-confirmed admissible interleaving; not reproduced" },
+    { "id": "R03", "priority": "P1", "area": "Loan accounting after debt-free interval", "basis": "Source-confirmed deterministic accounting path; not executed" },
+    { "id": "R04", "priority": "P2", "area": "Loan display and repayment eligibility", "basis": "Mod source, fixture data and shipped native formula; not executed" },
+    { "id": "R05", "priority": "P2", "area": "Proton Steam secondary-library discovery", "basis": "Source and Windows path semantics; not executed" },
+    { "id": "R06", "priority": "P2", "area": "Stale snapshot cleanup", "basis": "Source-confirmed admissible interleaving; not reproduced" },
+    { "id": "R07", "priority": "P2", "area": "Snapshot-pointer persistence order", "basis": "Source-confirmed admissible interleaving; not reproduced" },
+    { "id": "R08", "priority": "P2", "area": "Retry of failed demanded save while paused", "basis": "Source-confirmed state path; not executed" }
+  ]
+}

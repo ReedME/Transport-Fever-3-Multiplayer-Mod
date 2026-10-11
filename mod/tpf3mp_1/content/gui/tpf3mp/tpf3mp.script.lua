@@ -413,6 +413,8 @@ function data()
 		local roster = state and state.companies
 		if type(roster) ~= "table" or type(roster.list) ~= "table" then return nil, "" end
 		local out, sign = { list = {}, members = roster.members or {}, loans = roster.loans or {} }, {}
+		out.passwordNotice = require("tpf3mp.companies").passwordNotice(roster)
+		if out.passwordNotice then sign[#sign + 1] = out.passwordNotice end
 		-- A founded company reads its own persisted offers. Company zero keeps
 		-- the native finance window and its loan script state.
 		pcall(function()
@@ -646,6 +648,7 @@ function data()
 		if not roster then return end
 		local companies = require("tpf3mp.companies")
 		local function line(text) rows[#rows + 1] = label(text, "font-scale-annotation", COMPANIES_WIDTH - 40, 38) end
+		if roster.passwordNotice then line(roster.passwordNotice) end
 		local function row(children)
 			local spaced = {}
 			for i, child in ipairs(children) do
@@ -906,7 +909,7 @@ function data()
 			for _, offer in ipairs(roster.offers or {}) do
 				if type(offer) == "table" and type(offer.amount) == "number" then
 					offers[#offers + 1] = button("Borrow " .. money(offer.amount),
-						string.format("Borrow %s at %g%% a year", money(offer.amount), (offer.percentage or 0) * 100),
+						string.format("Borrow %s with %g%% interest over the full term", money(offer.amount), (offer.percentage or 0) * 100),
 						function()
 							local nextOffer = replacementOffer(offer)
 							if not nextOffer then

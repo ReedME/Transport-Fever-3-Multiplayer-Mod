@@ -140,21 +140,35 @@ fn libraries(root: &Path) -> Vec<PathBuf> {
         .as_ref()
         .and_then(|listed| listed.map("libraryfolders"))
     {
-        for value in folders.0.values() {
-            // Current Steam: a block with a "path"; older Steam: the path.
-            let path = match value {
-                Value::Map(folder) => folder.text("path"),
-                Value::Text(path) => Some(path.as_str()),
-            };
-            if let Some(path) = path.map(PathBuf::from)
-                && path.is_absolute()
-                && !found.contains(&path)
-            {
+        for path in listed_library_paths(folders, cfg!(windows)) {
+            if path.is_absolute() && !found.contains(&path) {
                 found.push(path);
             }
         }
     }
     found
+}
+
+/// Linux Steam's VDF still contains Unix paths when the reader runs under
+/// Proton. Convert each library through Wine's Z: mapping before applying
+/// Windows's absolute-path check, as we already do for the client root.
+fn listed_library_paths(folders: &Block, windows: bool) -> Vec<PathBuf> {
+    folders
+        .0
+        .values()
+        .filter_map(|value| {
+            // Current Steam: a block with a "path"; older Steam: the path.
+            let path = match value {
+                Value::Map(folder) => folder.text("path"),
+                Value::Text(path) => Some(path.as_str()),
+            }?;
+            Some(if windows {
+                wine_path(path).unwrap_or_else(|| PathBuf::from(path))
+            } else {
+                PathBuf::from(path)
+            })
+        })
+        .collect()
 }
 
 /// Where Steam may be installed on this system, the likeliest first.
@@ -835,6 +849,43 @@ mod tests {
             Some(PathBuf::from(r"Z:\home\me\.local\share\Steam"))
         );
         assert_eq!(wine_path(r"C:\Steam"), None);
+    }
+
+    #[test]
+    fn linux_vdf_secondary_libraries_are_translated_before_windows_path_checks() {
+        // Parse the actual Linux spelling, including the legacy text entry,
+        // rather than constructing VDF paths in the test runner's native OS.
+        let parsed = parse(
+            r#""libraryfolders" {
+            "0" { "path" "/home/player/.local/share/Steam" }
+            "1" { "path" "/mnt/Steam games" }
+            "2" "/media/another-library"
+            "3" { "path" "C:\\Steam" }
+            "4" { "path" "relative/library" }
+        }"#,
+        )
+        .unwrap();
+        let folders = parsed.map("libraryfolders").unwrap();
+        let windows = listed_library_paths(folders, true);
+        assert_eq!(
+            windows,
+            vec![
+                PathBuf::from(r"Z:\home\player\.local\share\Steam"),
+                PathBuf::from(r"Z:\mnt\Steam games"),
+                PathBuf::from(r"Z:\media\another-library"),
+                PathBuf::from(r"C:\Steam"),
+                PathBuf::from("relative/library"),
+            ]
+        );
+        assert_eq!(
+            listed_library_paths(folders, false)[1],
+            PathBuf::from("/mnt/Steam games")
+        );
+        #[cfg(windows)]
+        {
+            assert!(windows[..4].iter().all(|path| path.is_absolute()));
+            assert!(!windows[4].is_absolute());
+        }
     }
 
     #[test]

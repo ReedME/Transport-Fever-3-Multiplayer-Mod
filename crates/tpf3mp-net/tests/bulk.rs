@@ -2,7 +2,11 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex, mpsc},
+    time::Duration,
+};
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tpf3mp_net::{
@@ -14,7 +18,9 @@ use tpf3mp_proto::{
     BULK_REQUEST_MAX_FRAME, BULK_RESPONSE_MAX_FRAME, BulkRequest, BulkResponse, ChunkHash,
     FixedBytes,
 };
-use tpf3mp_snapshot::{ChunkParams, ChunkStore, Manifest, ManifestId, StoreConfig};
+use tpf3mp_snapshot::{ChunkParams, ChunkSink, ChunkStore, Manifest, ManifestId, StoreConfig};
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::{Layer, layer::SubscriberExt};
 
 const IDLE: Duration = Duration::from_secs(10);
 
@@ -91,6 +97,17 @@ async fn transfer(
     expected: ManifestId,
     completion: Completion,
 ) -> (Result<Manifest, BulkError>, Result<bulk::Served, BulkError>) {
+    transfer_with_idle(from, into, manifest, expected, completion, IDLE).await
+}
+
+async fn transfer_with_idle(
+    from: &ChunkStore,
+    into: &ChunkStore,
+    manifest: &Manifest,
+    expected: ManifestId,
+    completion: Completion,
+    idle: Duration,
+) -> (Result<Manifest, BulkError>, Result<bulk::Served, BulkError>) {
     let Pipe {
         fetcher: (mut send, mut recv),
         server: (mut server_send, mut server_recv),
@@ -101,7 +118,7 @@ async fn transfer(
         let manifest = manifest.clone();
         async move {
             let served =
-                bulk::serve(&mut server_send, &mut server_recv, &from, &manifest, IDLE).await;
+                bulk::serve(&mut server_send, &mut server_recv, &from, &manifest, idle).await;
             let _ = server_send.finish();
             served
         }
@@ -112,13 +129,240 @@ async fn transfer(
         into,
         &expected,
         completion,
-        IDLE,
+        idle,
         |_| {},
     )
     .await;
     // The server stops serving once the fetching side finishes, or fails.
     let _ = send.finish();
     (fetched, serving.await.unwrap())
+}
+
+/// Tokio cannot stop a blocking disk worker by aborting the async fetch that
+/// awaits it. Keep a real sink in exactly that state until the test releases it.
+struct DetachedSink {
+    release: mpsc::Sender<bool>,
+    finished: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl DetachedSink {
+    async fn start(store: &ChunkStore, manifest: &Manifest) -> Self {
+        let (release, released) = mpsc::channel();
+        let (claimed, claiming) = tokio::sync::oneshot::channel();
+        let (finished, finishing) = tokio::sync::oneshot::channel();
+        let store = store.clone();
+        let manifest = manifest.clone();
+        let original = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let sink = ChunkSink::open(&store, manifest).unwrap();
+                let _ = claimed.send(());
+                // A failed assertion drops the sender too, so no worker leaks.
+                if released.recv().unwrap_or(false) {
+                    sink.abandon().unwrap();
+                } else {
+                    drop(sink);
+                }
+                let _ = finished.send(());
+            })
+            .await
+            .unwrap();
+        });
+        tokio::time::timeout(IDLE, claiming).await.unwrap().unwrap();
+        original.abort();
+        assert!(original.await.unwrap_err().is_cancelled());
+        Self {
+            release,
+            finished: finishing,
+        }
+    }
+
+    async fn release(self, abandon: bool) {
+        self.release.send(abandon).unwrap();
+        tokio::time::timeout(IDLE, self.finished)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// Observe the actual first AlreadyOpen retry on this fetch's own subscriber.
+/// A scheduling delay or slow handshake cannot make the regression pass.
+struct SinkWaitObserver(Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+
+impl<S: tracing::Subscriber> Layer<S> for SinkWaitObserver {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() != "tpf3mp_net::bulk" {
+            return;
+        }
+        struct Message(bool);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}")
+                        == "waiting for a previous local snapshot transfer to finish";
+                }
+            }
+        }
+        let mut message = Message(false);
+        event.record(&mut message);
+        if message.0
+            && let Some(notify) = self.0.lock().unwrap().take()
+        {
+            let _ = notify.send(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_replacement_fetch_waits_for_cancelled_disk_work_without_blocking_other_snapshots() {
+    let (server_dir, client_dir, out_dir) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (server, client) = (store(&server_dir), store(&client_dir));
+    let data = random_bytes(21, 700_000);
+    let manifest = server.ingest(data.as_slice(), params()).unwrap();
+    let other_data = random_bytes(22, 400_000);
+    let other = server.ingest(other_data.as_slice(), params()).unwrap();
+    // Verified chunks survive an old owner's abandonment even when the
+    // pending manifest disappears. The replacement should reuse this chunk.
+    let cached = manifest.unique_chunks()[0].id;
+    let mut partial = ChunkSink::open(&client, manifest.clone()).unwrap();
+    partial
+        .put(&cached, &server.read_compressed(&cached).unwrap())
+        .unwrap();
+    drop(partial);
+    let detached = DetachedSink::start(&client, &manifest).await;
+    let out = out_dir.path().join("replacement.sav");
+    let (noticed, noticing) = tokio::sync::oneshot::channel();
+    let replacement = tokio::spawn({
+        let (server, client, manifest, out) = (
+            server.clone(),
+            client.clone(),
+            manifest.clone(),
+            out.clone(),
+        );
+        async move {
+            transfer(
+                &server,
+                &client,
+                &manifest,
+                manifest.id(),
+                Completion::File(out),
+            )
+            .await
+        }
+        .with_subscriber(
+            tracing_subscriber::registry().with(SinkWaitObserver(Mutex::new(Some(noticed)))),
+        )
+    });
+    tokio::time::timeout(IDLE, noticing).await.unwrap().unwrap();
+    assert!(
+        !replacement.is_finished(),
+        "the held sink still owns this snapshot"
+    );
+    assert!(
+        !out.exists(),
+        "no stale worker or replacement completed a file"
+    );
+
+    // No global transfer lock: a different ID completes while the old disk
+    // worker is still blocked and the replacement is waiting on its claim.
+    let other_out = out_dir.path().join("other.sav");
+    let (fetched, served) = transfer(
+        &server,
+        &client,
+        &other,
+        other.id(),
+        Completion::File(other_out.clone()),
+    )
+    .await;
+    assert_eq!(fetched.unwrap().id(), other.id());
+    served.unwrap();
+    assert_eq!(std::fs::read(other_out).unwrap(), other_data);
+    assert!(!replacement.is_finished());
+
+    // The old owner explicitly removes its pending record before dropping the
+    // claim. The current offer must recreate it, preserving cached chunks.
+    detached.release(true).await;
+    let (fetched, served) = tokio::time::timeout(IDLE, replacement)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.unwrap().id(), manifest.id());
+    assert_eq!(
+        served.unwrap().chunks,
+        manifest.unique_chunks().len() as u64 - 1
+    );
+    assert_eq!(std::fs::read(out).unwrap(), data);
+    assert_eq!(client.pending().unwrap(), []);
+    assert_eq!(client.retained().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_local_sink_that_never_releases_times_out_without_blame_or_abandoning_its_owner() {
+    let (server_dir, client_dir, out_dir) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (server, client) = (store(&server_dir), store(&client_dir));
+    let manifest = server
+        .ingest(random_bytes(23, 300_000).as_slice(), params())
+        .unwrap();
+    let detached = DetachedSink::start(&client, &manifest).await;
+    let out = out_dir.path().join("timed-out.sav");
+    let idle = Duration::from_millis(250);
+    let (noticed, noticing) = tokio::sync::oneshot::channel();
+    let fetching = tokio::spawn({
+        let (server, client, manifest, out) = (
+            server.clone(),
+            client.clone(),
+            manifest.clone(),
+            out.clone(),
+        );
+        async move {
+            transfer_with_idle(
+                &server,
+                &client,
+                &manifest,
+                manifest.id(),
+                Completion::File(out),
+                idle,
+            )
+            .await
+        }
+        .with_subscriber(
+            tracing_subscriber::registry().with(SinkWaitObserver(Mutex::new(Some(noticed)))),
+        )
+    });
+    tokio::time::timeout(IDLE, noticing).await.unwrap().unwrap();
+    let (fetched, _) = tokio::time::timeout(IDLE, fetching).await.unwrap().unwrap();
+    let error = fetched.unwrap_err();
+    assert!(
+        matches!(error, BulkError::LocalBusy { snapshot, waited }
+        if snapshot == manifest.id() && waited == idle),
+        "{error}"
+    );
+    assert!(
+        !error.is_violation(),
+        "local contention is not a hostile peer"
+    );
+    assert!(!out.exists());
+    assert_eq!(
+        client.pending().unwrap(),
+        [manifest.id()],
+        "another task still owns the transfer"
+    );
+    assert_eq!(client.retained().unwrap(), []);
+    detached.release(false).await;
+    // Failure did not damage the resumable state or leave its own claim open.
+    ChunkSink::resume(&client, &manifest.id())
+        .unwrap()
+        .abandon()
+        .unwrap();
+    assert_eq!(client.pending().unwrap(), []);
 }
 
 #[tokio::test]

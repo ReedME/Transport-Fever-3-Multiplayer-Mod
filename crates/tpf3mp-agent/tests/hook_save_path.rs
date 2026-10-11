@@ -121,6 +121,7 @@ async fn a_save_outside_the_saves_directory_is_refused() {
             })
             .unwrap(),
             encode(&ToAgent::Saved {
+                world_epoch: 1,
                 event: 1,
                 lanes: Vec::new(),
                 file: Some(Text::new(unrelated.to_string_lossy().into_owned()).unwrap()),

@@ -409,6 +409,8 @@ pub struct Resume {
     /// new history, and refuses to resume anyone past the point where the
     /// two differ.
     pub history: u64,
+    /// The producing-world epoch from its turn stream; preserved on resume.
+    pub world_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,16 +646,16 @@ pub enum GameMessage {
         secret: Option<Secret>,
     },
     /// The last step this client has executed.
-    Progress {
-        step: u64,
-    },
+    Progress { world_epoch: u64, step: u64 },
     Checkpoint {
+        world_epoch: u64,
         step: u64,
         lanes: Vec<LaneDigest>,
     },
     /// This client saved its world at the save event `event`, where its
     /// lanes were these. `world` is `None` if the save failed.
     Saved {
+        world_epoch: u64,
         event: u64,
         lanes: Vec<LaneDigest>,
         world: Option<SavedWorld>,
@@ -671,6 +673,8 @@ pub enum GameMessage {
     /// running game and keeps, orders and logs none. Sent again every few
     /// seconds while it shows, so a receiver forgets one that stops coming.
     Preview(Option<Payload>),
+    /// Acknowledges the world ordered on the turn stream, before reports.
+    Loaded { world_epoch: u64, step: u64 },
 }
 
 /// A password a player typed for an intent: a company's, to join it or to

@@ -184,7 +184,7 @@ rerunning; use `--check-only` for the initial analysis. See the
 [one-run command and reports](../tools/tpfre/README.md#one-update-run).
 It never edits the game or automatically approves unknown ABI data.
 
-Build `tools/tpfre` once with the machine's `quiet-cargo` wrapper when installed.
+Build `tools/tpfre` once with Cargo (an installed `quiet-cargo` wrapper is optional).
 Then, from the repository root, run the standalone tool against a complete
 private source archive:
 
@@ -208,10 +208,11 @@ Packages are built on `main` or
 manual runs with `verify_only` left off; a failed check blocks every package.
 Other feature branches can run it manually with `verify_only` enabled. Set up:
 
-- a dedicated private Windows GitHub Actions runner labelled
-  `tpf3mp-game-builds`, with Git, the pinned Rust toolchain, Windows PowerShell
-  and the machine's `quiet-cargo` wrapper under the runner account's
-  `.claude/tools/quiet-cargo/quiet-cargo.cmd`;
+- a dedicated private Windows or Linux GitHub Actions runner, with Git,
+  Python 3.12+, bash and the pinned Rust toolchain. Default labels are
+  `["self-hosted","Windows","X64","tpf3mp-game-builds"]`; set
+  `TPF3MP_GAME_RUNNER_LABELS` to a JSON label array to select a Linux runner.
+  `tools/github/verify_game_build.py` runs the live gate without a local wrapper;
 - the repository variable `TPF3MP_GAME_ARCHIVE`, an absolute path to the
   complete source archive readable by that runner, outside its checkout.
 
@@ -222,10 +223,9 @@ Steam build ID 25754343 archive on the same private runner before verifying a
 `profiles/native-build.txt`; `tpfre verify-build` then checks the selected
 bundle's SHA-256, size, PE timestamp and every target. An unknown bundle or
 missing archive stops verification, while the old release stays verifiable.
-The `feat/game-update-40420` branch alone may use a one-job private runner
-labelled `tpf3mp-40420-validation` to avoid taking unrelated queued release
-checks. The `dev`, `acceptance` and `main` jobs continue to require the normal
-`tpf3mp-game-builds` runner.
+The runner-label variable applies to all selected-build verification jobs in
+this fork. It changes where static verification runs, not which native bundle
+or archive is accepted.
 
 Set up the runner and repository variable in each repository before merging
 these release-workflow changes there. A runner registered to a fork and the
@@ -245,8 +245,9 @@ The verification tool's Cargo target directory stays in the runner's tool
 cache, outside the clean checkout. Repeated checks reuse compilation artifacts
 while still checking the current commit and every private archive file afresh.
 The private job is never triggered by pull requests. Register it only in the
-trusted repository that holds the release workflow. Run `run.cmd` under its
-configured Windows account; it must be online for checks to finish. On a
+trusted repository that holds the release workflow. Run `run.cmd` on Windows
+or `run.sh` on Linux under its configured account; it must be online for checks
+to finish. On a
 non-admin machine it can start hidden at that account's Windows login instead
 of being installed as a service. Keep runner credentials and archives outside
 Git, and use the Release archive until a reviewed Preview bundle is selected.
@@ -257,7 +258,7 @@ When configured, the same private job also runs `tpfre verify` against all
 candidate signatures, including optional targets, and uploads the separate
 `game-candidate-verification.json` artifact. Missing or unsupported candidate
 input fails the update check; an unset variable leaves this optional check out.
-The active native selection and `TPF3MP_GAME_ARCHIVE` still govern packaging.
+The active native selection and its mapped archive variable still govern packaging.
 For Preview 40418, point the candidate variable at its complete private source
 archive while keeping the active variable on Release. Signature success never
 selects or approves the candidate's native ABI or runtime. Ordinary CI also

@@ -1,9 +1,14 @@
 # Protocol
 
-Current integration: protocol **19**, bridge **28**, action schema **26**.
+Current integration: protocol **20**, bridge **29**, action schema **26**,
+room log format **9**.
 This selective combination differs from both prior dev and PR #37; all
 participants and the relay must be upgraded together. Numbers in feature
 history below describe their original introduction.
+The new `TurnStart` layout also changes room-log serialization: format 8
+logs cannot be resumed by format 9 binaries. Preserve the old logs and
+snapshots for recovery with their matching binaries, and start fresh rooms
+for this fork until a separately verified migration exists.
 
 This page defines the semantics and invariants of the TPF3-MP protocol. The
 exact fields live in `crates/tpf3mp-proto`, which is the source of truth; this
@@ -327,6 +332,16 @@ step up to `sealed_through` has run, and every event before `next_event` is
 applied. When it names a `world`, the client loads that world first (see
 "Snapshots").
 
+`TurnStart.world_epoch` identifies the producing world of that stream.
+Every ordered load, including the first local world, carries its epoch
+through the agent/hook bridge. Progress, checkpoints and saved-world
+reports carry the epoch the hook actually loaded. The room accepts them
+only after `Loaded { world_epoch, step }` acknowledges that exact load's
+frontier, and only while the epoch matches the member's current stream.
+Offering a snapshot permits its download; it does not prove the native
+game has loaded it. An old world's in-flight reports cannot be relabelled
+with the newly offered snapshot's provenance.
+
 Together these make every replica apply the same events at the same point in
 simulation time, whatever its latency. Clients enforce them strictly
 (`TurnFollower`): an event whose step is not the previous turn's frontier
@@ -458,7 +473,11 @@ These travel on the control stream.
   preview once written stays ahead of the client's own messages on the
   stream, so a flood of them must not fill its window. A slow client
   misses previews and is never disconnected for them.
-- **`Progress`**: the last step the client executed. It drives pacing.
+- **`Loaded`**: the epoch and frontier of the world the hook finished
+  loading. This transition bypasses periodic progress throttling. A full
+  room command queue closes the control connection so the client can retry
+  it after reconnecting.
+- **`Progress`**: the epoch and last step the client executed. It drives pacing.
 - **`Checkpoint`**: per-lane digests at every checkpoint step (a room
   setting). The server compares members' digests, as described in
   [ARCHITECTURE.md](ARCHITECTURE.md) under "Authority and data flow".
@@ -483,11 +502,17 @@ messages can be in flight when a player leaves, so they are not violations.
 ## Resuming
 
 A player who reconnects joins the room again with the same identity and a
-`Resume`: the last turn it applied and the history that turn belongs to,
+`Resume`: the last turn it accepted, its history, and its producing world epoch,
 which its stream's `TurnStart` named (`TurnFollower::resume_point`). The
 server opens a turn stream that starts right after that turn. The new
 connection replaces the old one, which is closed with `REPLACED`. A client
 checks that the stream continues its log exactly (`TurnFollower::restart`).
+An exact resume preserves the epoch. The agent remembers the hook's last
+load acknowledgement before sending it, then repeats its original load
+frontier before current progress on each new control stream. A connection
+lost between the hook acknowledgement and server handling therefore cannot
+leave that member permanently waiting for a load it already completed.
+A replacement world clears this acknowledgement and receives a new epoch.
 
 A server that can no longer resume a client there (the turns left its
 window, or were lost in a crash) answers `ResumeUnavailable`. The client
@@ -535,7 +560,9 @@ turn (save event 0, turn 0, step 0).
 
 **Saving.** The room saves every ten minutes of play, sooner when someone
 waits for a world, but never twice within a minute, and not at all while
-nothing has changed.
+nothing has changed since the last successfully agreed save. A failed
+demanded save remains retryable after the minimum gap, including while
+paused; the last attempted save does not suppress it indefinitely.
 1. It orders a `Save` event, sealed as the last event of its own turn,
    which runs no new steps. The save point is therefore a turn boundary: a
    stream from the save starts right after that turn.
@@ -543,7 +570,10 @@ nothing has changed.
    earlier event applied and before the event's step runs. It cuts the save
    into its chunk store and reports `Saved` with the world's lane digests
    and the snapshot it holds (or none, if saving failed). Only a member
-   whose stream carried the save may report it.
+  whose stream carried the save may report it.
+   Native save files include the producing world epoch and event sequence,
+   so a replayed event cannot overwrite a previous epoch's file while a
+   delayed ingest reads or removes it.
 3. Once every member pacing the room whose stream carries the save has
    reported, or two minutes have passed, the room judges the lanes as it
    judges a checkpoint's. A lone report stands: that is how a player alone
@@ -557,6 +587,15 @@ nothing has changed.
    off. A snapshot the room already holds needs no upload.
 5. The received snapshot becomes the room's current world. The one before
    stays for downloads that may still run; older ones are released.
+
+Lane majorities can select a combination no complete replica holds. In
+that case every save report diverges, no upload candidate qualifies and
+the server promotes no snapshot. It retains the last agreed world and
+logs an explicit warning. Demanded saves can retry, but automatic repair
+cannot synthesize the missing world or select an arbitrary reporter as a
+replacement. The room continues running; its owner should stop play and
+coordinate restoration from a known agreed save if retries do not converge.
+There is no automatic rollback of the room's log to its older snapshot.
 
 **Receiving a world.** The server opens a turn stream whose `Start` names
 the world, starting right after the save's turn. The client fetches the
@@ -627,10 +666,26 @@ nothing for a minute is given up on, and every chunk must move at
 64 KiB/s for its size (at least 5 s each), so nobody holds a transfer by
 trickling.
 
+The agent publishes its current retention set before scheduling cleanup.
+Queued cleanup reads that live set, rather than a captured older list.
+Counted holds protect each unpublished ingest/fetch result, including two
+operations producing the same snapshot; active transfers pin their world
+until they finish. Completion guards release their hold even if the bridge
+ends with queued work or the result cannot be delivered on its closed channel.
+Collection defers root release during ingest, and its
+chunk scan runs outside the publication lock. A completion for a replaced
+world releases its own hold and sends no saved-world report.
+
 **Persistence.** Next to each room's log, a pointer file names its current
 snapshot and where it stands. A restored room keeps offering that snapshot
 if the store still holds it and the recovered log reaches it. At start, the
 server releases snapshots no restored room refers to.
+Pointer jobs serialize per room and skip obsolete requests. Holds dropped
+by an in-memory promotion are released only after the latest pointer write
+has completed; a failed write retains them. On Unix this includes syncing
+the parent directory after the atomic rename. Windows retains the existing
+file-sync/rename behavior; crash durability of the directory entry remains
+a platform-specific acceptance check.
 
 ## Diagnostics
 

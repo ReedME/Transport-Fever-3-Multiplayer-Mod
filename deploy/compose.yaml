@@ -9,7 +9,7 @@ services:
     # The published image (`docker compose pull`), pinned with
     # TPF3MP_VERSION in deploy/.env; `docker compose up -d --build` builds
     # it from this checkout instead (docs/OPERATIONS.md, "Upgrades").
-    image: ghcr.io/juliansgith/tpf3mp-server:${TPF3MP_VERSION:-latest}
+    image: ${TPF3MP_SERVER_IMAGE:-ghcr.io/reedme/tpf3mp-server}:${TPF3MP_VERSION:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile

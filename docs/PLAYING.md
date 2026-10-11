@@ -62,16 +62,41 @@ installs also removes the launcher and shortcuts after the setup window
 closes. Windows Settings → Apps has the same uninstall entry. Saves,
 identities and settings remain; removed files go to TPF3-MP's backups.
 
+### Proton and Wine: the Windows ZIP package
+
+Use the Windows x64 ZIP, extract it, and run its `TPF3-MP.exe` in the
+**same Proton/Wine prefix as the Windows game**. The standalone managed
+EXE requires native Windows PowerShell for shortcuts and removal, and
+refuses setup under Wine before changing files. Wine's bundled PowerShell
+is a stub that can report success without executing an installer.
+
+The portable launcher's setup copies only `tpf3mp_1` into the account's
+`3493540/local/staging_area`, verifies every bundled file and its installation
+record, and keeps replaced files in its data folder's `backups`. Repair and
+mod removal use this same Rust path. Game-process enumeration must succeed
+and find no running game before changes; close games in other Wine prefixes
+too, since a prefix can only inspect its own Windows processes. Managed
+Windows shortcuts and registry installation are unavailable in this path.
+
+Linux Steam library paths, including secondary libraries, are translated
+through Wine's `Z:` drive. If auto-discovery still finds another executable,
+pass `--game-exe` with the Windows game's full path. The current native hook
+requires the exact supported Windows build; a native Linux executable cannot
+use the Windows hook. These installation checks do not establish game or
+injection compatibility under Proton; real-game acceptance is still required.
+
 ### Portable packages and other platforms
 
 1. Unpack the package anywhere you can write to, such as your Documents
    folder: the launcher updates the files in it (see "Updates").
 2. **The mod.** Start Transport Fever 3 once, so Steam makes its folder for
    your mods, and close it again. Then:
-   - **Windows:** double-click `INSTALL_TPF3MP.cmd` in the package.
+   - **Native Windows:** double-click `INSTALL_TPF3MP.cmd` in the package.
+   - **Proton/Wine:** start the packaged `TPF3-MP.exe` and use its setup,
+     as described above; do not use the PowerShell scripts.
    - **Linux and macOS:** run `./install.sh` from the package's folder.
 
-   The installer is a script, not a program: open `tools\install.ps1`
+   Native Windows and Linux/macOS installers are readable scripts: open `tools\install.ps1`
    (Windows) or `install.sh` (Linux and macOS) to read exactly what it
    changes. It puts the TPF3-MP mod, `tpf3mp_1`, in Steam's folder for
    your Transport Fever 3 mods, `<Steam>/userdata/<account>/3493540/local/staging_area`,
@@ -451,8 +476,14 @@ protected folder such as Program Files.
   follows you into the next room you create or join: no need to restart
   it.
 - **Your world disagrees.** Every few seconds everyone's game compares the
-  world with the room's. If yours has drifted, the room sends you its world
-  and your game reloads it. A notice says so.
+  world with the room's. If yours has drifted, the room tries to send an
+  agreed replacement for your game to reload. A notice says so. With three
+  or more different worlds, the votes can agree on parts that no one whole
+  world contains. The room then keeps its last agreed save and cannot
+  repair that disagreement automatically; it continues running. If the
+  notices keep returning, the owner should pause play and coordinate a
+  return to a known agreed save with the server operator. There is no
+  automatic rollback to that older save.
 - **Saving.** The room saves everyone's game together from time to time,
   which you notice as a short pause, like an autosave.
 - **Room saves in your save folder.** To load the room's world, your game

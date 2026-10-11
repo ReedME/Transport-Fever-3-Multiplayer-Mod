@@ -186,6 +186,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // No certificate or invite key is written for refused room data.
+    Server::preflight_data_dir(args.data_dir.as_deref())?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     match args.log_format {
         LogFormat::Text => tracing_subscriber::fmt().with_env_filter(filter).init(),

@@ -25,7 +25,7 @@ set -eu
 
 REPO=/opt/tpf3mp
 DEPLOY="$REPO/deploy"
-ORIGIN=https://github.com/Juliansgith/Transport-Fever-3-Multiplayer-Mod.git
+ORIGIN=https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod.git
 ADMIN=http://127.0.0.1:9470
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH

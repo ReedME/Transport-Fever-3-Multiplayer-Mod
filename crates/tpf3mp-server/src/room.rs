@@ -37,8 +37,8 @@ use crate::{
     persist::{self, Base, LogError, RoomLog, StartMember, StartRecord},
     ruleset::{RulesMenu, Ruleset},
     snapshots::{
-        self, Agreed, Candidates, Pointer, SAVE_DEADLINE, SavePoint, SaveReport, SaveRound, Saves,
-        Snapshots, UPLOAD_START, Upload,
+        self, Agreed, Candidates, Pointer, PointerWrites, SAVE_DEADLINE, SavePoint, SaveReport,
+        SaveRound, Saves, Snapshots, UPLOAD_START, Upload,
     },
     verdict::{self, Report, Verdict},
 };
@@ -305,6 +305,13 @@ pub(crate) enum RoomCommand {
         player: PlayerId,
         link: u64,
         step: u64,
+        world_epoch: u64,
+    },
+    Loaded {
+        player: PlayerId,
+        link: u64,
+        world_epoch: u64,
+        step: u64,
     },
     /// Where a member's game is with the room's world while it comes in.
     Loading {
@@ -319,12 +326,14 @@ pub(crate) enum RoomCommand {
     Checkpoint {
         player: PlayerId,
         link: u64,
+        world_epoch: u64,
         step: u64,
         lanes: Vec<LaneDigest>,
     },
     Saved {
         player: PlayerId,
         link: u64,
+        world_epoch: u64,
         event: u64,
         lanes: Vec<LaneDigest>,
         world: Option<SavedWorld>,
@@ -616,9 +625,13 @@ struct Member {
     /// The snapshot this member's connection may fetch.
     offered: Option<SnapshotId>,
     /// The world this member's game last loaded, as far as the room knows:
-    /// set when one goes out to it, kept when the player reconnects and
+    /// set once its load is acknowledged, kept when the player reconnects and
     /// resumes (its game keeps playing that world), unknown after a restart.
     loaded: Option<SnapshotId>,
+    /// Epoch the current stream reports; zero until a stream is opened.
+    world_epoch: u64,
+    /// Frontier of an ordered world, until explicitly acknowledged.
+    load_step: Option<u64>,
     /// When the room last rebased this member.
     rebased: Option<Instant>,
     /// The first event of this member's turn stream: it can report only
@@ -803,6 +816,7 @@ pub(crate) struct Room {
     log: Option<RoomLog>,
     /// A compaction of the log in progress.
     compaction: Option<Compaction>,
+    snapshot_writes: Arc<std::sync::Mutex<PointerWrites>>,
     /// The log's size at which it is compacted next.
     compact_at: u64,
     /// See [`RoomEnv::compact_log_at`].
@@ -944,6 +958,7 @@ impl Room {
             timeouts: spec.env.timeouts,
             log: None,
             compaction: None,
+            snapshot_writes: Arc::default(),
             compact_at: spec.env.compact_log_at,
             compact_log_at: spec.env.compact_log_at,
             unattended_since: None,
@@ -1151,6 +1166,8 @@ impl Room {
                 needs: Needs::Nothing,
                 offered: None,
                 loaded: None,
+                world_epoch: 0,
+                load_step: None,
                 rebased: None,
                 stream_from: 0,
             })
@@ -1216,6 +1233,7 @@ impl Room {
             timeouts: env.timeouts,
             log: Some(log),
             compaction: None,
+            snapshot_writes: Arc::default(),
             compact_at,
             compact_log_at: env.compact_log_at,
             // Nobody is connected after a restart; the abandon timeout runs
@@ -1496,22 +1514,42 @@ impl Room {
                 payload,
                 secret,
             } => self.intent(player, client_seq, payload, secret.as_ref()),
-            RoomCommand::Progress { player, link, step } => self.progress(player, link, step),
+            RoomCommand::Progress {
+                player,
+                link,
+                step,
+                world_epoch,
+            } => self.progress(player, link, world_epoch, step),
+            RoomCommand::Loaded {
+                player,
+                link,
+                world_epoch,
+                step,
+            } => self.loaded(player, link, world_epoch, step),
             RoomCommand::Loading { player, stage } => self.loading(player, stage, Instant::now()),
             RoomCommand::Preview { player, preview } => self.preview(player, preview),
             RoomCommand::Checkpoint {
                 player,
                 link,
+                world_epoch,
                 step,
                 lanes,
-            } => self.checkpoint(player, link, step, lanes, Instant::now()),
+            } => self.checkpoint(player, link, world_epoch, step, lanes, Instant::now()),
             RoomCommand::Saved {
                 player,
                 link,
+                world_epoch,
                 event,
                 lanes,
                 world,
-            } => self.saved(player, link, event, lanes, world, Instant::now()),
+            } => self.saved(
+                player,
+                link,
+                (world_epoch, event),
+                lanes,
+                world,
+                Instant::now(),
+            ),
             RoomCommand::Fetch {
                 player,
                 link,
@@ -1632,6 +1670,13 @@ impl Room {
                     Rejoin::World
                 }
                 Phase::Running(game) => {
+                    if resume.is_some_and(|resume| {
+                        resume.world_epoch == 0
+                            || (self.members[index].world_epoch != 0
+                                && resume.world_epoch != self.members[index].world_epoch)
+                    }) {
+                        return Err(RequestError::ResumeUnavailable);
+                    }
                     Rejoin::Stream(game.resume_feed(self.id, self.settings, &self.rules, resume)?)
                 }
             };
@@ -1645,7 +1690,6 @@ impl Room {
             member.name = new.name;
             member.platform = new.platform;
             member.streaming = false;
-            member.offered = None;
             // A new connection has not been told how its content differs.
             member.told_diff = None;
             member.told_room = None;
@@ -1660,6 +1704,7 @@ impl Room {
                     member.needs = Needs::Nothing;
                     if let TurnFeed::Open { start, .. } = &feed {
                         member.stream_from = start.next_event;
+                        member.world_epoch = start.world_epoch;
                     }
                     member.streaming = new.link.turns.try_send(feed).is_ok();
                 }
@@ -2087,6 +2132,8 @@ impl Room {
                 continue;
             }
             member.needs = Needs::Nothing;
+            member.world_epoch = open.world_epoch;
+            member.load_step = Some(open.sealed_through);
             if let Some(link) = &member.link {
                 member.streaming = link
                     .turns
@@ -2326,7 +2373,23 @@ impl Room {
         }
     }
 
-    fn progress(&mut self, player: PlayerId, link: u64, step: u64) {
+    fn loaded(&mut self, player: PlayerId, link: u64, world_epoch: u64, step: u64) {
+        let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|m| m.player == player && m.link.as_ref().is_some_and(|l| l.id == link))
+        else {
+            return;
+        };
+        if member.world_epoch != world_epoch || member.load_step != Some(step) {
+            return;
+        }
+        member.load_step = None;
+        member.loaded = member.offered;
+        self.progress(player, link, world_epoch, step);
+    }
+
+    fn progress(&mut self, player: PlayerId, link: u64, world_epoch: u64, step: u64) {
         let Phase::Running(game) = &self.phase else {
             return;
         };
@@ -2339,6 +2402,9 @@ impl Room {
         else {
             return;
         };
+        if !member.accepts_report(world_epoch) {
+            return;
+        }
         if step > sealed {
             // Executing an unsealed step breaks the protocol's central rule.
             warn!(room = %self.id, %player, step, sealed, "progress beyond the frontier");
@@ -2404,6 +2470,7 @@ impl Room {
         &mut self,
         player: PlayerId,
         link: u64,
+        world_epoch: u64,
         step: u64,
         mut lanes: Vec<LaneDigest>,
         now: Instant,
@@ -2419,6 +2486,9 @@ impl Room {
         else {
             return;
         };
+        if !self.members[order].accepts_report(world_epoch) {
+            return;
+        }
         if step == 0 || !step.is_multiple_of(interval) || step > game.sealed_through {
             debug!(room = %self.id, %player, step, "ignoring a checkpoint that is not due");
             return;
@@ -2543,7 +2613,7 @@ impl Room {
         &mut self,
         player: PlayerId,
         link: u64,
-        event: u64,
+        (world_epoch, event): (u64, u64),
         mut lanes: Vec<LaneDigest>,
         world: Option<SavedWorld>,
         now: Instant,
@@ -2557,7 +2627,7 @@ impl Room {
         };
         // Only a member whose stream carried the save can have made it.
         let member = &self.members[order];
-        if !member.streaming || member.stream_from > event {
+        if !member.accepts_report(world_epoch) || member.stream_from > event {
             debug!(room = %self.id, %player, event, "ignoring a report of a save this member never saw");
             return;
         }
@@ -2813,16 +2883,25 @@ impl Room {
             .into_iter()
             .collect();
         if let Some(snapshots) = &self.snapshots {
+            let writes = Arc::clone(&self.snapshot_writes);
+            writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .request(pointer, released);
             let snapshots = Arc::clone(snapshots);
             let dir = self.data_dir.clone();
             let room = self.id;
             tokio::task::spawn_blocking(move || {
-                if let Some(dir) = dir
-                    && let Err(error) = pointer.write(&dir, &room)
-                {
-                    warn!(%room, %error, "cannot record the room's snapshot; a restart will forget it");
+                let result = writes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .commit(pointer, dir.as_deref(), &room);
+                match result {
+                    Ok(released) => snapshots.release(&released),
+                    Err(error) => {
+                        warn!(%room, %error, "cannot record the room's snapshot; preserving the previous restart world")
+                    }
                 }
-                snapshots.release(&released);
             });
         }
         self.offer_worlds(Instant::now());
@@ -2923,6 +3002,11 @@ impl Room {
                 continue;
             };
             let was_streaming = member.streaming;
+            let TurnFeed::Open { start, .. } = &feed else {
+                continue;
+            };
+            let world_epoch = start.world_epoch;
+            let load_step = start.sealed_through;
             member.streaming = link.turns.try_send(feed).is_ok();
             if !member.streaming {
                 // A member already playing whose queue is full would get
@@ -2942,7 +3026,8 @@ impl Room {
             }
             member.needs = Needs::Nothing;
             member.offered = offered;
-            member.loaded = offered;
+            member.world_epoch = world_epoch;
+            member.load_step = Some(load_step);
             // A player still loading the first world keeps holding the
             // clock; anyone else catches up.
             if member.pace != Pace::Loading {
@@ -3018,6 +3103,14 @@ impl Room {
             return;
         };
         let (mut candidates, diverged) = snapshots::decide(&round.reports);
+        if !round.reports.is_empty() && diverged.len() == round.reports.len() {
+            warn!(
+                room = %self.id,
+                event,
+                reports = round.reports.len(),
+                "no complete replica matches the save's lane verdict; promoting no snapshot and retaining the last agreed world; owner intervention may be required"
+            );
+        }
         // Players whose uploads failed go last.
         candidates
             .make_contiguous()
@@ -3120,6 +3213,11 @@ impl Room {
     /// its snapshots.
     fn discard_game(&mut self) {
         self.cancel_compaction();
+        let mut writes = self
+            .snapshot_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_releases = writes.cancel();
         if let Some(log) = self.log.take()
             && let Err(error) = log.delete()
         {
@@ -3129,8 +3227,16 @@ impl Room {
             Pointer::remove(dir, &self.id);
         }
         if let (Some(snapshots), Phase::Running(game)) = (&self.snapshots, &self.phase) {
-            release_in_background(Arc::clone(snapshots), game.saves.held());
+            release_in_background(
+                Arc::clone(snapshots),
+                game.saves
+                    .held()
+                    .into_iter()
+                    .chain(pending_releases)
+                    .collect(),
+            );
         }
+        drop(writes);
         self.drop_start_world();
     }
 
@@ -3433,6 +3539,9 @@ impl Room {
 }
 
 impl Member {
+    fn accepts_report(&self, world_epoch: u64) -> bool {
+        self.streaming && self.world_epoch == world_epoch && self.load_step.is_none()
+    }
     fn new(new: NewMember) -> Self {
         Self {
             player: new.player,
@@ -3456,6 +3565,8 @@ impl Member {
             needs: Needs::Nothing,
             offered: None,
             loaded: None,
+            world_epoch: 0,
+            load_step: None,
             rebased: None,
             stream_from: 0,
         }
@@ -3641,7 +3752,7 @@ fn next_compaction(size: u64, every: u64) -> u64 {
 fn new_history() -> u64 {
     let mut bytes = [0; 8];
     getrandom::fill(&mut bytes).expect("the operating system's random source is available");
-    u64::from_le_bytes(bytes)
+    u64::from_le_bytes(bytes).max(1)
 }
 
 impl Game {
@@ -3782,6 +3893,7 @@ impl Game {
             checkpoint_interval: settings.checkpoint_interval,
             history: self.history(),
             world,
+            world_epoch: self.history(),
         }
     }
 
@@ -3952,8 +4064,10 @@ impl Game {
         resume: Option<Resume>,
     ) -> Result<TurnFeed, RequestError> {
         let stream = self.stream_after(resume)?;
+        let mut start = self.turn_start(room, settings, rules, &stream, None);
+        start.world_epoch = resume.map_or(self.history(), |resume| resume.world_epoch);
         Ok(TurnFeed::Open {
-            start: self.turn_start(room, settings, rules, &stream, None),
+            start,
             backlog: stream.backlog,
         })
     }
@@ -3969,8 +4083,10 @@ impl Game {
     ) -> Result<(TurnFeed, u64), RequestError> {
         let stream = self.stream_from_save(&agreed.point)?;
         let next_event = stream.next_event;
+        let mut start = self.turn_start(room, settings, rules, &stream, Some(agreed.offer()));
+        start.world_epoch = new_history();
         let feed = TurnFeed::Open {
-            start: self.turn_start(room, settings, rules, &stream, Some(agreed.offer())),
+            start,
             backlog: stream.backlog,
         };
         Ok((feed, next_event))
@@ -3980,6 +4096,7 @@ impl Game {
     /// log must still say what the save says about where it stands.
     fn stream_from_save(&self, point: &SavePoint) -> Result<Stream, RequestError> {
         let stream = self.stream_after(Some(Resume {
+            world_epoch: 1,
             after_turn: point.after_turn,
             history: point.history,
         }))?;
@@ -4099,6 +4216,7 @@ mod tests {
         }
         let feed = |after_turn: Option<u64>| {
             let resume = after_turn.map(|after_turn| Resume {
+                world_epoch: 1,
                 after_turn,
                 history: 1,
             });
@@ -4145,6 +4263,7 @@ mod tests {
                 Some(Resume {
                     after_turn,
                     history,
+                    world_epoch: 1,
                 }),
             )
         };
@@ -4478,6 +4597,7 @@ mod tests {
         let history = histories.last().unwrap().0;
         let stream = game
             .stream_after(Some(Resume {
+                world_epoch: 1,
                 after_turn: 22,
                 history,
             }))
@@ -4489,6 +4609,7 @@ mod tests {
         assert_eq!(stream.backlog[2], frames_after[0]);
         assert!(
             game.stream_after(Some(Resume {
+                world_epoch: 1,
                 after_turn: 19,
                 history,
             }))
@@ -4887,6 +5008,8 @@ mod tests {
             needs: Needs::Nothing,
             offered: None,
             loaded: None,
+            world_epoch: 0,
+            load_step: None,
             rebased: None,
             stream_from: 0,
         }

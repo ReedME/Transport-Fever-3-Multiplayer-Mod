@@ -204,6 +204,7 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
                 invite: invite(),
                 password: None,
                 resume: Some(Resume {
+                    world_epoch: 1,
                     after_turn: 40,
                     history: 99,
                 }),
@@ -252,10 +253,12 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
             }),
         }),
         ClientMessage::Game(GameMessage::Checkpoint {
+            world_epoch: 1,
             step: 500,
             lanes: lanes(),
         }),
         ClientMessage::Game(GameMessage::Saved {
+            world_epoch: 1,
             event: 12,
             lanes: lanes(),
             world: Some(SavedWorld {
@@ -320,6 +323,7 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
     ];
     let turns = [
         TurnMessage::Start(TurnStart {
+            world_epoch: 1,
             room: RoomId(FixedBytes([3; 16])),
             rules: Text::new("native").unwrap(),
             next_turn: 41,

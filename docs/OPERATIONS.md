@@ -55,7 +55,7 @@ Compose project (`name: tpf3mp`, so it never mixes with the relay's
 `deploy` project), its own hostname and ports.
 
 1. **The code:** `git clone
-   https://github.com/Juliansgith/Transport-Fever-3-Multiplayer-Mod.git
+   https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod.git
    /opt/tpf3mp`, at the commit `main` holds.
 2. **The certificate:** `certbot certonly --nginx -d <host>`. Certbot's
    nginx plugin answers the challenge; no site changes.
@@ -224,6 +224,18 @@ reach the server: late joiners then wait.
 
 ## Upgrades
 
+The ReedME repair candidate changes protocol 19 → 20, bridge 28 → 29 and
+room-log format 8 → 9. There is no old-log migration. Preserve the old server
+binaries, secret, logs and snapshots together, use a fresh data directory for
+this fork, and start fresh rooms. Format-8 logs are refused without rewriting
+them. Startup checks every log before opening the snapshot store or running
+recovery cleanup. Unidentified first-record formats also refuse startup;
+archive or repair those files deliberately, preserving the complete old data
+directory. Do not point the candidate at live upstream room data. Importing a game
+save into a fresh room applies the documented company-password reset policy.
+The resume upgrade check below applies only to compatible persisted formats;
+it cannot certify this incompatible transition as preserving running rooms.
+
 Before promoting a release that changes the protocol or persistence, run
 the check with the published player/server binaries and the candidate binaries:
 
@@ -241,7 +253,7 @@ It needs the loopback admin port and two consecutive launcher HTTP ports;
 Every player must run the server's protocol version. The handshake tells
 players on another version which side to update, and their launchers
 update themselves. Upgrade the server when a release is published, which
-also publishes its image, `ghcr.io/juliansgith/tpf3mp-server:<version>`
+also publishes its image, `ghcr.io/reedme/tpf3mp-server:<version>`
 and `:latest` (`.github/workflows/image.yml`):
 
 ```sh
@@ -516,7 +528,7 @@ and ping, host new rooms on the closest, and resolve a typed invite only
 after every listed server confirms exactly one credential match. The
 servers know nothing of each other. This is a deployment guide: this code
 change has not configured or deployed regional servers or changed the
-live relay. Regional clients and servers must all run protocol 19 together.
+live relay. Regional clients and servers must all run protocol 20 together.
 
 For each further server:
 
@@ -543,7 +555,7 @@ For each further server:
    a list that does not read.
 4. **Release**: only packages built with the variable know the server.
    Launchers of earlier releases keep playing on the default server alone.
-   Every listed server must be upgraded to the same protocol-19 release
+   Every listed server must be upgraded to the same protocol-20 release
    before publishing that regional client package.
 
 A server that is down is passed over for hosting. A typed invite waits up

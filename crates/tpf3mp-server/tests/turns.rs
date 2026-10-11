@@ -143,7 +143,13 @@ async fn the_clock_waits_until_everyone_has_loaded() {
     assert_eq!(follower.sealed_through(), 0, "held while bob is loading");
 
     // Bob finishes loading.
-    bob.test.client.report_progress(0).await.unwrap();
+    bob.reports_progress = false;
+    bob.play_until(|p| p.follower.is_some()).await;
+    bob.test
+        .client
+        .report_loaded(bob.world_epoch(), 0)
+        .await
+        .unwrap();
     ann.play_until(|p| p.executed >= 10).await;
     server.shut_down().await;
 }
@@ -153,10 +159,16 @@ async fn a_slow_player_holds_the_room() {
     let server = RunningServer::start(|_| {}).await;
     let clients = vec![server.client("ann").await, server.client("bob").await];
     let (mut players, _) = start(clients, FAST).await;
-    let bob = players.pop().unwrap();
+    let mut bob = players.pop().unwrap();
     let mut ann = players.pop().unwrap();
     // Bob loads, then never executes a step: his machine cannot keep up.
-    bob.test.client.report_progress(0).await.unwrap();
+    bob.reports_progress = false;
+    bob.play_until(|p| p.follower.is_some()).await;
+    bob.test
+        .client
+        .report_loaded(bob.world_epoch(), 0)
+        .await
+        .unwrap();
 
     // Three seconds at 50 steps per second would be 150 steps.
     ann.play_for(Duration::from_secs(3)).await;
@@ -179,10 +191,16 @@ async fn a_stalled_player_stops_holding_the_room() {
     .await;
     let clients = vec![server.client("ann").await, server.client("bob").await];
     let (mut players, _) = start(clients, FAST).await;
-    let bob = players.pop().unwrap();
+    let mut bob = players.pop().unwrap();
     let mut ann = players.pop().unwrap();
     // Bob loads, then his game freezes while his connection stays up.
-    bob.test.client.report_progress(0).await.unwrap();
+    bob.reports_progress = false;
+    bob.play_until(|p| p.follower.is_some()).await;
+    bob.test
+        .client
+        .report_loaded(bob.world_epoch(), 0)
+        .await
+        .unwrap();
 
     ann.play_for(Duration::from_secs(3)).await;
     let sealed = ann.follower.as_ref().unwrap().sealed_through();
@@ -425,6 +443,7 @@ async fn resuming_from_the_future_is_refused() {
             invite,
             password: None,
             resume: Some(Resume {
+                world_epoch: 1,
                 after_turn: 1_000_000,
                 history,
             }),
@@ -502,12 +521,56 @@ async fn checkpoints_single_out_the_diverged_player() {
 }
 
 #[tokio::test]
+async fn delayed_old_world_reports_cannot_replace_a_current_checkpoint() {
+    let server = RunningServer::start(|_| {}).await;
+    let clients = vec![server.client("ann").await, server.client("bob").await];
+    let (players, _) = start(clients, FAST).await;
+    let mut players = play_all(players, |p| p.executed >= 20).await;
+    let ann_epoch = players[0].world_epoch();
+    let bob_epoch = players[1].world_epoch();
+    let lanes = |value| {
+        vec![tpf3mp_proto::LaneDigest {
+            lane: 3,
+            digest: tpf3mp_proto::FixedBytes([value; 32]),
+        }]
+    };
+    // The earlier seat's stale report would win a two-player disagreement
+    // and make its real report a duplicate if the epoch were not checked.
+    players[1]
+        .client()
+        .report_checkpoint(bob_epoch, 20, lanes(1))
+        .await
+        .unwrap();
+    players[0]
+        .client()
+        .report_checkpoint(ann_epoch ^ 1, 20, lanes(9))
+        .await
+        .unwrap();
+    players[0]
+        .client()
+        .report_checkpoint(ann_epoch, 20, lanes(1))
+        .await
+        .unwrap();
+    for player in &mut players {
+        player.play_for(Duration::from_millis(100)).await;
+    }
+    assert!(
+        players.iter().all(|player| player.diverged.is_empty()),
+        "an old-world report contaminated the current verdict"
+    );
+    server.shut_down().await;
+}
+
+#[tokio::test]
 async fn progress_beyond_the_frontier_is_a_violation() {
     let server = RunningServer::start(|_| {}).await;
     let (mut players, _) = start(vec![server.client("ann").await], FAST).await;
     let mut ann = players.pop().unwrap();
     ann.play_until(|p| p.executed >= 1).await;
-    ann.client().report_progress(1_000_000).await.unwrap();
+    ann.client()
+        .report_progress(ann.world_epoch(), 1_000_000)
+        .await
+        .unwrap();
     let reason = ann.test.closed().await;
     assert_eq!(
         application_close_code(&reason),

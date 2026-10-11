@@ -109,10 +109,22 @@ impl Game for ToyGame {
 
 /// Starts the game in a thread of its own.
 pub fn spawn(config: FakeHookConfig) -> JoinHandle<Result<HookReport, HookError>> {
-    std::thread::spawn(move || run(&config))
+    spawn_observed(config, None)
 }
 
-fn run(config: &FakeHookConfig) -> Result<HookReport, HookError> {
+/// A fixture can wait for an actual snapshot load instead of guessing how
+/// long download and disk work take on a particular machine.
+pub(crate) fn spawn_observed(
+    config: FakeHookConfig,
+    snapshot_loaded: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
+) -> JoinHandle<Result<HookReport, HookError>> {
+    std::thread::spawn(move || run(&config, snapshot_loaded.as_ref()))
+}
+
+fn run(
+    config: &FakeHookConfig,
+    snapshot_loaded: Option<&tokio::sync::mpsc::UnboundedSender<u64>>,
+) -> Result<HookReport, HookError> {
     let mut session = Session::attach(&config.link_name, "fake hook", config.patience)?;
     if config.at_menu {
         while session.try_begin()?.is_none() {
@@ -145,6 +157,11 @@ fn run(config: &FakeHookConfig) -> Result<HookReport, HookError> {
                 }
                 game.world = load_world(config, &load)?;
                 session.loaded(load.next_step)?;
+                if load.file.is_some()
+                    && let Some(observer) = snapshot_loaded
+                {
+                    let _ = observer.send(load.next_step);
+                }
                 ran = load.next_step - 1;
                 continue;
             }

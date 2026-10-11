@@ -42,8 +42,9 @@ use tpf3mp_proto::{
 /// played by, and version 6 the game's content manifest. Version 7's
 /// invite tag is of the room's six-character code alone. Version 8's
 /// commands carry the seal of a password sent with them (protocol 8), never
-/// the password.
-pub(crate) const FORMAT_VERSION: u16 = 8;
+/// the password. Version 9's turn-stream starts include the producing-world
+/// epoch of protocol 20. Older layouts require their matching binaries.
+pub(crate) const FORMAT_VERSION: u16 = 9;
 /// Largest start record: one whose base holds the rules' state.
 const MAX_START_RECORD: usize = 16 << 20;
 /// Largest record after the start record: a turn frame at its cap. Kept
@@ -118,7 +119,7 @@ pub(crate) struct StartMember {
 
 /// Why a log cannot be read back.
 #[derive(Debug, Error)]
-pub(crate) enum LogError {
+pub enum LogError {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error("the log is not a regular file")]
@@ -253,6 +254,18 @@ impl RoomLog {
             len,
             torn_at: None,
         })
+    }
+
+    /// Reads only the version prefix of the intact first record, without
+    /// interpreting that version's remaining layout or changing the file.
+    /// Directory startup uses this before any recovery writer or collector.
+    pub(crate) fn format_version(path: &Path) -> Result<u16, LogError> {
+        let first = Self::read(path)?
+            .next_record()?
+            .ok_or(LogError::Damaged(0))?;
+        postcard::take_from_bytes::<u16>(&first)
+            .map(|(version, _)| version)
+            .map_err(|_| LogError::Damaged(0))
     }
 
     /// Appends one record. The write reaches the operating system at once,
@@ -472,6 +485,38 @@ mod tests {
         reader.delete().unwrap();
         assert!(!path.exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn format_preflight_reads_the_prefix_without_decoding_or_rewriting_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.log");
+        for version in [8_u16, FORMAT_VERSION, 10, 300] {
+            let mut payload = postcard::to_stdvec(&version).unwrap();
+            payload.extend_from_slice(&[0xff; 10]);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            // A torn later record must remain byte-for-byte intact too.
+            bytes.extend_from_slice(&[5, 0]);
+            fs::write(&path, &bytes).unwrap();
+            assert!(postcard::from_bytes::<StartRecord>(&payload).is_err());
+            assert_eq!(RoomLog::format_version(&path).unwrap(), version);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[HEADER] ^= 1;
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            RoomLog::format_version(&path),
+            Err(LogError::Damaged(0))
+        ));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "corrupt bytes are not guessed to be a version"
+        );
     }
 
     #[test]
