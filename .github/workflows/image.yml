@@ -8,6 +8,9 @@ name: server image
 on:
   release:
     types: [published]
+  push:
+    # This candidate publishes only its branch tag, never :latest.
+    branches: [codex/proton-competitive-fixes]
   workflow_dispatch:
 
 permissions:

@@ -51,6 +51,9 @@ The deployment default is `ghcr.io/reedme/tpf3mp-server`. A manually published
 feature image uses `branch-codex-proton-competitive-fixes`; select it through
 `TPF3MP_VERSION` in `deploy/compose.yaml`. A feature image must not replace
 `latest`. Local builds can also build `deploy/Dockerfile` directly.
+The initial review branch triggers its own acceptance and branch-image runs;
+GitHub had not registered the fresh fork's manual workflows. Release branches
+and packaging gates are unchanged.
 
 Before publishing player packages, choose and operate the actual public server.
 Set the `TPF3MP_DEFAULT_SERVER`/`TPF3MP_SERVERS` repository variables required

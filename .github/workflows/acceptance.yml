@@ -6,7 +6,9 @@ name: acceptance
 # and a soak, with optimized builds as players and servers run them.
 on:
   push:
-    branches: [acceptance]
+    # The fresh fork has not registered its manual workflow catalog yet.
+    # Exercise this reviewed candidate without promoting release branches.
+    branches: [acceptance, codex/proton-competitive-fixes]
   workflow_dispatch:
 
 permissions:
