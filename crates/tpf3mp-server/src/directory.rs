@@ -2,13 +2,14 @@
 
 use std::{
     collections::HashMap,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
 use ring::hmac;
+use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tpf3mp_proto::{
     BoundedVec, Code, CreateRoom, FixedBytes, Invite, ListedRoom, MAX_ROOM_MEMBERS, PlayerId,
@@ -19,6 +20,7 @@ use tracing::{info, warn};
 use crate::{
     admission::RoomShare,
     metrics,
+    persist::{self, LogError, RoomLog},
     room::{
         NewMember, ROOM_QUEUE, Room, RoomEnv, RoomHandle, RoomSecrets, RoomSpec, SharedSummary,
     },
@@ -27,6 +29,26 @@ use crate::{
 
 /// How long a shutdown waits for each room to finish.
 const ROOM_SHUTDOWN: Duration = Duration::from_secs(5);
+
+/// A startup failure found before room recovery is allowed to change data.
+#[derive(Debug, Error)]
+pub enum RecoveryError {
+    #[error("cannot preflight room data at {}: {source}", .path.display())]
+    Read { path: PathBuf, source: io::Error },
+    #[error("cannot identify the format of room log {}: {source}; preserve the data for repair or use a fresh data directory", .path.display())]
+    UnknownFormat { path: PathBuf, source: LogError },
+    #[error("room log {} uses format {found}, but this server requires {supported}; preserve the data and use matching binaries or a fresh data directory", .path.display())]
+    UnsupportedFormat {
+        path: PathBuf,
+        found: u16,
+        supported: u16,
+    },
+}
+
+struct RecoveryFiles {
+    logs: Vec<PathBuf>,
+    compacting: Vec<PathBuf>,
+}
 
 pub(crate) struct Directory {
     rooms: Mutex<Rooms>,
@@ -81,51 +103,121 @@ impl Directory {
         }
     }
 
+    /// Checks every known log before opening stores, removing partial files,
+    /// rewriting a room or collecting snapshots. A version prefix remains
+    /// readable even when the rest of that older layout cannot be decoded.
+    pub(crate) fn preflight(dir: Option<&Path>) -> Result<(), RecoveryError> {
+        Self::recovery_files(dir).map(|_| ())
+    }
+
+    fn recovery_files(dir: Option<&Path>) -> Result<RecoveryFiles, RecoveryError> {
+        let empty = || RecoveryFiles {
+            logs: Vec::new(),
+            compacting: Vec::new(),
+        };
+        let Some(dir) = dir else {
+            return Ok(empty());
+        };
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(empty()),
+            Err(source) => {
+                return Err(RecoveryError::Read {
+                    path: dir.to_owned(),
+                    source,
+                });
+            }
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| RecoveryError::Read {
+                path: dir.to_owned(),
+                source,
+            })?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|source| RecoveryError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            // Never follow planted links into another player's files.
+            if kind.is_file() {
+                files.push(path);
+            }
+        }
+        files.sort();
+        let has_extension =
+            |path: &Path, wanted: &str| path.extension().is_some_and(|ext| ext == wanted);
+        // A prior buggy upgrade may already have quarantined an unsupported
+        // log. Its snapshots must remain protected on the next startup too.
+        for path in files.iter().filter(|path| {
+            has_extension(path, "log")
+                || has_extension(path, "compacting")
+                || has_extension(path, "broken")
+        }) {
+            match RoomLog::format_version(path) {
+                Ok(found) if found != persist::FORMAT_VERSION => {
+                    return Err(RecoveryError::UnsupportedFormat {
+                        path: path.clone(),
+                        found,
+                        supported: persist::FORMAT_VERSION,
+                    });
+                }
+                Err(LogError::Io(source)) => {
+                    return Err(RecoveryError::Read {
+                        path: path.clone(),
+                        source,
+                    });
+                }
+                Err(source) => {
+                    return Err(RecoveryError::UnknownFormat {
+                        path: path.clone(),
+                        source,
+                    });
+                }
+                Ok(_) => {}
+            }
+        }
+        Ok(RecoveryFiles {
+            logs: files
+                .iter()
+                .filter(|path| has_extension(path, "log"))
+                .cloned()
+                .collect(),
+            compacting: files
+                .into_iter()
+                .filter(|path| has_extension(path, "compacting"))
+                .collect(),
+        })
+    }
+
     /// Restores every running room logged in the data directory. A log that
     /// cannot be recovered is renamed to `*.broken`, unmodified, and kept
     /// for diagnosis, never deleted. Returns how many rooms were restored.
-    pub(crate) fn recover(self: &Arc<Self>) -> usize {
+    /// Unsupported formats refuse all recovery before any room is changed.
+    pub(crate) fn recover(self: &Arc<Self>) -> Result<usize, RecoveryError> {
+        let files = Self::recovery_files(self.env.data_dir.as_deref())?;
         let mut held = Vec::new();
-        let restored = self.recover_rooms(&mut held);
+        let restored = self.recover_rooms(files, &mut held);
         // Snapshots of rooms that are gone would otherwise stay forever.
         if let Some(snapshots) = &self.env.snapshots {
             snapshots.release_all_but(&held);
         }
-        restored
+        Ok(restored)
     }
 
     /// Restores the logged rooms, noting the snapshots they hold.
-    fn recover_rooms(self: &Arc<Self>, held: &mut Vec<tpf3mp_snapshot::ManifestId>) -> usize {
-        let Some(dir) = &self.env.data_dir else {
-            return 0;
-        };
-        let Ok(entries) = fs::read_dir(dir) else {
-            return 0;
-        };
-        // Only regular files: a planted link must not lead recovery, which
-        // may cut a torn record, to some other file.
-        let files: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .map(|entry| entry.path())
-            .collect();
-        let has_extension =
-            |path: &PathBuf, wanted: &str| path.extension().is_some_and(|ext| ext == wanted);
-        for partial in files
-            .iter()
-            .filter(|path| has_extension(path, "compacting"))
-        {
+    fn recover_rooms(
+        self: &Arc<Self>,
+        files: RecoveryFiles,
+        held: &mut Vec<tpf3mp_snapshot::ManifestId>,
+    ) -> usize {
+        for partial in files.compacting {
             // A compaction the last process did not finish; the log it
             // would have replaced is whole.
             let _ = fs::remove_file(partial);
         }
-        let mut paths: Vec<PathBuf> = files
-            .into_iter()
-            .filter(|path| has_extension(path, "log"))
-            .collect();
-        paths.sort();
         let mut restored = 0;
-        for path in paths {
+        for path in files.logs {
             let recovered = Room::recover(&path, self.key.clone(), &self.rules, self.env.clone());
             match recovered {
                 Ok(Some(room)) => {
@@ -404,4 +496,249 @@ fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0; N];
     getrandom::fill(&mut bytes).expect("the operating system's random source is available");
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use tpf3mp_net::{ServerIdentity, bulk};
+    use tpf3mp_proto::{Platform, RoomSettings};
+    use tpf3mp_snapshot::{ChunkParams, ChunkStore, StoreConfig};
+
+    use super::*;
+    use crate::{
+        DiagnosticsConfig, Server, ServerConfig, ServerError, SnapshotConfig,
+        metrics::Metrics,
+        persist::{StartMember, StartRecord},
+        room::Timeouts,
+        snapshots::{Pointer, SavePoint, Snapshots},
+    };
+
+    fn start(id: u8, version: u16) -> StartRecord {
+        let owner = PlayerId(FixedBytes([2; 32]));
+        StartRecord {
+            version,
+            history: 1,
+            id: RoomId(FixedBytes([id; 16])),
+            name: Text::new("room").unwrap(),
+            rules: Text::new("native").unwrap(),
+            manifest: None,
+            owner,
+            max_players: 4,
+            settings: RoomSettings::DEFAULT,
+            invite_tag: vec![id; 32],
+            password_tag: None,
+            members: vec![StartMember {
+                player: owner,
+                name: Text::new("owner").unwrap(),
+                platform: Platform::current(),
+                content: None,
+            }],
+            base: None,
+        }
+    }
+
+    /// A valid room sorts before the incompatible room. Without preflight,
+    /// recovery rewrites and registers it before quarantining the old log.
+    fn logged_rooms(data: &Path, store: &ChunkStore) -> PathBuf {
+        let valid = start(0, persist::FORMAT_VERSION);
+        drop(RoomLog::create(data, &valid).unwrap());
+        let old = start(1, 8);
+        drop(RoomLog::create(data, &old).unwrap());
+        // Cleanup of an interrupted, current-format compaction must not run.
+        let partial = RoomLog::path_for(data, &valid.id).with_extension("log.compacting");
+        fs::copy(RoomLog::path_for(data, &valid.id), partial).unwrap();
+        let manifest = store
+            .ingest(&[7_u8; 1000][..], ChunkParams::DEFAULT)
+            .unwrap();
+        Pointer::new(
+            bulk::snapshot_id(&manifest.id()),
+            SavePoint {
+                event: 0,
+                after_turn: 0,
+                history: 1,
+                sealed_through: 0,
+            },
+        )
+        .write(data, &old.id)
+        .unwrap();
+        RoomLog::path_for(data, &old.id)
+    }
+
+    fn file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn read(dir: &Path, root: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    read(&path, root, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        fs::read(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        read(root, root, &mut files);
+        files
+    }
+
+    fn config(data: &Path, snapshots: &Path) -> ServerConfig {
+        let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+        let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), identity);
+        config.data_dir = Some(data.to_owned());
+        config.snapshots = Some(SnapshotConfig::new(snapshots));
+        config
+    }
+
+    #[tokio::test]
+    async fn incompatible_startup_preserves_every_log_pointer_and_snapshot_byte() {
+        for extension in ["log", "broken", "log.compacting"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            let snapshots = temp.path().join("snapshots");
+            let store = ChunkStore::open(&snapshots, StoreConfig::new(1 << 20)).unwrap();
+            let original = logged_rooms(&data, &store);
+            let legacy = original.with_extension(extension);
+            if legacy != original {
+                fs::rename(&original, &legacy).unwrap();
+            }
+            // ChunkStore::open clears tmp: preservation proves bind refuses
+            // before reopening the store, as well as before recovery/GC.
+            fs::write(snapshots.join("tmp/unfinished"), b"keep pending disk work").unwrap();
+            drop(store);
+            let before_data = file_bytes(&data);
+            let before_snapshots = file_bytes(&snapshots);
+            let diagnostics = temp.path().join("diagnostics");
+            let mut config = config(&data, &snapshots);
+            config.diagnostics = Some(DiagnosticsConfig::new(
+                diagnostics.clone(),
+                Duration::ZERO,
+                0,
+            ));
+            let error = match Server::bind(config) {
+                Err(error) => error,
+                Ok(_) => panic!("incompatible room data must refuse startup"),
+            };
+            assert!(
+                matches!(error, ServerError::Recovery(RecoveryError::UnsupportedFormat { path, found: 8, supported: persist::FORMAT_VERSION }) if path == legacy)
+            );
+            assert_eq!(
+                file_bytes(&data),
+                before_data,
+                "all rooms and partials are unchanged"
+            );
+            assert_eq!(
+                file_bytes(&snapshots),
+                before_snapshots,
+                "roots, chunks and unfinished work are unchanged"
+            );
+            assert!(
+                !diagnostics.exists(),
+                "preflight precedes diagnostics startup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_recovery_refuses_before_rewriting_registering_or_collecting() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let snapshot_dir = temp.path().join("snapshots");
+        let snapshots = Arc::new(Snapshots::open(&SnapshotConfig::new(&snapshot_dir)).unwrap());
+        let legacy = logged_rooms(&data, &snapshots.store);
+        let before_data = file_bytes(&data);
+        let before_snapshots = file_bytes(&snapshot_dir);
+        let directory = Arc::new(Directory::new(DirectoryConfig {
+            secret: [1; 32],
+            max_rooms: 100,
+            rules: RulesMenu::native(),
+            env: RoomEnv {
+                tick: Duration::from_millis(100),
+                metrics: Arc::new(Metrics::default()),
+                data_dir: Some(data.clone()),
+                timeouts: Timeouts {
+                    stall: Duration::from_secs(10),
+                    load: Duration::from_secs(10),
+                    abandoned: Duration::from_secs(600),
+                },
+                snapshots: Some(snapshots),
+                compact_log_at: 1 << 20,
+            },
+        }));
+        let error = directory.recover().unwrap_err();
+        assert!(
+            matches!(error, RecoveryError::UnsupportedFormat { path, found: 8, supported: persist::FORMAT_VERSION } if path == legacy)
+        );
+        assert_eq!(directory.len(), 0, "no earlier valid room was registered");
+        assert_eq!(file_bytes(&data), before_data);
+        assert_eq!(file_bytes(&snapshot_dir), before_snapshots);
+    }
+
+    #[tokio::test]
+    async fn unidentified_first_records_preserve_the_same_data_as_unsupported_formats() {
+        for extension in ["log", "broken", "log.compacting"] {
+            for damage in ["crc", "truncated", "unreadable-version"] {
+                let temp = tempfile::tempdir().unwrap();
+                let data = temp.path().join("data");
+                let snapshots = temp.path().join("snapshots");
+                let store = ChunkStore::open(&snapshots, StoreConfig::new(1 << 20)).unwrap();
+                let original = logged_rooms(&data, &store);
+                let legacy = original.with_extension(extension);
+                let mut bytes = fs::read(&original).unwrap();
+                match damage {
+                    "crc" => bytes[8] ^= 1,
+                    "truncated" => bytes.truncate(4),
+                    "unreadable-version" => {
+                        let payload = [0xff_u8; 10];
+                        bytes.clear();
+                        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+                        bytes.extend_from_slice(&payload);
+                    }
+                    _ => unreachable!(),
+                }
+                fs::write(&original, bytes).unwrap();
+                if legacy != original {
+                    fs::rename(&original, &legacy).unwrap();
+                }
+                fs::write(snapshots.join("tmp/unfinished"), b"keep pending disk work").unwrap();
+                drop(store);
+                let before_data = file_bytes(&data);
+                let before_snapshots = file_bytes(&snapshots);
+                let error = match Server::bind(config(&data, &snapshots)) {
+                    Err(error) => error,
+                    Ok(_) => panic!("an unidentified header cannot be declared current format"),
+                };
+                assert!(
+                    matches!(error, ServerError::Recovery(RecoveryError::UnknownFormat { path, source: LogError::Damaged(0) }) if path == legacy)
+                );
+                assert_eq!(file_bytes(&data), before_data, "{extension} with {damage}");
+                assert_eq!(
+                    file_bytes(&snapshots),
+                    before_snapshots,
+                    "{extension} with {damage}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_data_directory_refuses_before_creating_any_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::write(&data, b"a file is not a data directory").unwrap();
+        let snapshots = temp.path().join("snapshots");
+        let error = match Server::bind(config(&data, &snapshots)) {
+            Err(error) => error,
+            Ok(_) => panic!("unreadable recovery input must refuse startup"),
+        };
+        assert!(
+            matches!(error, ServerError::Recovery(RecoveryError::Read { path, .. }) if path == data)
+        );
+        assert!(!snapshots.exists());
+        assert_eq!(fs::read(&data).unwrap(), b"a file is not a data directory");
+    }
 }

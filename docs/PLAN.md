@@ -17,7 +17,8 @@ plan below is retained as context; this checklist tracks our validation.
 - [x] ReedME branch protections and protected update-signing environment.
 - [x] Fork server/image/update defaults and portable private verifier tested.
 - [x] Local source checks, Windows crosscheck and synthetic room acceptance.
-- [ ] Cross-platform CI and full acceptance workflow on the pushed candidate.
+- Cross-platform CI and acceptance must pass on the exact pushed candidate;
+  current run results are tracked on [the review PR](https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod/pull/1).
 - [ ] Exact supported Windows archive and private verifier runner available.
 - [ ] Real two-player Proton competitive/recovery session.
 

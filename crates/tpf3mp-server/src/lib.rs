@@ -16,7 +16,15 @@ mod snapshots;
 mod tunnel;
 mod verdict;
 
-use std::{fmt, future::Future, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    io,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -36,6 +44,8 @@ pub use crate::{
         DiagnosticsConfig, Entry as DiagnosticsEntry, READ_LIMIT as DIAGNOSTICS_READ_LIMIT,
         SESSION_QUOTA, SessionOf as DiagnosticsSession, Summary as DiagnosticsSummary,
     },
+    directory::RecoveryError,
+    persist::LogError as RoomLogError,
     ruleset::{AcceptAll, NATIVE, RulesChoice, RulesMenu, Ruleset, RulesetFactory},
     snapshots::SnapshotConfig,
     tunnel::{AddressRange, TunnelConfig},
@@ -187,6 +197,8 @@ impl fmt::Debug for ServerConfig {
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error("room recovery refused: {0}")]
+    Recovery(#[from] RecoveryError),
     #[error(transparent)]
     Tls(#[from] TlsError),
     #[error("cannot open the UDP socket: {0}")]
@@ -240,7 +252,17 @@ pub struct Server {
 }
 
 impl Server {
+    /// Read-only compatibility check for a server's room data. CLI callers
+    /// run this before creating certificates or invite keys; `bind` also
+    /// checks before opening stores or starting recovery.
+    pub fn preflight_data_dir(data_dir: Option<&Path>) -> Result<(), RecoveryError> {
+        Directory::preflight(data_dir)
+    }
+
     pub fn bind(config: ServerConfig) -> Result<Self, ServerError> {
+        // Store opening creates directories and lock files; diagnostics can
+        // prune old reports. Refuse incompatible room data before either.
+        Self::preflight_data_dir(config.data_dir.as_deref())?;
         let snapshots = match &config.snapshots {
             Some(snapshots) => Some(Arc::new(Snapshots::open(snapshots)?)),
             None => None,
@@ -293,7 +315,7 @@ impl Server {
             ),
             None => None,
         };
-        let restored = directory.recover();
+        let restored = directory.recover()?;
         if restored > 0 {
             tracing::info!(rooms = restored, "restored running rooms");
         }

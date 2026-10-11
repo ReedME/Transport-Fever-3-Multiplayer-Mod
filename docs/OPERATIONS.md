@@ -228,7 +228,10 @@ The ReedME repair candidate changes protocol 19 → 20, bridge 28 → 29 and
 room-log format 8 → 9. There is no old-log migration. Preserve the old server
 binaries, secret, logs and snapshots together, use a fresh data directory for
 this fork, and start fresh rooms. Format-8 logs are refused without rewriting
-them; do not point the candidate at live upstream room data. Importing a game
+them. Startup checks every log before opening the snapshot store or running
+recovery cleanup. Unidentified first-record formats also refuse startup;
+archive or repair those files deliberately, preserving the complete old data
+directory. Do not point the candidate at live upstream room data. Importing a game
 save into a fresh room applies the documented company-password reset policy.
 The resume upgrade check below applies only to compatible persisted formats;
 it cannot certify this incompatible transition as preserving running rooms.

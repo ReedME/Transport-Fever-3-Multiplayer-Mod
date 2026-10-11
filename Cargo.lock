@@ -4584,6 +4584,7 @@ dependencies = [
  "tpf3mp-proto",
  "tpf3mp-snapshot",
  "tracing",
+ "tracing-subscriber",
  "webpki-roots",
 ]
 

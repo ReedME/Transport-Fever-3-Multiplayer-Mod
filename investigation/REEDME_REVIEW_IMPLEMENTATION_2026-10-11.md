@@ -30,6 +30,19 @@ generation, pointer and hold lifecycle. Review followups also closed
 same-snapshot count loss, lost load acknowledgements, event-number filename
 reuse and abandoned-completion retention.
 
+Cross-platform validation exposed another replacement-fetch race: aborting an
+async download does not cancel blocking snapshot I/O, which can still own the
+exclusive transfer claim. A same-snapshot replacement now waits asynchronously
+within the existing idle deadline for that claim to release. Resuming directly
+also removes the pending-list/read race; if the old worker removed that record,
+the validated offered manifest can start the replacement. Other errors still
+propagate. Deterministic QUIC fixtures observe the actual contention before
+releasing the old owner, verify exact received bytes and independent snapshot
+progress, and bound a busy-owner timeout. Restoring the old opener in a scratch
+checkout makes the overlap regression fail. The restored-room fixture waits for an actual completed load
+and a rebound server before its next player joins; its exact load-count and
+world-equality assertions remain.
+
 ## Persistence and competitive policies
 
 Loan migration retains outstanding principal and existing journals, books no
@@ -52,7 +65,12 @@ automatic rollback of the room log or arbitrary-replica selection.
 
 The repair uses protocol **20**, bridge **29** and room-log format **9**.
 Protocol-19 clients cannot connect. Old format-8 room data is refused and
-preserved; no migration is implemented. Keep old binaries, secret, logs and
+preserved before recovery rewrites or snapshot cleanup; a startup preflight
+checks every room log first and refuses unidentified/damaged first records too.
+The CLI checks before writing a certificate or invite key. Byte-preservation
+fixtures cover mixed versions, quarantined logs, compaction files and damaged
+headers; an actual CLI refusal fixture covers identity files. No migration is
+implemented. Keep old binaries, secret, logs and
 snapshots together and use fresh fork rooms/data directories. This candidate
 has not passed a migration of running upstream sessions.
 
@@ -61,7 +79,7 @@ has not passed a migration of running upstream sessions.
 - `cargo fmt --all -- --check` and `git diff --check`.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` on Linux
   and the Windows GNU target.
-- `cargo test --workspace --locked`: **1,727 passed, 0 failed, 9 ignored**.
+- `cargo test --workspace --locked`: **1,735 passed, 0 failed, 9 ignored**.
   The ignored environment/hardware tests are not counted as passes. Broad
   testing exposed an existing parallel-test race over the hook's simulation
   seed; shared test-only guards fix it without changing production behavior
@@ -84,6 +102,16 @@ has not passed a migration of running upstream sessions.
   divergences. Both loaded the room world. The existing plain-UDP fallback
   handled Wine's unsupported socket options. Seven Windows installer
   fixtures also passed in that prefix.
+- Windows Steam discovery fixtures under Proton: **11 passed, 1 ignored**.
+- The two late-join paths and barrier-based restored-world scenario pass
+  under Proton on the final Windows candidate.
+- Native Linux server with Windows clients under Proton: two fake players,
+  1,200 steps each, matching final lanes and zero divergences.
+
+Additional Windows-server scenarios under Wine exposed an unresolved open-log
+compaction failure (`Access denied` during replacement). The initial supported
+topology uses a native Linux server with Windows clients under Proton. Native
+Windows server CI is separate from running that server inside Wine.
 
 These tests exercise model worlds and Lua API stand-ins. They cannot prove
 native injection, real engine determinism, gameplay presentation or long

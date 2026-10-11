@@ -2,6 +2,7 @@
 //! play to the target step, and collect every bot's report.
 
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -233,6 +234,33 @@ pub(crate) fn link_name(kind: &str) -> String {
 /// resumes, as the real one does; a player who joins late receives the
 /// world from the room. Returns the hooks' reports in plan order.
 pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
+    play_bridged_room_controlled(plan, BridgedControl::default()).await
+}
+
+/// Fixture milestones and gates, indexed by the plan's player seat. They
+/// synchronize scenarios with completed game work; production timing is unchanged.
+#[derive(Default)]
+pub struct BridgedControl {
+    /// Receives the next step only after that game loaded a snapshot and
+    /// acknowledged it to its bridge.
+    pub snapshot_loaded: BTreeMap<usize, tokio::sync::mpsc::UnboundedSender<u64>>,
+    /// A late player also waits for this signal before connecting. Its
+    /// scheduled `join_after` remains the earliest time it can arrive.
+    pub before_join: BTreeMap<usize, tokio::sync::oneshot::Receiver<()>>,
+}
+
+/// As [`play_bridged_room`], with explicit milestones for restart fixtures.
+pub async fn play_bridged_room_controlled(
+    plan: BridgedPlan,
+    mut control: BridgedControl,
+) -> Result<Vec<HookReport>> {
+    if control.before_join.keys().any(|seat| {
+        plan.players
+            .get(*seat)
+            .is_none_or(|player| player.join_after.is_none())
+    }) {
+        bail!("a join gate must name a late player's seat");
+    }
     let mut starting = Vec::new();
     for player in plan.players.iter().filter(|p| p.join_after.is_none()) {
         let options = player.options(&plan)?;
@@ -264,6 +292,7 @@ pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
             &invite,
             connection,
             start_world,
+            control.snapshot_loaded.remove(&index),
         )?);
     }
     if let Some(owner) = owner {
@@ -279,6 +308,12 @@ pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
     late.sort_by_key(|(_, _, after)| *after);
     for (index, player, after) in late {
         tokio::time::sleep_until(started + after).await;
+        if let Some(gate) = control.before_join.remove(&index) {
+            tokio::time::timeout(plan.deadline, gate)
+                .await
+                .context("waiting for a late player's join gate")?
+                .context("a late player's join gate closed before it was opened")?;
+        }
         let options = player.options(&plan)?;
         let (client, events) = join_late(&options, &invite, plan.deadline).await?;
         games[index] = Some(play_through_hook(
@@ -287,6 +322,7 @@ pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
             &invite,
             (options, client, events),
             None,
+            control.snapshot_loaded.remove(&index),
         )?);
     }
 
@@ -384,6 +420,7 @@ fn play_through_hook(
     invite: &Invite,
     (options, client, events): (ConnectOptions, Client, Events),
     start_world: Option<PathBuf>,
+    snapshot_loaded: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
 ) -> Result<(Hook, BridgeTask)> {
     let rejoin = Rejoin {
         options,
@@ -400,19 +437,22 @@ fn play_through_hook(
     };
     let link_name = link_name("bridged");
     let link = Link::create(&LinkConfig::new(&link_name), Role::Agent)?;
-    let hook = fake_hook::spawn(FakeHookConfig {
-        link_name,
-        player: client.player(),
-        seed: player.seed,
-        world_seed: player.world_seed,
-        act_every: player.act_every,
-        target_step: player.target_step,
-        drift_at: player.drift_at,
-        patience: plan.deadline,
-        // A room that starts from a save starts with the games at their
-        // menus; late joiners arrive at a running game.
-        at_menu: plan.start_world.is_some() && player.join_after.is_none(),
-    });
+    let hook = fake_hook::spawn_observed(
+        FakeHookConfig {
+            link_name,
+            player: client.player(),
+            seed: player.seed,
+            world_seed: player.world_seed,
+            act_every: player.act_every,
+            target_step: player.target_step,
+            drift_at: player.drift_at,
+            patience: plan.deadline,
+            // A room that starts from a save starts with the games at their
+            // menus; late joiners arrive at a running game.
+            at_menu: plan.start_world.is_some() && player.join_after.is_none(),
+        },
+        snapshot_loaded,
+    );
     let bridge = tokio::spawn(async move {
         let options = BridgeOptions {
             worlds,

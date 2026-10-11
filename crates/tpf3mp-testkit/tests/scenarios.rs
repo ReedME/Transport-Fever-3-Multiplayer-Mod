@@ -16,7 +16,8 @@ use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
     scenario::{
-        BridgedPlan, BridgedPlayer, RoomPlan, latency_summary, play_bridged_room, play_room,
+        BridgedControl, BridgedPlan, BridgedPlayer, RoomPlan, latency_summary, play_bridged_room,
+        play_bridged_room_controlled, play_room,
     },
     toy::{ToyWorld, lane, toy_rules_menu},
 };
@@ -70,6 +71,14 @@ impl TestServer {
         data: Option<(PathBuf, [u8; 32])>,
         snapshots: Option<SnapshotConfig>,
     ) -> Self {
+        // Keep CI quiet normally; opt in to the real bridge/server diagnostics
+        // when reproducing a scenario failure, including connection close reasons.
+        if let Ok(filter) = std::env::var("TPF3MP_TEST_TRACE") {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_test_writer()
+                .try_init();
+        }
         let trust = ServerTrust::Pinned(identity.leaf().clone());
         let mut config = ServerConfig::new(listen, identity);
         if let Some((dir, secret)) = data {
@@ -781,24 +790,39 @@ async fn a_restored_room_still_hands_on_its_world() {
     // Long enough that the second player still plays when the last one's
     // world is handed on (it reloads it too).
     let mut players = saving_players(3, 1200);
-    // One player joins early, so the room saves before the restart; the
-    // last joins after it, from the world the restored room kept.
+    // One player joins early. Restart only after its snapshot really loaded;
+    // disk work and debug-build speed must not decide whether that happened.
     players[1].join_after = Some(Duration::from_secs(1));
-    players[2].join_after = Some(Duration::from_secs(6));
-    let game = tokio::spawn(play_bridged_room(BridgedPlan {
-        server: address,
-        server_name: "localhost".into(),
-        trust: first.trust.clone(),
-        settings,
-        players,
-        deadline: Duration::from_secs(90),
-        worlds: Some(root.join("players")),
-        start_world: None,
-    }));
+    players[2].join_after = players[1].join_after;
+    let (loaded, mut loaded_worlds) = tokio::sync::mpsc::unbounded_channel();
+    let (restart_done, join_after_restart) = oneshot::channel();
+    let control = BridgedControl {
+        snapshot_loaded: [(1, loaded)].into(),
+        before_join: [(2, join_after_restart)].into(),
+    };
+    let game = tokio::spawn(play_bridged_room_controlled(
+        BridgedPlan {
+            server: address,
+            server_name: "localhost".into(),
+            trust: first.trust.clone(),
+            settings,
+            players,
+            deadline: Duration::from_secs(90),
+            worlds: Some(root.join("players")),
+            start_world: None,
+        },
+        control,
+    ));
 
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    tokio::time::timeout(Duration::from_secs(90), loaded_worlds.recv())
+        .await
+        .expect("the second player did not load before the restart deadline")
+        .expect("the second player ended before loading its first snapshot");
     first.stop().await;
     let second = TestServer::start_saving(address, identity, data, root.join("snapshots")).await;
+    restart_done
+        .send(())
+        .expect("the scenario ended before the restored server was ready");
 
     let reports = game.await.unwrap().unwrap();
     assert_worlds_agree(&reports);

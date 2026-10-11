@@ -2,6 +2,8 @@
 
 This public fork targets trusted friends competing as separate companies in
 the Windows Steam game under Proton. The sequencer can run natively on Linux.
+Use the native Linux server for this initial setup; Windows-server log
+compaction inside Wine has a known compatibility failure.
 The review baseline is upstream v1.3.1 at
 `538733611cc5e4c8ea30d48513d5b0df761db05a`; the repair candidate is
 `1.3.2-reedme.1`. The dated review remains a record of that baseline, rather
@@ -44,8 +46,11 @@ Start the Windows launcher in the game's Proton prefix with
 reachable explicit address and the same pinned certificate. Keep the server's
 secret file and data directory together for same-room recovery. Protocol 20,
 bridge 29 and persisted format 9 require matching candidate binaries; protocol
-19 clients cannot join this server. Old format-8 room logs must remain backed
-up and be handled by the format gate rather than silently reinterpreted.
+19 clients cannot join this server. Back up the complete old data directory,
+including snapshots and the invite key, before any upgrade. Startup refuses
+incompatible or unidentified room-log formats before identity writes, recovery
+or snapshot cleanup. Format-8 data needs its matching old server; this candidate
+needs fresh data and, if configured separately, a fresh snapshot directory.
 
 The deployment default is `ghcr.io/reedme/tpf3mp-server`. A manually published
 feature image uses `branch-codex-proton-competitive-fixes`; select it through
@@ -90,6 +95,9 @@ disposable world. Verify installation output, launcher injection and Steam
 sign-in, then two companies at 1x, pause/resume and 4x. Cover debt-free time
 before borrowing, staggered loans, displayed installment/payoff, automatic
 saves, late join, reconnect, replacement-world reload and server restart.
+Through the normal game UI, check independent balances and asset ownership,
+shared station access, and refusal of actions against the other company's
+assets. These ownership checks require real-game acceptance too.
 Include a paused saved loan and infinite-money setting in finance acceptance.
 Record every scheduled checkpoint, including missing samples, and inspect
 game/hook/server logs. Synthetic or profile verification cannot substitute for
