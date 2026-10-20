@@ -184,6 +184,56 @@ function companies.head(roster, id)
 	return players[1]
 end
 
+local function stableRoom(room)
+	return type(room) == "string" and #room == 34 and room:match("^r%-%x+$") ~= nil
+end
+
+-- Password seals are bound to the server's stable RoomId. A display name
+-- or invite cannot establish their provenance. Unknown legacy provenance
+-- is reset once; subsequent same-room loads preserve the recorded seals.
+function companies.roomNeedsBind(roster, room)
+	return stableRoom(room) and (type(roster) ~= "table" or roster.passwordRoom ~= room)
+end
+
+function companies.bindRoom(roster, room)
+	if not stableRoom(room) then return nil, "the stable room identity is unavailable" end
+	if roster.passwordRoom == room then return 0 end
+	local legacy = not stableRoom(roster.passwordRoom)
+	local cleared = {}
+	for _, c in ipairs(roster.list or {}) do
+		if type(c.lock) == "table" then
+			c.lock = nil
+			if not c.gone then cleared[#cleared + 1] = c.id end
+		end
+	end
+	roster.passwordRoom = room
+	roster.passwordReset = #cleared > 0 and { legacy = legacy, companies = cleared } or nil
+	return #cleared
+end
+
+function companies.passwordNotice(roster)
+	local reset = type(roster) == "table" and roster.passwordReset
+	if type(reset) ~= "table" then return nil end
+	local names = {}
+	for _, id in ipairs(reset.companies or {}) do
+		local c = companies.find(roster, id)
+		if c and not c.gone then names[#names + 1] = c.name end
+	end
+	if #names == 0 then return nil end
+	local why = reset.legacy and "This older save has no recorded password room."
+		or "This save was imported into a different room."
+	return why .. " Previous company passwords were cleared and must be set again: " .. table.concat(names, ", ") .. "."
+end
+
+local function passwordResolved(roster, id)
+	local reset = roster.passwordReset
+	if type(reset) ~= "table" then return end
+	for i = #(reset.companies or {}), 1, -1 do
+		if reset.companies[i] == id then table.remove(reset.companies, i) end
+	end
+	if #reset.companies == 0 then roster.passwordReset = nil end
+end
+
 -- The roster in one line, for hook.log: each live company with its id, its
 -- head (the first 8 hex digits), how many chose it, and whether it has a
 -- password or closed stations. Never a seal.
@@ -796,13 +846,14 @@ end
 -- the game offers (the loan script's availableLoans), booked to that
 -- company as the game books a loan (a LOAN journal entry, which raises the
 -- account's balance and its loan alike, seen on build 40408), and paid back
--- month by month as an annuity, the interest booked as INTEREST and the
--- rest as LOAN, until nothing is owed; or all at once.
+-- with the native loan_util.tl's equal principal and fixed interest, with
+-- rounding corrections on the final payment; or all at once. Each loan's
+-- payment origin is its own game timestamp, as in loan.script.tl.
 --
 --   roster.loans = { { id =, company =, amount =, remaining =, months =,
---                      paid =, rate = (a month), payment = }, ... }
+--                      duration =, percentage =, paid =, lastPayDay =,
+--                      accounting = "native-v1", payment = }, ... }
 --   roster.nextLoan = n
---   roster.month = the last month whose payments were booked
 --   roster.loanOffers = { { company = id, availableLoans = { Loan, ... } }, ... }
 
 companies.LOAN_SCRIPT = "::/game_mechanics/finance/loan.gs"
@@ -944,7 +995,7 @@ function companies.monthNow(api)
 end
 
 local function monthLength(api)
-	local ok, length = pcall(api.util.getDefaultMonthDuration)
+	local ok, length = pcall(function() return api.util.getDefaultMonthDuration() end)
 	if ok and type(length) == "number" and length > 0 then return length end
 	return nil
 end
@@ -959,10 +1010,49 @@ local function book(api, send, entity, amount, kind)
 	send(api.cmd.makeJournalBookAssetCmd(entity, entry))
 end
 
--- The monthly payment that pays `amount` back in `months` at `rate` a month.
-local function annuity(amount, rate, months)
-	if rate <= 0 then return math.ceil(amount / months) end
-	return math.ceil(amount * rate / (1 - (1 + rate) ^ -months))
+-- Native loan_util.tl:getMonthlyLoanAndInterestWithErrors (build 40408).
+-- percentage is interest over the whole term, not an annual rate. Keep
+-- both rounding corrections: even a negative interest correction is
+-- booked by the native script on the final payment.
+local function nativePayments(amount, months, percentage)
+	local monthly = amount / months
+	local principal = math.floor(monthly + 0.5)
+	local interest = math.floor(percentage * monthly + 0.5)
+	return principal, interest, amount - months * principal,
+		math.floor(amount * percentage + 0.5) - months * interest
+end
+
+-- Saved annuity loans have no per-loan time origin. Preserve the exact
+-- outstanding debt and all previously booked journals, and refinance only
+-- that balance over the unexpired number of payments at the offered term
+-- percentage. This changes no money. The new schedule starts now, once,
+-- so neither a stale roster.month nor an old paid count charges it again.
+function companies.migrateLoans(roster, api)
+	local now, length = gameTimeNow(api), monthLength(api)
+	if now == nil or length == nil then return 0 end
+	local migrated, keep = 0, {}
+	for _, loan in ipairs(roster.loans or {}) do
+		if loan.accounting ~= "native-v1" and loan.remaining > 0 then
+			loan.legacy = { amount = loan.amount, remaining = loan.remaining, months = loan.months,
+				paid = loan.paid, rate = loan.rate, payment = loan.payment }
+			loan.amount = loan.remaining
+			loan.months = math.max(1, loan.months - loan.paid)
+			loan.duration = loan.months * length
+			loan.percentage = loan.rate * 12
+			loan.paid, loan.lastPayDay, loan.accounting = 0, now, "native-v1"
+			local principal, interest = nativePayments(loan.amount, loan.months, loan.percentage)
+			loan.payment = principal + interest
+			loan.rate = nil
+			migrated = migrated + 1
+		end
+		-- Native rounding corrections may temporarily make the principal
+		-- zero or negative before the final installment; its final principal
+		-- and interest corrections still have to be booked.
+		if loan.accounting == "native-v1" and loan.paid < loan.months then keep[#keep + 1] = loan end
+	end
+	roster.loans = keep
+	roster.month = nil
+	return migrated
 end
 
 -- The loans of company `id`.
@@ -994,8 +1084,11 @@ function companies.loanTable(roster, id, real, monthLength, fresh)
 	end
 	local obtained = {}
 	for _, loan in ipairs(type(roster) == "table" and companies.loansOf(roster, id) or {}) do
+		-- GUI reads never migrate simulation state or invent a payoff for an
+		-- old annuity loan. The simulation migrates it at its next update.
+		if loan.accounting ~= "native-v1" then error("the company's loan accounting is awaiting migration") end
 		obtained[#obtained + 1] = { type = loan.type or "Custom", amount = loan.amount,
-			duration = loan.months * monthLength, percentage = loan.rate * 12,
+			duration = loan.duration, percentage = loan.percentage,
 			timesPaid = loan.paid, id = loan.id }
 	end
 	return { availableLoans = offers, obtainedLoans = obtained, freeId = type(roster) == "table" and roster.nextLoan or 1 }
@@ -1035,7 +1128,6 @@ function companies.borrow(roster, id, terms, nextTerms, send, api)
 	local amount, duration, percentage = terms.amount, terms.duration, terms.percentage
 	if amount <= 0 or duration <= 0 or percentage < 0 then return false, "the offered loan terms are invalid" end
 	local months = math.max(1, math.floor(duration / length + 0.5))
-	local rate = percentage / 12
 	local now = gameTimeNow(api)
 	if now == nil then return false, "this game does not say what time it is" end
 	local minCooldown, maxCooldown = length * 4, length * 8
@@ -1045,10 +1137,11 @@ function companies.borrow(roster, id, terms, nextTerms, send, api)
 	state.availableLoans[slot] = { type = terms.type, cooldownUntil = now + cooldown }
 	roster.loans = roster.loans or {}
 	roster.nextLoan = (roster.nextLoan or 1)
+	local principal, interest = nativePayments(amount, months, percentage)
 	roster.loans[#roster.loans + 1] = { id = roster.nextLoan, company = id, amount = amount, remaining = amount,
-		months = months, paid = 0, rate = rate, payment = annuity(amount, rate, months), type = terms.type }
+		months = months, duration = duration, percentage = percentage, paid = 0, lastPayDay = now,
+		accounting = "native-v1", payment = principal + interest, type = terms.type }
 	roster.nextLoan = roster.nextLoan + 1
-	roster.month = roster.month or companies.monthNow(api)
 	return true
 end
 
@@ -1074,39 +1167,45 @@ function companies.repay(roster, id, terms, send, api)
 	return false, "the company has no such loan"
 end
 
--- Books every month since the last one booked: each loan's payment, its
--- interest and the part that pays the loan down. Returns how many months.
-function companies.chargeMonths(roster, month, send, api)
-	if type(month) ~= "number" then return 0 end
-	if roster.month == nil then roster.month = month return 0 end
-	local months = 0
-	while roster.month < month do
-		roster.month = roster.month + 1
-		months = months + 1
-		local keep = {}
-		for _, loan in ipairs(roster.loans or {}) do
+-- At most one installment per due loan per update, as loan.script.tl:
+-- lastPayDay becomes the game's current time, not a global month index.
+-- A delayed update never charges time before the loan was taken.
+function companies.chargeLoans(roster, send, api)
+	local now = gameTimeNow(api)
+	if now == nil then return 0 end
+	local payments, keep = 0, {}
+	for _, loan in ipairs(roster.loans or {}) do
+		if loan.accounting ~= "native-v1" then error("loan accounting must be migrated before charging") end
+		if loan.lastPayDay + loan.duration / loan.months <= now then
+			local principal, interest, principalError, interestError = nativePayments(loan.amount, loan.months, loan.percentage)
+			loan.paid = loan.paid + 1
+			loan.lastPayDay = now
+			if loan.paid == loan.months then
+				principal, interest = principal + principalError, interest + interestError
+			end
 			local c = companies.find(roster, loan.company)
-			local interest = math.floor(loan.remaining * loan.rate + 0.5)
-			local principal = math.min(loan.remaining, math.max(0, loan.payment - interest))
-			if loan.paid + 1 >= loan.months then principal = loan.remaining end
 			if c then
-				if interest > 0 then book(api, send, c.entity, -interest, "INTEREST") end
-				if principal > 0 then book(api, send, c.entity, -principal, "LOAN") end
+				book(api, send, c.entity, -principal, "LOAN")
+				book(api, send, c.entity, -interest, "INTEREST")
 			end
 			loan.remaining = loan.remaining - principal
-			loan.paid = loan.paid + 1
-			if loan.remaining > 0 then keep[#keep + 1] = loan end
+			payments = payments + 1
 		end
-		roster.loans = keep
+		if loan.paid < loan.months then keep[#keep + 1] = loan end
 	end
-	return months
+	roster.loans = keep
+	return payments
 end
 
--- Whether a month's payments are due: a company owes something and a month
--- has begun since the last booked.
-function companies.due(roster, month)
-	return type(roster) == "table" and type(month) == "number" and roster.month ~= nil
-		and month > roster.month and #(roster.loans or {}) > 0
+-- Old schedules also wake the simulation so they migrate even without a
+-- player action. Reading this predicate never changes the saved roster.
+function companies.loansDue(roster, api)
+	local now = gameTimeNow(api)
+	if type(roster) ~= "table" or now == nil or monthLength(api) == nil then return false end
+	for _, loan in ipairs(roster.loans or {}) do
+		if loan.accounting ~= "native-v1" or loan.lastPayDay + loan.duration / loan.months <= now then return true end
+	end
+	return false
 end
 
 -- ------------------------------------------------------------- subsidies
@@ -1307,24 +1406,24 @@ function companies.settleSubsidies(roster, state, day, send, api)
 				r.state = "completed"
 				if not c.gone then
 					moveSubsidy(roster, c, amount, send, api)
-					said[#said + 1] = "subsidy " .. string.format("%d", r.uid) .. " completed for " .. c.name .. ": " .. amount
+					said[#said + 1] = "subsidy " .. string.format("%.0f", r.uid) .. " completed for " .. c.name .. ": " .. amount
 				elseif first and amount ~= 0 then
 					-- Its taker is gone: the reward is no one's, and the
 					-- first company gives back what the script booked it.
 					book(api, send, first.entity, -amount, "SUBSIDY")
-					said[#said + 1] = "subsidy " .. string.format("%d", r.uid) .. " completed for " .. c.name
+					said[#said + 1] = "subsidy " .. string.format("%.0f", r.uid) .. " completed for " .. c.name
 						.. ", gone: its reward of " .. amount .. " is no one's"
 				end
 			elseif where == "failed" then
 				local amount = companies.subsidyMoney(data.failure)
 				if not c.gone then
 					moveSubsidy(roster, c, -amount, send, api)
-					said[#said + 1] = "subsidy " .. string.format("%d", r.uid) .. " failed for " .. c.name .. ": -" .. amount
+					said[#said + 1] = "subsidy " .. string.format("%.0f", r.uid) .. " failed for " .. c.name .. ": -" .. amount
 				elseif first and amount ~= 0 then
 					-- Its taker is gone: no one pays its penalty, and the
 					-- first company gets back what the script charged it.
 					book(api, send, first.entity, amount, "SUBSIDY")
-					said[#said + 1] = "subsidy " .. string.format("%d", r.uid) .. " failed for " .. c.name
+					said[#said + 1] = "subsidy " .. string.format("%.0f", r.uid) .. " failed for " .. c.name
 						.. ", gone: its penalty of " .. amount .. " is no one's"
 				end
 			end
@@ -1410,6 +1509,7 @@ function companies.run(roster, player, op, send, api, seal)
 		if owns then return false, c.name .. " still owns something" end
 		c.gone = true
 		leave(roster, player)
+		passwordResolved(roster, c.id)
 		return true, nil, c.id
 	elseif kind == "Lock" then
 		-- Its head gives it a password, or a new one: every game keeps the
@@ -1420,6 +1520,7 @@ function companies.run(roster, player, op, send, api, seal)
 		if not ok then return false, why end
 		if not sealFor(seal, c.id) then return false, "a password for " .. c.name .. " comes sealed by the room" end
 		c.lock = { scope = seal.scope, tag = seal.tag }
+		passwordResolved(roster, c.id)
 		return true, nil, c.id
 	elseif kind == "Unlock" then
 		local c = companies.find(roster, body)
@@ -1427,6 +1528,7 @@ function companies.run(roster, player, op, send, api, seal)
 		local ok, why = headOf(roster, player, c, "takes the password from")
 		if not ok then return false, why end
 		c.lock = nil
+		passwordResolved(roster, c.id)
 		return true, nil, c.id
 	elseif kind == "Dismiss" then
 		-- Its head sends a player out: they play for the room's first

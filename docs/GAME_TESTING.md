@@ -33,6 +33,11 @@ Test with the cheapest layer that can catch the problem:
 game ("place a bus stop as P2, does P1 see it?") is often quicker than
 scripting it. Say exactly what to do and what to look for.
 
+For company or asset incidents, record each player's active company and
+which company owns every edited asset. A shared-company test does not clear
+an incident reported with players in separate companies; reproduce that
+company and ownership arrangement.
+
 ## Rules
 
 - **Only the games you started.** Other agents may be testing on the same
@@ -143,8 +148,12 @@ It:
    without the mod's page, or is not at its menu after `-MenuWait`
    seconds (180) fails the setup; nothing is typed into it;
 5. waits until the room has saved that world and the guests have loaded it
-   from their main menus;
-6. closes the host's console and zooms in.
+   from their main menus (with `-Players 1`, a game alone in its room, for
+   measuring without a second game on the PC: until the host plays the
+   room's world from step 1);
+6. closes the host's console and zooms in. On a tall window the console's
+   close button is elsewhere: `-CloseConsoleAt x,y` names it, in the
+   coordinates of a half-size capture (`gamewin.ps1 shot`).
 
 It ends by printing:
 
@@ -279,6 +288,45 @@ It compares every step all players sampled, and prints the lanes of each
 step that differs (exit code 1). Equal probes after a test, plus every
 action applied everywhere, is the evidence that the change works in
 multiplayer.
+
+For a company or vehicle incident, keep the event-boundary lines from each
+`hook.log`: `company-event`, `assign-vehicle`, `buy-vehicle`,
+`bulldoze-construction` and `action-event`. They identify the sender's
+company transition, each vehicle/line assignment and its outcome, purchase
+model order and resulting IDs, and the construction actually resolved by a
+bulldoze. Compare canonical vehicle/line IDs across games; native entity IDs
+are local to each game. `owner=none` means no owner component/value was
+present, while `owner=unavailable` means the optional read could not be
+completed. These records contain no player key, invite, password or seal.
+
+### Next desync trial
+
+Use a fresh local two-player room with the candidate hook and mod, starting
+through the ordinary launcher flow. Keep both `hook.log` files from the
+beginning of the room; compare the same checkpoint steps, not just the final
+world. Each player builds roads and tracks, buys and assigns a vehicle, then
+replaces a vehicle and uses it in another ordered action. Keep vehicles and
+traffic active at both 1x and 4x rather than waiting in an empty world. A
+first 30–45 minute session can expose a failure but is only a bounded first
+stage. For the longer acceptance run, cover more than 42,600 room steps
+after the shared load (twice the earlier 21,300-step lane symptom), at least
+60 in-game days, and a rejoin from the room's save followed by another
+vehicle action. Read the actual step numbers in both logs; elapsed wall time
+and game days alone do not establish this coverage. The pass condition is
+that every ordered action applies in both games, every overlapping checkpoint
+digest agrees, and no canonical vehicle or line id changes merely because
+its entity was replaced or briefly omitted from a game list. This is the
+ordinary-start evidence for PLAN.md's Test A; the offline Lua tests establish
+the injected read-error behavior only. Do not inject component-read failures
+in the real game to test that failure path.
+
+If a checkpoint differs, preserve both complete logs and run
+`tools/lane_diff.py` on the resulting lane dumps. Compare the `free ids: step`
+lines at the earliest differing checkpoint and the `free operations:` burst
+in both logs. A `complete=false` burst, missing peer interval or omitted log
+lines leaves the native operation order unproved; rerun with capture intact
+before changing an engine sort. Do not infer the first cause from a later
+vehicle position difference alone.
 
 ## Investigating without the room
 

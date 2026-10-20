@@ -61,7 +61,7 @@ fn preview_pins_its_exact_identity_and_preserves_release_target_coverage() {
     );
     assert_eq!(preview.build.size, Some(69_756_856));
     assert_eq!(preview.build.pe_timestamp, Some(1_790_974_087));
-    assert_eq!(preview.targets.len(), 146);
+    assert_eq!(preview.targets.len(), 152);
     assert_eq!(
         release.build.sha256,
         "de1daad3a13f3b7e9f79903361bb43769cf4f15e59271a263aefe1f075f23ef2"

@@ -89,6 +89,9 @@ impl HookLink for tpf3mp_ipc::Link {
 
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
+    /// The effective child-game configuration, when its environment differs
+    /// from the agent's inherited one. Otherwise parsed once at bridge creation.
+    pub scan_plan: Option<tpf3mp_proto::ScanPlan>,
     /// Playout margin: each step plays this long after its seal arrives.
     pub playout_margin: Duration,
     /// How long a late arrival keeps the playout buffer grown.
@@ -170,6 +173,7 @@ pub struct LobbyLink {
 impl Default for BridgeOptions {
     fn default() -> Self {
         Self {
+            scan_plan: None,
             playout_margin: Duration::from_millis(20),
             playout_memory: Duration::from_secs(10),
             poll: Duration::from_millis(2),
@@ -433,13 +437,17 @@ enum World {
 #[derive(Debug)]
 enum Done {
     Ingested {
+        generation: u64,
+        world_epoch: u64,
         event: u64,
         lanes: Vec<LaneDigest>,
         result: Result<(ManifestId, SavedWorld), String>,
+        hold: Option<transfer::PendingWorld>,
     },
     Fetched {
         attempt: u64,
         result: Result<(PathBuf, ManifestId), String>,
+        hold: Option<transfer::PendingWorld>,
     },
     Uploaded {
         snapshot: SnapshotId,
@@ -450,6 +458,7 @@ enum Done {
     StartCut {
         attempt: u64,
         result: Result<(ManifestId, SavedWorld, Option<FileStamp>), String>,
+        hold: Option<transfer::PendingWorld>,
     },
     /// The room would not take the save it was to start from.
     StartRefused { attempt: u64, error: String },
@@ -537,6 +546,7 @@ fn held_weight(event: &ClientEvent) -> usize {
 
 /// Couples one game's hook to one client.
 pub struct Bridge<L> {
+    scan_plan: Result<tpf3mp_proto::ScanPlan, &'static str>,
     link: L,
     options: BridgeOptions,
     follower: Option<TurnFollower>,
@@ -548,9 +558,12 @@ pub struct Bridge<L> {
     world: World,
     /// Every load sent to the hook still awaiting its answer, in send order.
     /// A server restart can replace a load before its answer arrives.
-    sent_loads: VecDeque<(u64, u64)>,
+    sent_loads: VecDeque<(u64, u64, u64)>,
     /// Identifies the latest load order even if it starts at the same step.
     load_generation: u64,
+    world_epoch: u64,
+    /// Retried on exact reconnect: enqueueing locally is not a server ack.
+    last_loaded: Option<(u64, u64)>,
     /// Whether the game has loaded a world since the last load was ordered.
     loaded: bool,
     /// The room's speed as the hook was last told it; none before the
@@ -629,6 +642,8 @@ pub struct Bridge<L> {
     /// turn stream that would begin the game held until it has: the lists
     /// the game begins with carry the room's mods and settings.
     room_heard: bool,
+    /// The current connection has supplied and validated its room plan.
+    room_view_heard: bool,
     held_stream: Option<TurnStart>,
     /// What came after that stream until then, taken up in order after it.
     held_events: VecDeque<ClientEvent>,
@@ -650,6 +665,7 @@ impl<L: HookLink> Bridge<L> {
     /// one before goes with it.
     fn on_new_connection(&mut self) {
         self.room_heard = false;
+        self.room_view_heard = false;
         self.held_stream = None;
         self.held_events.clear();
         self.held_bytes = 0;
@@ -669,6 +685,10 @@ impl<L: HookLink> Bridge<L> {
         let now = Instant::now();
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         Self {
+            scan_plan: options
+                .scan_plan
+                .map(Ok)
+                .unwrap_or_else(tpf3mp_proto::ScanPlan::from_environment),
             hook_beat: (link.peer_heartbeat(), now),
             link,
             follower: None,
@@ -679,6 +699,8 @@ impl<L: HookLink> Bridge<L> {
             world: World::Ready,
             sent_loads: VecDeque::new(),
             load_generation: 0,
+            world_epoch: 1,
+            last_loaded: None,
             loaded: false,
             speed: None,
             commands: 0,
@@ -724,6 +746,7 @@ impl<L: HookLink> Bridge<L> {
             declared: None,
             told: None,
             room_heard: false,
+            room_view_heard: false,
             held_stream: None,
             held_events: VecDeque::new(),
             held_bytes: 0,
@@ -955,10 +978,13 @@ impl<L: HookLink> Bridge<L> {
                         version: tpf3mp_bridge::BRIDGE_VERSION,
                     });
                 }
-                ToAgent::Loaded { next_step } => {
+                ToAgent::Loaded {
+                    next_step,
+                    world_epoch,
+                } => {
                     // The hook finishes loads in order. A previous world's
                     // answer may arrive after rejoining ordered a replacement.
-                    if !self.current_load_ack(next_step)? {
+                    if !self.current_load_ack(next_step, world_epoch)? {
                         continue;
                     }
                     self.world = World::Ready;
@@ -966,10 +992,12 @@ impl<L: HookLink> Bridge<L> {
                     // Loaded counts as progress: the server holds the room
                     // until every member has loaded.
                     let progress = next_step.saturating_sub(1);
-                    client.report_progress(progress).await?;
+                    self.last_loaded = Some((world_epoch, progress));
                     self.progress = Some(progress);
-                    self.reported = Some(progress);
+                    self.reported = None;
                     self.loaded = true;
+                    client.report_loaded(world_epoch, progress).await?;
+                    self.reported = Some(progress);
                 }
                 ToAgent::Command { payload, secret } => {
                     client
@@ -977,14 +1005,25 @@ impl<L: HookLink> Bridge<L> {
                         .await?;
                     self.commands += 1;
                 }
-                ToAgent::Ran { step } if current => {
+                ToAgent::Ran { step, world_epoch }
+                    if current && world_epoch == self.world_epoch =>
+                {
                     self.progress = Some(step);
                     self.status(|status| status.step = Some(step));
                 }
-                ToAgent::Checkpoint { step, lanes } if current => {
-                    client.report_checkpoint(step, lanes).await?;
+                ToAgent::Checkpoint {
+                    step,
+                    lanes,
+                    world_epoch,
+                } if current && world_epoch == self.world_epoch => {
+                    client.report_checkpoint(world_epoch, step, lanes).await?;
                 }
-                ToAgent::Saved { event, lanes, file } if current => {
+                ToAgent::Saved {
+                    event,
+                    lanes,
+                    file,
+                    world_epoch,
+                } if current && world_epoch == self.world_epoch => {
                     self.saved_world(event, lanes, file, client).await?;
                 }
                 ToAgent::Ran { .. } | ToAgent::Checkpoint { .. } | ToAgent::Saved { .. } => {}
@@ -1191,7 +1230,15 @@ impl<L: HookLink> Bridge<L> {
                 .ingest_copy(&file)
                 .map(|(manifest, world)| (manifest.id(), world, stamp))
                 .map_err(|error| format!("cannot read the save {}: {error}", file.display()));
-            let _ = done.send(Done::StartCut { attempt, result });
+            let hold = result
+                .as_ref()
+                .ok()
+                .map(|(id, _, _)| worlds.pending_result(*id));
+            let _ = done.send(Done::StartCut {
+                attempt,
+                result,
+                hold,
+            });
         });
     }
 
@@ -1363,10 +1410,14 @@ impl<L: HookLink> Bridge<L> {
     ) -> Result<(), BridgeFault> {
         let file = file.map(|file| PathBuf::from(file.as_str()));
         let (Some(worlds), Some(file)) = (self.options.worlds.clone(), file) else {
-            client.report_saved(event, lanes, None).await?;
+            client
+                .report_saved(self.world_epoch, event, lanes, None)
+                .await?;
             return Ok(());
         };
         let done = self.done_tx.clone();
+        let generation = self.load_generation;
+        let world_epoch = self.world_epoch;
         tokio::task::spawn_blocking(move || {
             // The hook saves where it was told. Any other file it names is
             // the player's, not the agent's to take in and delete.
@@ -1381,10 +1432,17 @@ impl<L: HookLink> Bridge<L> {
                     worlds.saves().display()
                 ))
             };
+            let hold = result
+                .as_ref()
+                .ok()
+                .map(|(id, _)| worlds.pending_result(*id));
             let _ = done.send(Done::Ingested {
+                generation,
+                world_epoch,
                 event,
                 lanes,
                 result,
+                hold,
             });
         });
         Ok(())
@@ -1397,14 +1455,17 @@ impl<L: HookLink> Bridge<L> {
             return Ok(());
         };
         let Some(reported) = self.reported else {
-            client.report_progress(progress).await?;
+            if let Some((epoch, step)) = self.last_loaded {
+                client.report_loaded(epoch, step).await?;
+            }
+            client.report_progress(self.world_epoch, progress).await?;
             self.reported = Some(progress);
             self.last_report = now;
             return Ok(());
         };
         let due = now.saturating_duration_since(self.last_report) >= self.options.progress_every;
         if due && progress > reported {
-            client.report_progress(progress).await?;
+            client.report_progress(self.world_epoch, progress).await?;
             self.reported = Some(progress);
             self.last_report = now;
         }
@@ -1466,7 +1527,7 @@ impl<L: HookLink> Bridge<L> {
             return Ok(None);
         }
         match event {
-            ClientEvent::TurnStream(start) if !self.begun && !self.room_heard => {
+            ClientEvent::TurnStream(start) if !self.room_heard || !self.room_view_heard => {
                 // A game joined while it runs: its stream and the room's
                 // mods come on different streams; the game begins once both
                 // are here.
@@ -1487,6 +1548,15 @@ impl<L: HookLink> Bridge<L> {
                     self.begun = true;
                     let saves = self.saves_dir();
                     self.outbox.push_back(ToHook::Begin {
+                        room: start.room,
+                        scan_plan: self
+                            .room
+                            .as_ref()
+                            .ok_or(BridgeFault::Unexpected(
+                                "a turn stream before the room view",
+                            ))?
+                            .settings
+                            .scan_plan,
                         rules: start.rules.clone(),
                         steps_per_second: start.steps_per_second,
                         checkpoint_interval: start.checkpoint_interval,
@@ -1501,10 +1571,12 @@ impl<L: HookLink> Bridge<L> {
                 let next_step = start.sealed_through.saturating_add(1);
                 match (start.world, &mut self.follower) {
                     (Some(offer), _) => {
+                        self.world_epoch = start.world_epoch;
                         self.follower = Some(TurnFollower::new(&start));
                         self.fetch_world(offer, next_step, client)?;
                     }
                     (None, None) => {
+                        self.world_epoch = start.world_epoch;
                         // A new game: every player loads the world it starts
                         // from.
                         self.follower = Some(TurnFollower::new(&start));
@@ -1515,6 +1587,7 @@ impl<L: HookLink> Bridge<L> {
                         // The game from its first turn, from a server that
                         // keeps no worlds: start over from the first world.
                         Err(_) if start.next_event == 1 && start.sealed_through == 0 => {
+                            self.world_epoch = start.world_epoch;
                             self.follower = Some(TurnFollower::new(&start));
                             self.order_load(None, next_step)?;
                         }
@@ -1574,6 +1647,12 @@ impl<L: HookLink> Bridge<L> {
                 self.status(|status| push_bounded(&mut status.chat, (from, text)));
             }
             ClientEvent::RoomUpdate(room) => {
+                let local = self.scan_plan.map_err(BridgeFault::Unexpected)?;
+                if !room.settings.scan_plan.is_valid() || room.settings.scan_plan != local {
+                    return Err(BridgeFault::Unexpected(
+                        "world scan plan differs from the room",
+                    ));
+                }
                 // The game's Multiplayer window shows the room once the game
                 // began.
                 if self.begun {
@@ -1595,6 +1674,7 @@ impl<L: HookLink> Bridge<L> {
                 {
                     self.start_failed("the room gave up waiting for it", client);
                 }
+                self.room_view_heard = true;
                 self.room = Some(room.clone());
                 self.room_phase = Some(room.phase);
                 self.room_owner = Some(room.owner);
@@ -1644,20 +1724,23 @@ impl<L: HookLink> Bridge<L> {
                 self.told.clone_from(&room);
                 self.room_heard = true;
                 self.status(|status| status.room_mods = room.map(|room| *room));
-                if let Some(start) = self.held_stream.take() {
-                    if let Some(end) = self.on_event(ClientEvent::TurnStream(start), client)? {
-                        return Ok(Some(end));
-                    }
-                    self.held_bytes = 0;
-                    while let Some(event) = self.held_events.pop_front() {
-                        if let Some(end) = self.on_event(event, client)? {
-                            return Ok(Some(end));
-                        }
-                    }
-                }
             }
             ClientEvent::Kicked => return Ok(Some(BridgeEnd::Kicked)),
             ClientEvent::Closed(reason) => return Ok(Some(BridgeEnd::Closed(reason))),
+        }
+        if self.room_heard
+            && self.room_view_heard
+            && let Some(start) = self.held_stream.take()
+        {
+            if let Some(end) = self.on_event(ClientEvent::TurnStream(start), client)? {
+                return Ok(Some(end));
+            }
+            self.held_bytes = 0;
+            while let Some(event) = self.held_events.pop_front() {
+                if let Some(end) = self.on_event(event, client)? {
+                    return Ok(Some(end));
+                }
+            }
         }
         Ok(None)
     }
@@ -1670,10 +1753,21 @@ impl<L: HookLink> Bridge<L> {
     ) -> Result<Option<BridgeEnd>, BridgeFault> {
         match done {
             Done::Ingested {
+                generation,
+                world_epoch,
                 event,
                 lanes,
                 result,
+                hold,
             } => {
+                if generation != self.load_generation
+                    || world_epoch != self.world_epoch
+                    || self.world != World::Ready
+                {
+                    drop(hold);
+                    self.tidy();
+                    return Ok(None);
+                }
                 let world = match result {
                     Ok((id, world)) => {
                         self.saved.push_back(id);
@@ -1688,18 +1782,29 @@ impl<L: HookLink> Bridge<L> {
                         None
                     }
                 };
-                client.report_saved(event, lanes, world).await?;
+                drop(hold);
+                client
+                    .report_saved(world_epoch, event, lanes, world)
+                    .await?;
             }
-            Done::Fetched { attempt, result } => {
+            Done::Fetched {
+                attempt,
+                result,
+                hold,
+            } => {
                 let World::Fetching {
                     next_step,
                     attempt: current,
                     ..
                 } = self.world
                 else {
+                    drop(hold);
+                    self.tidy();
                     return Ok(None);
                 };
                 if attempt != current {
+                    drop(hold);
+                    self.tidy();
                     return Ok(None);
                 }
                 self.fetch = None;
@@ -1721,6 +1826,7 @@ impl<L: HookLink> Bridge<L> {
                         return Ok(Some(BridgeEnd::WorldUnavailable));
                     }
                 }
+                drop(hold);
             }
             Done::Uploaded { snapshot, result } => {
                 let starting = self.start == StartWorld::Told(snapshot);
@@ -1736,8 +1842,14 @@ impl<L: HookLink> Bridge<L> {
                     Err(error) => warn!(%snapshot, %error, "uploading a save failed"),
                 }
             }
-            Done::StartCut { attempt, result } => {
+            Done::StartCut {
+                attempt,
+                result,
+                hold,
+            } => {
                 if self.start != StartWorld::Cutting || attempt != self.start_attempt {
+                    drop(hold);
+                    self.tidy();
                     return Ok(None);
                 }
                 match result {
@@ -1761,6 +1873,7 @@ impl<L: HookLink> Bridge<L> {
                     }
                     Err(error) => self.start_failed(&error, client),
                 }
+                drop(hold);
             }
             Done::StartRefused { attempt, error } => {
                 if matches!(self.start, StartWorld::Told(_)) && attempt == self.start_attempt {
@@ -1887,7 +2000,15 @@ impl<L: HookLink> Bridge<L> {
                 .await
                 .map(|(file, manifest)| (file, manifest.id()))
                 .map_err(|error| error.to_string());
-            let _ = done.send(Done::Fetched { attempt, result });
+            let hold = result
+                .as_ref()
+                .ok()
+                .map(|(_, id)| worlds.pending_result(*id));
+            let _ = done.send(Done::Fetched {
+                attempt,
+                result,
+                hold,
+            });
         });
         self.fetch = Some(task.abort_handle());
         Ok(())
@@ -1898,7 +2019,11 @@ impl<L: HookLink> Bridge<L> {
         let file = file.map(path_text).transpose()?;
         self.void_world();
         self.load_generation += 1;
-        self.outbox.push_back(ToHook::Load { file, next_step });
+        self.outbox.push_back(ToHook::Load {
+            file,
+            next_step,
+            world_epoch: self.world_epoch,
+        });
         self.world = World::Loading { next_step };
         self.status(|status| status.world = WorldStatus::Loading);
         Ok(())
@@ -2027,17 +2152,18 @@ impl<L: HookLink> Bridge<L> {
         });
         self.progress = None;
         self.loaded = false;
+        self.last_loaded = None;
     }
 
     /// Consumes the next sent load's answer. Only the latest ordered world
     /// can become playable; an older one may finish while its replacement is
     /// being fetched or loaded, even when both begin at the same step.
-    fn current_load_ack(&mut self, next_step: u64) -> Result<bool, BridgeFault> {
-        let (expected, generation) = self
+    fn current_load_ack(&mut self, next_step: u64, world_epoch: u64) -> Result<bool, BridgeFault> {
+        let (expected, generation, expected_epoch) = self
             .sent_loads
             .pop_front()
             .ok_or(BridgeFault::Unexpected("a world nobody ordered"))?;
-        if next_step != expected {
+        if next_step != expected || world_epoch != expected_epoch {
             return Err(BridgeFault::LoadedElsewhere {
                 expected,
                 got: next_step,
@@ -2101,8 +2227,9 @@ impl<L: HookLink> Bridge<L> {
             .chain(self.received)
             .chain(self.start_kept)
             .collect();
+        worlds.set_keep(&keep);
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = worlds.keep_only(&keep) {
+            if let Err(error) = worlds.collect() {
                 debug!(%error, "cannot tidy the world store");
             }
         });
@@ -2127,9 +2254,14 @@ impl<L: HookLink> Bridge<L> {
             if !self.link.send(&bytes)? {
                 break;
             }
-            if let ToHook::Load { next_step, .. } = message {
+            if let ToHook::Load {
+                next_step,
+                world_epoch,
+                ..
+            } = message
+            {
                 self.sent_loads
-                    .push_back((*next_step, self.load_generation));
+                    .push_back((*next_step, self.load_generation, *world_epoch));
             }
             self.outbox.pop_front();
         }
@@ -2546,6 +2678,9 @@ async fn rejoin_attempts<L: HookLink>(
     options: &ConnectOptions,
     deadline: Instant,
 ) -> Result<(Client, Events), GaveUp> {
+    let scan_plan = bridge
+        .scan_plan
+        .map_err(|why| GaveUp::Failed(why.to_owned()))?;
     let mut backoff = Duration::from_millis(250);
     let mut resume = bridge.resume_point();
     let declared = bridge.declared.clone();
@@ -2566,6 +2701,7 @@ async fn rejoin_attempts<L: HookLink>(
             }
             client
                 .join_room(JoinRoom {
+                    scan_plan,
                     invite: rejoin.invite,
                     password: rejoin.password.clone(),
                     resume,
@@ -2582,6 +2718,9 @@ async fn rejoin_attempts<L: HookLink>(
                     ClientError::Refused(RequestError::BadInvite | RequestError::NotInRoom) => {
                         Failed::Gone
                     }
+                    ClientError::Refused(RequestError::ScanPlanMismatch) => {
+                        Failed::Incompatible(RequestError::ScanPlanMismatch.to_string())
+                    }
                     other => Failed::Retry(other.to_string()),
                 })?;
             Ok::<_, Failed>((client, events))
@@ -2595,6 +2734,7 @@ async fn rejoin_attempts<L: HookLink>(
         match outcome {
             Ok(rejoined) => return Ok(rejoined),
             Err(Failed::Gone) => return Err(GaveUp::RoomGone),
+            Err(Failed::Incompatible(error)) => return Err(GaveUp::Failed(error)),
             // The server was updated past this client: no attempt can
             // succeed until the player updates too.
             Err(Failed::Outdated(error)) => {
@@ -2623,6 +2763,8 @@ async fn rejoin_attempts<L: HookLink>(
 
 /// Why one attempt to rejoin failed.
 enum Failed {
+    /// Restart with compatible scan configuration; retrying cannot help.
+    Incompatible(String),
     /// Worth trying again.
     Retry(String),
     /// The room no longer has the turns asked for.
@@ -2721,6 +2863,161 @@ mod tests {
 
     use super::*;
 
+    async fn idle_client() -> (Client, tokio::task::JoinHandle<()>) {
+        use tpf3mp_net::{
+            Identity, ServerIdentity, ServerTrust, read_message, read_preamble, server_config,
+            write_message, write_preamble,
+        };
+        use tpf3mp_proto::{
+            CONTROL_MAX_FRAME, ClientMessage, PROTOCOL_VERSION, ServerMessage, Welcome,
+        };
+        let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+        let trust = ServerTrust::Pinned(identity.leaf().clone());
+        let endpoint = quinn::Endpoint::server(
+            server_config(identity).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            read_preamble(&mut recv).await.unwrap();
+            write_preamble(&mut send, PROTOCOL_VERSION).await.unwrap();
+            let _: ClientMessage = read_message(&mut recv, CONTROL_MAX_FRAME).await.unwrap();
+            write_message(
+                &mut send,
+                &ServerMessage::Welcome(Welcome {
+                    server_version: Text::new("test").unwrap(),
+                    session_id: SessionId("AB2CD3".parse().unwrap()),
+                    rules: Vec::new(),
+                }),
+                CONTROL_MAX_FRAME,
+            )
+            .await
+            .unwrap();
+            std::future::pending::<()>().await;
+            drop((endpoint, connection, send, recv));
+        });
+        let (client, _) = connect(ConnectOptions::new(
+            address,
+            "localhost",
+            trust,
+            Arc::new(Identity::generate().unwrap().0),
+            Text::new("test").unwrap(),
+        ))
+        .await
+        .unwrap();
+        (client, server)
+    }
+
+    fn scan_room() -> RoomView {
+        RoomView {
+            id: start().room,
+            name: Text::new("scan room").unwrap(),
+            rules: Text::new("native").unwrap(),
+            owner: PlayerId(FixedBytes([1; 32])),
+            max_players: 4,
+            has_password: false,
+            phase: RoomPhase::Running,
+            settings: tpf3mp_proto::RoomSettings::DEFAULT,
+            members: Vec::new(),
+            competitive: false,
+            start: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_plan_reaches_begin_before_load_in_every_stream_order() {
+        let (client, server) = idle_client().await;
+        for plan in [
+            tpf3mp_proto::ScanPlan::DEFAULT,
+            tpf3mp_proto::ScanPlan::from_values(Some("on"), Some("5x10")).unwrap(),
+            tpf3mp_proto::ScanPlan::from_values(Some("compare"), Some("5x10")).unwrap(),
+        ] {
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [2, 0, 1],
+                [1, 2, 0],
+                [2, 1, 0],
+            ] {
+                let mut bridge = Bridge::new(
+                    AcceptingLink,
+                    BridgeOptions {
+                        scan_plan: Some(plan),
+                        ..BridgeOptions::default()
+                    },
+                );
+                let mut room = scan_room();
+                room.settings.scan_plan = plan;
+                let mut stream = start();
+                stream.world_epoch = 7;
+                for (index, event) in order.iter().enumerate() {
+                    let event = match event {
+                        0 => ClientEvent::TurnStream(stream.clone()),
+                        1 => ClientEvent::RoomUpdate(room.clone()),
+                        _ => ClientEvent::RoomMods(None),
+                    };
+                    bridge.on_event(event, &client).unwrap();
+                    assert_eq!(bridge.begun, index == 2);
+                    assert_eq!(bridge.follower.is_some(), index == 2);
+                }
+                let begin_at = bridge.outbox.messages.iter().position(|message| matches!(message, ToHook::Begin { room: id, scan_plan, .. } if *id == room.id && *scan_plan == plan)).unwrap();
+                let load_at = bridge
+                    .outbox
+                    .messages
+                    .iter()
+                    .position(|message| matches!(message, ToHook::Load { world_epoch: 7, .. }))
+                    .unwrap();
+                assert!(begin_at < load_at);
+                assert_eq!(bridge.world_epoch, 7);
+                bridge.on_new_connection();
+                bridge
+                    .on_event(ClientEvent::TurnStream(stream), &client)
+                    .unwrap();
+                assert!(
+                    bridge.held_stream.is_some(),
+                    "rejoin waits for fresh room agreement too"
+                );
+                bridge
+                    .on_event(ClientEvent::RoomMods(None), &client)
+                    .unwrap();
+                assert!(bridge.held_stream.is_some());
+                bridge
+                    .on_event(ClientEvent::RoomUpdate(room.clone()), &client)
+                    .unwrap();
+                assert!(bridge.held_stream.is_none());
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_incompatible_room_view_is_refused_before_begin_or_load() {
+        let (client, server) = idle_client().await;
+        let mut bridge = Bridge::new(AcceptingLink, BridgeOptions::default());
+        bridge
+            .on_event(ClientEvent::TurnStream(start()), &client)
+            .unwrap();
+        bridge
+            .on_event(ClientEvent::RoomMods(None), &client)
+            .unwrap();
+        let mut room = scan_room();
+        room.settings.scan_plan =
+            tpf3mp_proto::ScanPlan::from_values(Some("on"), Some("5x10")).unwrap();
+        assert!(
+            bridge
+                .on_event(ClientEvent::RoomUpdate(room), &client)
+                .is_err()
+        );
+        assert!(!bridge.begun);
+        assert!(bridge.follower.is_none());
+        assert!(bridge.outbox.messages.is_empty());
+        server.abort();
+    }
+
     /// A game without the picker (`--mods`) loads the room's world with the
     /// room's mods and settings as its owner declared them, its own listed
     /// personal mods after them: the content check does not cover the
@@ -2753,6 +3050,7 @@ mod tests {
             game: Text::lossy("40408"),
             mods: vec![room_mod("signals"), room_mod("tpf3mp_1")],
             params: settings.clone(),
+            native: Vec::new(),
         };
         let lists = told_lists(Some(&told), Some(&listed)).unwrap();
         assert_eq!(lists.shared, listed.shared);
@@ -2785,6 +3083,228 @@ mod tests {
         assert!(held_weight(&ClientEvent::Kicked) > 0);
     }
 
+    async fn control_peer(
+        count: usize,
+    ) -> (
+        Client,
+        tokio::sync::oneshot::Receiver<Vec<tpf3mp_proto::ClientMessage>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tpf3mp_net::{
+            Identity, ServerIdentity, ServerTrust, read_message, read_preamble, server_config,
+            write_message, write_preamble,
+        };
+        use tpf3mp_proto::{
+            CONTROL_MAX_FRAME, ClientMessage, PROTOCOL_VERSION, ServerMessage, SessionId, Welcome,
+        };
+        let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+        let leaf = identity.leaf().clone();
+        let endpoint = quinn::Endpoint::server(
+            server_config(identity).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let (reported_tx, reported) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            read_preamble(&mut recv).await.unwrap();
+            write_preamble(&mut send, PROTOCOL_VERSION).await.unwrap();
+            let _: ClientMessage = read_message(&mut recv, CONTROL_MAX_FRAME).await.unwrap();
+            write_message(
+                &mut send,
+                &ServerMessage::Welcome(Welcome {
+                    server_version: Text::new("test").unwrap(),
+                    session_id: SessionId("AB2CD3".parse().unwrap()),
+                    rules: Vec::new(),
+                }),
+                CONTROL_MAX_FRAME,
+            )
+            .await
+            .unwrap();
+            let mut messages = Vec::new();
+            for _ in 0..count {
+                messages.push(
+                    read_message::<ClientMessage>(&mut recv, CONTROL_MAX_FRAME)
+                        .await
+                        .unwrap(),
+                );
+            }
+            reported_tx.send(messages).unwrap();
+        });
+        let (client, _) = crate::connect(crate::ConnectOptions::new(
+            address,
+            "localhost",
+            ServerTrust::Pinned(leaf),
+            Arc::new(Identity::generate().unwrap().0),
+            Text::new("test").unwrap(),
+        ))
+        .await
+        .unwrap();
+        (client, reported, server)
+    }
+
+    #[tokio::test]
+    async fn delayed_ingest_from_a_replaced_world_never_reaches_the_server() {
+        use tpf3mp_proto::{ClientMessage, GameMessage};
+        let (client, reported, server) = control_peer(1).await;
+        let mut bridge = Bridge::new(AcceptingLink, BridgeOptions::default()).greeted("test");
+        let old_generation = bridge.load_generation;
+        let old_epoch = bridge.world_epoch;
+        let (release, wait) = std::sync::mpsc::channel();
+        let done_tx = bridge.done_tx.clone();
+        let ingest = tokio::task::spawn_blocking(move || {
+            wait.recv().unwrap();
+            done_tx
+                .send(Done::Ingested {
+                    generation: old_generation,
+                    world_epoch: old_epoch,
+                    event: 12,
+                    lanes: Vec::new(),
+                    result: Err("save failed".into()),
+                    hold: None,
+                })
+                .unwrap();
+        });
+        bridge.world_epoch = 2;
+        bridge.order_load(None, 1).unwrap();
+        bridge.flush().unwrap();
+        assert!(bridge.current_load_ack(1, 2).unwrap());
+        bridge.world = World::Ready;
+        release.send(()).unwrap();
+        ingest.await.unwrap();
+        let done = bridge.done_rx.recv().await.unwrap();
+        bridge.on_done(done, &client).await.unwrap();
+        // An ordered marker makes absence observable without a timing sleep.
+        client.report_loading(None).await.unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(10), reported)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                message.as_slice(),
+                [ClientMessage::Game(GameMessage::Loading(None))]
+            ),
+            "stale ingest was sent before the marker: {message:?}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_exact_resume_replays_loaded_before_its_current_progress() {
+        use tpf3mp_proto::{ClientMessage, GameMessage};
+        let (client, reported, server) = control_peer(2).await;
+        let mut bridge = Bridge::new(AcceptingLink, BridgeOptions::default()).greeted("test");
+        let mut stream = start();
+        stream.sealed_through = 40;
+        bridge.begun = true;
+        bridge.follower = Some(TurnFollower::new(&stream));
+        bridge.world = World::Ready;
+        bridge.last_loaded = Some((1, 0));
+        bridge.progress = Some(40);
+        bridge.reported = Some(40);
+        // The previous control stream could have lost Loaded after the hook
+        // completed its first load. An exact resume must retry its original
+        // frontier, not the forty steps the game has since run.
+        bridge
+            .on_event(ClientEvent::TurnStream(stream), &client)
+            .unwrap();
+        assert!(bridge.held_stream.is_some());
+        assert_eq!(bridge.reported, Some(40));
+        bridge
+            .on_event(ClientEvent::RoomMods(None), &client)
+            .unwrap();
+        assert!(bridge.held_stream.is_some());
+        bridge
+            .on_event(ClientEvent::RoomUpdate(scan_room()), &client)
+            .unwrap();
+        assert!(bridge.held_stream.is_none());
+        bridge
+            .report_progress(&client, Instant::now())
+            .await
+            .unwrap();
+        let messages = tokio::time::timeout(Duration::from_secs(10), reported)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    ClientMessage::Game(GameMessage::Loaded {
+                        world_epoch: 1,
+                        step: 0
+                    }),
+                    ClientMessage::Game(GameMessage::Progress {
+                        world_epoch: 1,
+                        step: 40
+                    }),
+                ]
+            ),
+            "load acknowledgement must precede progress: {messages:?}"
+        );
+        bridge.order_load(None, 41).unwrap();
+        assert!(
+            bridge.last_loaded.is_none(),
+            "a replacement forgets the old world's ACK"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn ending_a_bridge_releases_queued_and_unsent_world_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let worlds = Worlds::open(dir.path(), 1 << 20).unwrap();
+        let file = worlds.saves().join("world.sav");
+        std::fs::write(&file, [5u8; 1000]).unwrap();
+        let (first, world) = worlds.ingest_copy(&file).unwrap();
+        let (second, _) = worlds.ingest_copy(&file).unwrap();
+        assert_eq!(
+            first.id(),
+            second.id(),
+            "two independent results of one snapshot"
+        );
+        let received = worlds.received_file(&world.snapshot);
+        std::fs::write(&received, [5u8; 1000]).unwrap();
+        let bridge = Bridge::new(
+            AcceptingLink,
+            BridgeOptions {
+                worlds: Some(worlds.clone()),
+                ..BridgeOptions::default()
+            },
+        )
+        .greeted("test");
+        let sender = bridge.done_tx.clone();
+        sender
+            .send(Done::Ingested {
+                generation: bridge.load_generation,
+                world_epoch: bridge.world_epoch,
+                event: 12,
+                lanes: Vec::new(),
+                result: Ok((first.id(), world)),
+                hold: Some(worlds.pending_result(first.id())),
+            })
+            .unwrap();
+        // Receiver destruction drops its queued completion, but only one hold.
+        drop(bridge);
+        worlds.collect().unwrap();
+        assert!(worlds.store().manifest(&second.id()).is_ok());
+        assert!(received.exists());
+        // Disk work finishes after that receiver closed. Discarding the send
+        // error drops its completion guard without needing bridge handling.
+        assert!(sender.is_closed());
+        let _ = sender.send(Done::StartCut {
+            attempt: 1,
+            result: Ok((second.id(), world, None)),
+            hold: Some(worlds.pending_result(second.id())),
+        });
+        worlds.collect().unwrap();
+        assert!(worlds.store().manifest(&second.id()).is_err());
+        assert!(!received.exists());
+    }
+
     struct AcceptingLink;
 
     impl HookLink for AcceptingLink {
@@ -2811,9 +3331,9 @@ mod tests {
         bridge.order_load(None, 1).unwrap();
         bridge.flush().unwrap();
 
-        assert!(!bridge.current_load_ack(1).unwrap());
+        assert!(!bridge.current_load_ack(1, 1).unwrap());
         assert_eq!(bridge.world, World::Loading { next_step: 1 });
-        assert!(bridge.current_load_ack(1).unwrap());
+        assert!(bridge.current_load_ack(1, 1).unwrap());
     }
 
     #[test]
@@ -2824,9 +3344,9 @@ mod tests {
         bridge.void_world();
         bridge.world = World::Ready;
 
-        assert!(!bridge.current_load_ack(1).unwrap());
+        assert!(!bridge.current_load_ack(1, 1).unwrap());
         assert!(matches!(
-            bridge.current_load_ack(1),
+            bridge.current_load_ack(1, 1),
             Err(BridgeFault::Unexpected("a world nobody ordered"))
         ));
     }
@@ -2838,9 +3358,9 @@ mod tests {
         bridge.order_load(None, 1).unwrap();
         bridge.flush().unwrap();
 
-        assert!(bridge.current_load_ack(1).unwrap());
+        assert!(bridge.current_load_ack(1, 1).unwrap());
         assert!(matches!(
-            bridge.current_load_ack(1),
+            bridge.current_load_ack(1, 1),
             Err(BridgeFault::Unexpected("a world nobody ordered"))
         ));
     }
@@ -2852,7 +3372,7 @@ mod tests {
         bridge.flush().unwrap();
 
         assert!(matches!(
-            bridge.current_load_ack(4),
+            bridge.current_load_ack(4, 1),
             Err(BridgeFault::LoadedElsewhere {
                 expected: 5,
                 got: 4
@@ -2949,6 +3469,7 @@ mod tests {
 
     fn start() -> TurnStart {
         TurnStart {
+            world_epoch: 1,
             room: RoomId(FixedBytes([0; 16])),
             rules: Text::new("native").unwrap(),
             next_turn: 1,

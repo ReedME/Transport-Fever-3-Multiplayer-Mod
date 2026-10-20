@@ -1390,3 +1390,297 @@ there), D4 (trust in the project, fail closed). PLAN.md, Part 3: a new item.
 Not covered yet: the room's terms on the wire (an additive field of the
 content declaration, with a protocol version bump), the launcher's page for
 native mods, and Big Maps itself as the first package.
+
+## D30 (2026-10-11): ReedME fork review implementation
+
+ReedME authorized carrying out all items in the fork's
+`investigation/REEDME_DEEP_REVIEW_2026-10-11.md`. This entry applies to the
+ReedME fork; earlier owner decisions and contributor provenance remain
+upstream history.
+
+- Windows game builds through Proton are the initial client target.
+  The portable Windows ZIP uses a transactional Rust mod installer and
+  native process checks. This is a scoped D9 exception because Wine's
+  PowerShell stub returns success without executing scripts. Native Windows
+  keeps readable scripts, whose installed bytes and record must verify.
+  Managed standalone installation is refused clearly under Wine.
+- Native company loans use the game's fixed principal and full-term
+  interest, with per-loan payment origins. Legacy annuity loans preserve
+  outstanding principal and existing journals; a one-time remaining-term
+  schedule transition starts at the current game time and exposes those
+  exact terms in the finance window. It creates no money and charges no
+  periods before that transition.
+- New rooms imported from multiplayer saves discard previous-room company
+  password seals with a visible reset notice. Same-room reconnect, reload
+  and restoration retain seals; company membership, assets and station
+  permissions remain. New passwords can be set by company heads afterward.
+  Locked legacy saves without stable room provenance reset once on first
+  upgraded room load with a distinct legacy notice; unknown identity never
+  triggers a reset.
+- Checkpoint/save reports identify their producing world. Stale background
+  completions cannot affect another world, and snapshot retention and
+  pointer persistence protect live/recoverable worlds.
+  Per-lane votes without any complete matching replica promote no save. Keep
+  the last agreed world and report this recovery limit; restoring that world
+  requires owner intervention. Do not invent a composite world or silently
+  select an arbitrary divergent replica.
+- The fork uses its own repository/update trust and server images.
+  Unconfigured developer launchers use loopback, never upstream production.
+  Public packages need deliberately configured operated servers. Native
+  archive verification and protected signed updates remain release gates.
+- The first competitive scope is trusted players on identical Windows game
+  builds. Native sequencing is not an authoritative anti-cheat economy.
+  No real-game or public-release acceptance is implied by synthetic tests.
+
+This authorization covers focused fixes, regressions, local test tooling
+and fork governance. It does not replace missing game inputs with fabricated
+verification or authorize publishing an unverified release.
+
+## Later upstream policy history
+
+The following amendments record decisions of the upstream owner, not new
+approvals by ReedME. The fork's current authorization is D31 below. The
+historical junction exception is U-D30, distinct from this fork's D30;
+U-D30 is not adopted or enabled by this refresh.
+
+### D29 amendment (2026-10-12, owner-approved 2026-10-15): the room's server serves the native-mods index
+
+The owner approved this amendment on 2026-10-15. It replaces D29's
+project-signed-index-only requirement; its built-in-code rule and package
+checks remain in force until a later decision changes them.
+
+The user asked on 2026-10-12 to "build the index into the server": the
+index of native mods should come from the server a player plays on, not
+from a release asset that only a reviewer of the project's signing
+workflow can publish. Under the original D29, no native mod could reach a
+player until the project made a native-mods key, a signing workflow and a
+first index, and every launcher was built with the key; a server's operator
+who wanted to offer Big Maps could not.
+
+- **Each server serves its own index, made from a registry.** The operator
+  names a registry (`--native-mods-registry`): a git repository whose
+  `mods.txt` lists the mods' own repositories, as CKAN's metadata
+  repository lists Kerbal mods. Each mod's repository holds
+  `tpf3mp-native.json`, its packages in D29's format, whose names and
+  descriptions are the preview players see. The server reads them again
+  every hour and hands the index made of them to its clients on the control
+  stream (a new request, `NativeIndex`, in pages, with a `PROTOCOL_VERSION`
+  bump). A mod that cannot be read, is malformed or claims another's id is
+  left out, the others served. The format is D29's unchanged: every package
+  pins the game builds it runs on, every file its size and SHA-256, its
+  dependencies, conflicts and settings, and the hook features it enables.
+  Files may live anywhere over HTTPS, the mod's own releases included; each
+  is checked against the index as it downloads, as now.
+- **Proposed mods are shown apart, never installed by themselves.** A mod
+  joins a registry through a pull request adding its repository. For a
+  GitHub registry the server also serves what open pull requests would add,
+  as proposals, each with its pull request. The launcher shows them only
+  when the player asks ("Show proposed mods"), marks them as not reviewed,
+  and installs one only when the player chooses it; a room never gets one
+  by itself.
+- **The server's word is the signature.** A launcher trusts the index of
+  the server it plays on as it trusts that server's rooms (D4): reached
+  over TLS with a certificate from a public authority, as every server is.
+  No separate key is needed. An index signed with the project's
+  native-mods key (D29) is still accepted from anywhere, so the project can
+  publish one later without changing the launcher.
+- **Only built-in code runs, as in D29.** A package still only enables
+  features compiled into TPF3-MP's hook (`features::BUILT_IN`) and ships
+  data, Lua and settings; one with plugin libraries is refused. A server
+  therefore cannot make a game run native code TPF3-MP does not ship; what
+  it can add is Lua and data, which a Mod Hub mod can add too.
+- **A room installs from its own server.** A member gets the room's
+  native mods from the index of the server that hosts the room, in the
+  room's versions, never from another player. The serial floor and the
+  cached index are kept per server, so one server's index cannot replay or
+  replace another's.
+- **The player sees whose index it is.** The launcher's Native mods group
+  names the server whose index it shows. It gets a room's native mods by
+  itself only from a server the release lists; from a server the player set
+  in Settings (D12), only when the player asks.
+
+Rejected:
+
+- **Keep the project's signing workflow as the only way** (D29 as it is):
+  safest, but nothing ships until the project builds it, and an operator
+  of another listed server cannot offer a mod the project has not signed.
+- **Each operator signs with their own key, built into launchers**: the
+  same wait, once per operator, and launchers would need a key list per
+  release.
+- **Any address, as CKAN reads netkans**: D29's reason stands; an index
+  comes from a server the player chose, or from the project.
+
+The owner accepted this trade-off: trust moves from one reviewed key to every
+server's operator, and to whoever merges pull requests into that server's
+registry. A rogue or hacked server could offer a package of Lua
+and data to its own players, and switch built-in features on for them; it
+could not run native code the hook does not have. Players on the project's
+servers trust the project, as now.
+
+Touches: D29 (where the index comes from and who vouches for it; the
+format, built-in features only, per-file checks and room terms stay), D4
+(servers trusted by clients), D12 and its approved amendment (several
+operated servers; a server set in Settings). PLAN.md, Part 3, the D29
+item: the key and signing workflow would no longer be needed before
+players can use a native mod.
+
+### D29 amendment (2026-10-14, owner-approved 2026-10-15): native mods may carry plugins, their own code
+
+The owner approved this amendment on 2026-10-15. It builds on the
+owner-approved server-index amendment: plugins may come from the project's
+signed index or a server's trusted index, subject to explicit consent for
+each exact package identity. Approval of this policy does not mark plugin
+loading, consent, or PR #151 as implemented or merged. This later amendment
+replaces the earlier plugin-refusal rule; built-in features and their
+existing checks remain supported.
+
+A native mod may bring its own patch code and declare where in the game it
+patches. Plugins are native libraries, pinned by platform, size and
+SHA-256 in the trusted index, and built against a versioned interface of
+the hook (`abi`, the `tpf3mp-plugin-abi` crate). Only the plugin for the
+player's platform and supported interface may be installed or loaded.
+
+- **Hooks are declared, found by signature, never by address.** A package
+  lists the places in the game's code it patches (`hooks`): a name, an
+  IDA-style signature that must match exactly once in the running build,
+  an offset, the bytes expected there, how it shares them (`chain` or
+  `replace`), and its kind, the hook core's own patches: a `detour` at a
+  function's start, a `splice` in the middle of one, a `rewrite` of bytes
+  one for one, a redirected `call`, or a `slot` of a vtable. The hook
+  refuses a hook that does not match, matches twice or holds other bytes.
+  Raw addresses are refused because they change with game updates and
+  cannot be checked.
+- **The hook owns every patch.** A plugin never writes to the game's code.
+  Its export attaches detours by declared hook name; the hook patches each
+  function once and chains detours in load order. A `replace` hook is alone
+  on its function. Hooks on functions used by TPF3-MP's multiplayer code
+  are refused. Any failed byte, interface, hook or plugin check patches
+  nothing and keeps the game out of rooms.
+- **Executable consent is per exact content identity.** Before any plugin
+  payload is fetched, installed or enabled, the launcher shows the mod's
+  author/publisher, its trusted source (the project index or named server
+  and registry), and the full SHA-256 canonical package identity. These
+  details come from the already validated index and registry metadata; the
+  launcher does not fetch a homepage, download URL or other arbitrary URL
+  to assemble the prompt. The index metadata must provide enough publisher
+  and source information to show it clearly.
+- **Consent follows the same identity as the room and package store.** The
+  launcher remembers approval only for the full canonical identity,
+  including id, version, package metadata, settings, dependencies and all
+  payload descriptors—not for an id, version string or mutable URL alone.
+  Reconnecting with the same identity does not prompt again. Any identity
+  change requires fresh consent; this can include a version or metadata
+  change even when plugin bytes are unchanged. Changed executable bytes or
+  hook declarations necessarily change the identity. The digest used for
+  consent must be the same identity carried in room terms and used to
+  verify/cache the package. The pending identity work in #148 covers regular
+  package files; before plugins load, extend that identity to bind every
+  plugin's platform, ABI, path, size and SHA-256 plus its declared hooks.
+- **Declining leaves the package unavailable.** A declined plugin payload
+  is not fetched, installed or enabled, and the room join stays blocked
+  until the player accepts the exact identity or chooses not to join. A
+  room never installs a proposed registry entry by itself; the player must
+  opt into a proposal and then consent to its executable content.
+- **Code counts as changing the simulation.** A package with a plugin must
+  say `simulation: true`; its exact plugin bytes and hooks are part of its
+  canonical identity and room terms. A package of built-in features still
+  works under D29: features compiled into `features::BUILT_IN` remain
+  available and keep their existing build/profile and room-term checks.
+- **The hook owns Lua, services and game mods.** A plugin may provide Lua
+  for the game's Lua states and use only the hook's declared services. A
+  package's `game_mods` folders may be installed while it is enabled; a
+  player's own folder of the same name is never overwritten.
+- **Windows first.** The initial implementation may load plugins on
+  Windows x86-64. On an unsupported platform, a package with a required
+  plugin is refused and cannot join a room.
+
+Rejected:
+
+- **Keep D29 as it is** (built-in features only): safest, but every native
+  mod waits for the project to write its code, and mods like Big Maps stay
+  out.
+- **Data-only patches** (a catalogue of values the hook exposes, which mods
+  set): useful, but cannot express new behaviour; it complements plugins
+  rather than replacing them.
+- **Plugins that patch the game themselves**: two plugins on one function
+  could overwrite each other's jumps, a plugin could patch TPF3-MP's own
+  multiplayer functions, and nothing could chain or refuse them.
+- **Only the project's signed index may carry plugins**: safer, but the
+  owner chose to trust a server's registry for code as for rooms.
+
+Trade-off: **this lets a server operator, and whoever merges pull requests
+into its registry, offer native code to players who consent to install it.**
+A plugin runs inside the game with the player's rights: it can read files,
+reach the network or crash the game. Consent and SHA-256 verification do
+not sandbox it or make it safe; they let the player choose exact bytes from
+a source the player can identify. Players on the project's servers trust
+the project's registry, as with rooms.
+
+Touches: D29 (plugins become allowed while built-in features stay), the
+server-index amendment (where packages come from), D4 (trust in servers,
+now for code), D11 (the hook loads only launcher-enabled plugins).
+PLAN.md, Part 3, the D29 item.
+
+## U-D30 (upstream, 2026-10-17, not adopted by the ReedME fork): carry only the observed double-slip switch before full junction acceptance
+
+The upstream owner approved the narrow exception proposed in PR #156.
+ReedME has not approved this exception for the fork; it remains disabled.
+The following describes upstream behavior only. With
+`strict_junctions` off, a standalone junction edit may carry the junction
+window's double-slip switch toggling on or off at an existing node. Capture
+and replay must compare that node's configurations and refuse any change to
+lane connections, crosswalks, light type, phases or the custom-phase mark.
+The only accompanying preference change allowed is Auto to No at a node
+with track and no street, the side effect observed in the two-game test on
+build 40420. A reset, an edit with no switch change, or a new configuration
+is refused.
+
+This exception does not enable the crossing tool's tram-lane edits or any
+other standalone junction action. Those remain behind Part 3's full
+acceptance gate, including custom phases, reset and geometry preservation.
+The two-game double-slip observation and the `double_slip` regression
+scenario support this one exception; they do not complete the broader
+junction acceptance.
+
+Touches: PLAN.md, Part 3, the junction item; `strict_junctions` remains off.
+
+## D31 (2026-10-20): ReedME authorizes the compatible upstream refresh and external plugin model
+
+ReedME explicitly approved adopting the external plugin model while
+integrating upstream `02829e3608011351789b6ca0117093177f64b201` into the
+fork. This authorizes the compatible implementation and its focused tests;
+it does not approve upstream services, transfer repository authority, or
+establish real-game acceptance or release readiness. D30 remains unchanged.
+
+- The optional native-mod sources are a project-signed index verified by
+  deliberately configured fork keys, or an authenticated server index from
+  a server the player deliberately selected and the operator configured.
+  A server's TLS identity authenticates that server's index; it is not a
+  project signature or an assurance that the supplied code is safe. No
+  upstream production service, registry, signing key or updater becomes a
+  fork default through this merge.
+- Before fetching, installing or enabling executable payloads, the launcher
+  requires explicit consent to the trusted source authority and full canonical
+  package identity. Source authority means the project or selected server
+  canonical host:port, not a TLS certificate, registry URL or key fingerprint.
+  The identity binds settings, dependencies, files,
+  platform and ABI descriptors, executable bytes and declared hooks. A
+  changed source authority or identity requires fresh consent, including
+  transitive plugin dependencies. Proposed registry entries never install by themselves.
+- The hook retains build, ABI, byte/signature, patch-conflict and protected
+  multiplayer-site checks. Unsupported platforms and unverifiable checks
+  refuse loading and room entry. Plugins execute with the player's rights;
+  signatures, hashes and consent do not sandbox them.
+- The refresh uses protocol 24, bridge 30, action schema 28 and room-log
+  format 11. Earlier formats 8, 9 and 10 are refused before mutation; fork
+  and upstream format 9 are distinct layouts. Preserve the complete old
+  data and snapshot directories with their matching binaries and use fresh
+  data and snapshot directories. No migration is authorized or implied.
+- Experimental crossing capture, crossing toolbar types, construction
+  rejoin, tool continuation and full standalone junction edits retain their
+  acceptance gates. U-D30's double-slip exception remains disabled pending
+  a separate ReedME decision. Native scan modes remain explicit opt-ins;
+  rooms must agree their exact scan plan before seat or world mutation.
+- Upstream test and game observations remain credited upstream evidence.
+  The fork still needs exact-build verification and its own ordinary-start
+  two-player Proton competitive/recovery acceptance before release.

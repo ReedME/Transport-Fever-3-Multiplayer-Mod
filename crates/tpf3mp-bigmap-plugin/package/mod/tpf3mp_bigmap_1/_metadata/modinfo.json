@@ -1,0 +1,8 @@
+{
+    "authors": [ { "name": "TPF3-MP", "role": "CREATOR" } ],
+    "description": "Big maps for Transport Fever 3, stage 1, after TpF2 Big Maps by silver2127: four map sizes past Gigantomaniac, 32.8 to 45.1 km a side, in the New Game size list. They stay inside every limit the stock game has, so no part of the game is patched and the worlds load in any game. Needs the TPF3-MP hook, which serves the New Game page; a size this computer lacks the memory to generate is hidden, with the reason.",
+    "name": "TPF3-MP Big Maps (stage 1)",
+    "summary": "Bigger maps in the New Game size list, up to 45 km a side.",
+    "tags": [ "Script Mod" ],
+    "url": "https://github.com/Juliansgith/Transport-Fever-3-Multiplayer-Mod"
+}

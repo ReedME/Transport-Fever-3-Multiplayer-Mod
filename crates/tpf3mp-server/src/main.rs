@@ -181,11 +181,29 @@ struct Args {
     /// to loopback and the private networks.
     #[arg(long, requires = "tunnel_behind_proxy")]
     tunnel_proxy: Vec<AddressRange>,
+
+    /// The native mods' registry this server offers its players: a git
+    /// repository (https://github.com/<owner>/<name>) whose mods.txt lists
+    /// the mods' repositories, each with its tpf3mp-native.json
+    /// (docs/NATIVE_MODS.md). Without it the server offers none.
+    #[arg(long)]
+    native_mods_registry: Option<String>,
+
+    /// Minutes between readings of the registry.
+    #[arg(long, default_value_t = 60, requires = "native_mods_registry")]
+    native_mods_every_minutes: u64,
+
+    /// A GitHub token for reading the registry's open pull requests (the
+    /// proposed mods) more often than GitHub allows unnamed callers.
+    #[arg(long, env = "TPF3MP_GITHUB_TOKEN", hide_env_values = true)]
+    native_mods_github_token: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // No certificate or invite key is written for refused room data.
+    Server::preflight_data_dir(args.data_dir.as_deref())?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     match args.log_format {
         LogFormat::Text => tracing_subscriber::fmt().with_env_filter(filter).init(),
@@ -258,6 +276,14 @@ async fn main() -> Result<()> {
     if config.snapshots.is_none() {
         warn!("no snapshots: players cannot join games that have started");
     }
+    config.native_registry =
+        args.native_mods_registry
+            .clone()
+            .map(|url| tpf3mp_server::NativeRegistry {
+                url,
+                every: Duration::from_secs(args.native_mods_every_minutes.max(5) * 60),
+                github_token: args.native_mods_github_token.clone(),
+            });
     config.diagnostics = match &args.data_dir {
         Some(data) if args.diagnostics_days > 0 => {
             let mut diagnostics = DiagnosticsConfig::new(

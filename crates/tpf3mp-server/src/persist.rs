@@ -29,8 +29,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tpf3mp_proto::{
-    ContentFingerprint, ContentManifest, Platform, PlayerId, RoomId, RoomSettings, RulesName,
-    Speed, TURN_MAX_FRAME, Text,
+    ContentFingerprint, ContentManifest, ModRef, NATIVE_PREFIX, NativeMod, Platform, PlayerId,
+    RoomId, RoomSettings, RulesName, Speed, TURN_MAX_FRAME, Text, Unlisted,
 };
 
 /// Version of the log's layout. Version 2 added histories: the start
@@ -42,8 +42,12 @@ use tpf3mp_proto::{
 /// played by, and version 6 the game's content manifest. Version 7's
 /// invite tag is of the room's six-character code alone. Version 8's
 /// commands carry the seal of a password sent with them (protocol 8), never
-/// the password.
-pub(crate) const FORMAT_VERSION: u16 = 8;
+/// the password. ReedME version 9 added producing-world epochs to turn
+/// streams; upstream version 9 instead added native settings, and upstream
+/// version 10 added scan plans. Version 11 combines those changes. The
+/// version-9 layouts are ambiguous: all older formats require their matching
+/// binaries and are refused before any recovery or cleanup changes disk.
+pub(crate) const FORMAT_VERSION: u16 = 11;
 /// Largest start record: one whose base holds the rules' state.
 const MAX_START_RECORD: usize = 16 << 20;
 /// Largest record after the start record: a turn frame at its cap. Kept
@@ -68,7 +72,7 @@ pub(crate) struct StartRecord {
     pub(crate) rules: RulesName,
     /// What the game runs, by name, to tell players who join with other
     /// content how theirs differs. `None` if the owner declared none.
-    pub(crate) manifest: Option<ContentManifest>,
+    pub(crate) manifest: Option<StoredManifest>,
     pub(crate) owner: PlayerId,
     pub(crate) max_players: u8,
     pub(crate) settings: RoomSettings,
@@ -77,6 +81,8 @@ pub(crate) struct StartRecord {
     pub(crate) members: Vec<StartMember>,
     /// For a compacted log, the game's state before its first turn.
     pub(crate) base: Option<Base>,
+    /// Full room declarations for native mods.
+    pub(crate) native_mods: Vec<NativeMod>,
 }
 
 /// A running game's state after a turn, which a compacted log starts from
@@ -118,7 +124,7 @@ pub(crate) struct StartMember {
 
 /// Why a log cannot be read back.
 #[derive(Debug, Error)]
-pub(crate) enum LogError {
+pub enum LogError {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error("the log is not a regular file")]
@@ -253,6 +259,18 @@ impl RoomLog {
             len,
             torn_at: None,
         })
+    }
+
+    /// Reads only the version prefix of the intact first record, without
+    /// interpreting that version's remaining layout or changing the file.
+    /// Directory startup uses this before any recovery writer or collector.
+    pub(crate) fn format_version(path: &Path) -> Result<u16, LogError> {
+        let first = Self::read(path)?
+            .next_record()?
+            .ok_or(LogError::Damaged(0))?;
+        postcard::take_from_bytes::<u16>(&first)
+            .map(|(version, _)| version)
+            .map_err(|_| LogError::Damaged(0))
     }
 
     /// Appends one record. The write reaches the operating system at once,
@@ -414,9 +432,56 @@ fn private_options() -> OpenOptions {
     options
 }
 
+/// A content manifest as the log keeps it, in the layout logs of this
+/// version always had: the native mods (protocol 20) follow the mods,
+/// named as they are (`native:<id>`), so that a log written before
+/// manifests had them reads unchanged and the same manifest comes back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoredManifest {
+    game: Text<64>,
+    mods: Vec<ModRef>,
+    unlisted: Option<Unlisted>,
+}
+
+impl From<&ContentManifest> for StoredManifest {
+    fn from(manifest: &ContentManifest) -> Self {
+        Self {
+            game: manifest.game.clone(),
+            mods: manifest
+                .mods
+                .iter()
+                .chain(&manifest.native)
+                .cloned()
+                .collect(),
+            unlisted: manifest.unlisted,
+        }
+    }
+}
+
+impl StoredManifest {
+    /// The manifest kept. A mod named as a native one is taken as one: a
+    /// game that declared such a mod among its mods gets another
+    /// fingerprint back, and the room then tells nothing from it.
+    pub(crate) fn manifest(self) -> ContentManifest {
+        let (native, mods) = self
+            .mods
+            .into_iter()
+            .partition(|listed| listed.id.as_str().starts_with(NATIVE_PREFIX));
+        ContentManifest {
+            game: self.game,
+            mods,
+            unlisted: self.unlisted,
+            native,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use tpf3mp_proto::FixedBytes;
+    use std::collections::BTreeMap;
+
+    use tpf3mp_nativemods::{index::Setting, terms::settings_digest};
+    use tpf3mp_proto::{ContentManifest, FixedBytes, ModRef, NativeSetting, NativeValue};
 
     use super::*;
 
@@ -424,6 +489,33 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tpf3mp-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// A manifest comes back from the log as it was, native mods and all,
+    /// and a log written before manifests had native mods reads unchanged.
+    #[test]
+    fn a_manifest_comes_back_from_the_log_whole() {
+        let listed = |id: &str| ModRef {
+            id: Text::new(id).unwrap(),
+            version: Text::new("1.0.0+0123456789").unwrap(),
+        };
+        let plain = ContentManifest::new(
+            Text::new("40420").unwrap(),
+            vec![listed("signals"), listed("tpf3mp_1")],
+        );
+        let native = plain.clone().with_native(vec![listed("native:bigmap")]);
+        for manifest in [plain.clone(), native] {
+            let bytes = postcard::to_allocvec(&StoredManifest::from(&manifest)).unwrap();
+            let back: StoredManifest = postcard::from_bytes(&bytes).unwrap();
+            let back = back.manifest();
+            assert_eq!(back, manifest);
+            assert_eq!(back.fingerprint(), manifest.fingerprint());
+        }
+        // The layout of a manifest before native mods.
+        let old = (&plain.game, &plain.mods, &plain.unlisted);
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        let read: StoredManifest = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(read.manifest(), plain);
     }
 
     fn start() -> StartRecord {
@@ -441,7 +533,60 @@ mod tests {
             password_tag: None,
             members: Vec::new(),
             base: None,
+            native_mods: Vec::new(),
         }
+    }
+
+    fn native_declaration() -> (ContentManifest, NativeMod) {
+        let settings = vec![NativeSetting {
+            key: Text::new("radius").unwrap(),
+            value: NativeValue::Int(37),
+        }];
+        let settings_map = BTreeMap::from([("radius".to_owned(), Setting::Int(37))]);
+        let version = Text::new(format!(
+            "1.2.3+{}{}",
+            &settings_digest(&settings_map)[..10],
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let term = ModRef {
+            id: Text::new("native:bigmap").unwrap(),
+            version: version.clone(),
+        };
+        let manifest = ContentManifest::new(
+            Text::new("40420").unwrap(),
+            vec![ModRef {
+                id: Text::new("tpf3mp_1").unwrap(),
+                version: Text::new("1.0.0").unwrap(),
+            }],
+        )
+        .with_native(vec![term]);
+        let native = NativeMod {
+            id: Text::new("bigmap").unwrap(),
+            version,
+            name: Text::new("Big Maps").unwrap(),
+            settings,
+        };
+        (manifest, native)
+    }
+
+    #[test]
+    fn format11_start_record_keeps_non_default_native_settings_and_scan_plan() {
+        let (manifest, native) = native_declaration();
+        let mut start = start();
+        start.manifest = Some(StoredManifest::from(&manifest));
+        start.native_mods = vec![native.clone()];
+        start.settings.scan_plan =
+            tpf3mp_proto::ScanPlan::from_values(Some("compare"), Some("5x10")).unwrap();
+        let bytes = postcard::to_stdvec(&start).unwrap();
+        let restored: StartRecord = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.version, FORMAT_VERSION);
+        assert_eq!(restored.native_mods, [native]);
+        assert_eq!(restored.settings.scan_plan, start.settings.scan_plan);
+        assert_eq!(
+            restored.manifest.unwrap().manifest().fingerprint(),
+            manifest.fingerprint()
+        );
     }
 
     fn read_all(path: &Path) -> Result<(LogReader, Vec<Vec<u8>>), LogError> {
@@ -472,6 +617,38 @@ mod tests {
         reader.delete().unwrap();
         assert!(!path.exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn format_preflight_reads_the_prefix_without_decoding_or_rewriting_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.log");
+        for version in [8_u16, 9, 10, FORMAT_VERSION, 300] {
+            let mut payload = postcard::to_stdvec(&version).unwrap();
+            payload.extend_from_slice(&[0xff; 10]);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            // A torn later record must remain byte-for-byte intact too.
+            bytes.extend_from_slice(&[5, 0]);
+            fs::write(&path, &bytes).unwrap();
+            assert!(postcard::from_bytes::<StartRecord>(&payload).is_err());
+            assert_eq!(RoomLog::format_version(&path).unwrap(), version);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[HEADER] ^= 1;
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            RoomLog::format_version(&path),
+            Err(LogError::Damaged(0))
+        ));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "corrupt bytes are not guessed to be a version"
+        );
     }
 
     #[test]

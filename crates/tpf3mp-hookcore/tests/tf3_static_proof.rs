@@ -35,6 +35,12 @@ const TARGETS: &[(&str, u64)] = &[
     // The stop tool (crates/tpf3mp-hook/src/stoptool.rs).
     ("StreetTerminalBuilder::MousePressed/Add call", 0x5954e8),
     ("StreetTerminalBuilder::MousePressed/busy set", 0x595305),
+    ("StreetBuilder::UpdateEngine/Add call", 0x589ecf),
+    ("StreetBuilder::UpdateEngine/capture", 0x589c85),
+    ("StreetBuilder::UpdateEngine callback/result scan", 0x56e629),
+    ("StreetBuilder::UpdateEngine callback/snap", 0x56e8e2),
+    ("UI::StreetBuilder::StartAt", 0x571710),
+    ("ecs::Engine::EntityExists", 0x4f7db0),
     ("BaseNodeConfig/field offsets", 0x1768337),
     ("StreetProposal/node configuration offsets", 0x22c395f),
     ("BaseNodeConfig/crosswalk set layout", 0xa4990d),

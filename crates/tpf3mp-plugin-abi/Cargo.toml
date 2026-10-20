@@ -1,0 +1,11 @@
+[package]
+name = "tpf3mp-plugin-abi"
+description = "The interface between TPF3-MP's hook and a native mod's plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]

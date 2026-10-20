@@ -154,6 +154,7 @@ async fn in_a_room_with_patience(
             max_players: 8,
             password: None,
             settings: RoomSettings {
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 steps_per_second: 50,
                 input_delay_ms: 40,
                 checkpoint_interval: 10,

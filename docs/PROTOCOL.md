@@ -1,9 +1,17 @@
 # Protocol
 
-Current integration: protocol **19**, bridge **28**, action schema **26**.
+Current integration: protocol **24**, bridge **30**, action schema **28**,
+room log format **11**.
 This selective combination differs from both prior dev and PR #37; all
 participants and the relay must be upgraded together. Numbers in feature
 history below describe their original introduction.
+The combined wire and persisted layouts differ from both upstream and the
+previous fork. Earlier room-log formats 8, 9 and 10 are refused before any
+recovery rewrite, store open or collection; fork format 9 and upstream
+format 9 describe different layouts. Preserve the complete old data and
+snapshot directories with their matching binaries, and use fresh data and
+snapshot directories for this fork. No migration is provided. An unknown or
+damaged first record also refuses startup without changing those bytes.
 
 This page defines the semantics and invariants of the TPF3-MP protocol. The
 exact fields live in `crates/tpf3mp-proto`, which is the source of truth; this
@@ -95,6 +103,22 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
   the server orders commands without judging them. The room view and every
   `TurnStart` name the room's rules, and they never change for the life of
   the room.
+- **World scans (protocol 23).** `RoomSettings.scan_plan` fixes the exact
+  world-check mode (`RollingV1`, `NativeCompareV2`, or `NativeV2`), part
+  count and update stride for the life of the room. The default remains
+  rolling-v1, `10x1`; native modes are experimental opt-ins. Create refuses
+  invalid plans. Every join, including reconnect/resume, supplies a matching
+  `JoinRoom.scan_plan`. After checking credentials, the room refuses a
+  mismatch with `ScanPlanMismatch` before changing a seat, replacing a
+  connection, appending events or sending a world. The launcher and hook
+  parse the same environment contract, including launcher `--game-env`
+  overrides; malformed values refuse multiplayer.
+  Control and turn streams can arrive in either order: the agent holds the
+  turn stream until both the fresh room view and mod declaration arrive,
+  and passes the agreed plan in bridge-30 `Begin` before any load. The hook
+  checks its cached local configuration against that plan before loading or
+  advancing room steps. Native readers still scan the whole entity table
+  per part; agreement establishes compatibility, without a latency bound.
 - **Closing.** A room closes when its last member leaves; a lobby also
   when its last member disconnects. A running game also closes when nobody
   has been connected to it for the server's grace period, 10 minutes by
@@ -219,8 +243,9 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
   world loads them with (`ModParams`: per mod its `modParams` by name, up
   to 64 bytes, each a whole number; the id `""`, `GAME_SETTINGS`, carries
   the game's own: difficulty, costs, the economy's). The room takes it
-  whole or not at all: every mod listed (no `Unlisted` tail), at most 256,
-  each valid and once, TPF3-MP's own exactly once and last, a Mod Hub
+  whole or not at all: every ordinary mod listed (no `Unlisted` tail), at
+  most 256, each valid and once, TPF3-MP's own exactly once and last; up to
+  16 native terms are additional (272 terms total). A Mod Hub
   number only for a mod from `mod.io`, settings only for the room's mods
   and the game's own, at most 512, each mod once, all within 60 KiB;
   otherwise `InvalidContent`. Only the owner sends it (`NotOwner`), only
@@ -248,6 +273,58 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
   game restored after a restart tells its mods again from it, each by its
   id, with no names, Mod Hub numbers or settings (its world carries its
   own settings); a manifest that is no room's list tells none.
+- **Native mods** (protocol 22; D29, [NATIVE_MODS.md](NATIVE_MODS.md)).
+  A manifest also names the game's native mods that change the simulation
+  (`ContentManifest::native`, at most 16, ordered by id): each a `ModRef`
+  whose id is `native:` and the package's id (no mod folder can be named
+  so) and whose version is the package's version, `+`, the first ten hex
+  digits of a SHA-256 of its settings, defaults included, followed by the
+  full 64-digit SHA-256 package identity (`0.3.0+0123456789<64 hex digits>`).
+  The first ten digits let the server verify the settings named in the room
+  declaration; only the full identity binds package contents. It covers the
+  package metadata, simulation flag, features, declared and effective
+  settings, dependencies, sorted file paths, sizes and SHA-256s, every
+  platform's plugin descriptors and declared hooks. They compare as mods do:
+  `ContentDiff` lists a
+  missing, extra or other native mod under its `native:` id, so two games
+  with different native mods, package bytes or settings never share a room. The
+  fingerprint covers them only when there are any: without native mods it
+  is the fingerprint protocol 19 derived, so a room logged before keeps
+  taking its players back. The owner's `RoomConfig` carries, beside its
+  mods, one `NativeMod` for each of the manifest's native mods in order
+  (`native`: the package's id, the manifest's version, a name for players
+  and every setting, `NativeSetting`, keyed once in order, each a
+  `NativeValue`: a boolean, a whole number or text of up to 128 bytes), and
+  `RoomMods::native` tells them to every member, whose launcher installs
+  that version from the room server's authenticated index or the project's
+  optional signed index with those settings (never from another player).
+  The launcher requires local consent for the same full package identity
+  and source before fetching, installing or enabling executable plugins;
+  the consent choice is not sent to the room. The room refuses a declaration whose
+  native mods do not match its manifest's one for one (`InvalidContent`).
+  An owner cannot start a game with native terms until its valid room
+  declaration supplies their settings.
+  The fork's room log start record (format 11) keeps each native mod's
+  full settings beside the manifest terms and persists the exact scan plan;
+  a restored game tells new members those same settings. This fork refuses
+  every earlier format before recovery or garbage collection. Upstream's
+  legacy format-8/9 decoders do not establish compatibility with the fork's
+  earlier layout or its producing-world turn records. Keep old logs and
+  snapshots intact with their original binary; no defaults or migration are
+  guessed.
+- **A server's native mods** (protocol 21). `NativeIndex { proposed,
+  page }` asks for one page of the native mods the server offers: its
+  index of native mods, the JSON of [NATIVE_MODS.md](NATIVE_MODS.md)'s
+  format, or with `proposed` the mods open pull requests to its registry
+  would add (`Proposals`). The answer is `Response::NativeIndex(Some(
+  NativeIndexPage))`: the index's serial, the page, how many pages there
+  are and up to 48 KiB of its bytes, at most 32 pages; or `None` from a
+  server that offers none. A page past the last answers with the first. A
+  client reads pages 0, 1, … until it has them all, every one with the same
+  serial, and starts again once if the serial changed between pages. The
+  launcher keeps each server's index apart, refuses one older than the one
+  it kept from that server, and rejects different index bytes that reuse the
+  same serial. It installs from the accepted index as from a signed index.
 - **Starting.** In the lobby, members declare their content and toggle
   **ready**. The owner can start the game only when every member is ready,
   all fingerprints are equal, and the world the owner handed over, if any,
@@ -326,6 +403,23 @@ A stream's `Start` also says where the world it continues stands: every
 step up to `sealed_through` has run, and every event before `next_event` is
 applied. When it names a `world`, the client loads that world first (see
 "Snapshots").
+
+`TurnStart.world_epoch` identifies the producing world of that stream.
+Every ordered load, including the first local world, carries its epoch
+through the agent/hook bridge. Progress, checkpoints and saved-world
+reports carry the epoch the hook actually loaded. The room accepts them
+only after `Loaded { world_epoch, step }` acknowledges that exact load's
+frontier, and only while the epoch matches the member's current stream.
+Offering a snapshot permits its download; it does not prove the native
+game has loaded it. An old world's in-flight reports cannot be relabelled
+with the newly offered snapshot's provenance.
+
+When another member joins or reconnects, a propagated refeed preserves an
+existing pending offer of the same snapshot and load frontier on a live,
+streaming link. It keeps that offer's epoch while awaiting `Loaded`, instead
+of ordering the same native load again. This does not count as a completed
+load; a changed world/frontier or replacement connection still needs its
+own appropriate feed.
 
 Together these make every replica apply the same events at the same point in
 simulation time, whatever its latency. Clients enforce them strictly
@@ -458,7 +552,11 @@ These travel on the control stream.
   preview once written stays ahead of the client's own messages on the
   stream, so a flood of them must not fill its window. A slow client
   misses previews and is never disconnected for them.
-- **`Progress`**: the last step the client executed. It drives pacing.
+- **`Loaded`**: the epoch and frontier of the world the hook finished
+  loading. This transition bypasses periodic progress throttling. A full
+  room command queue closes the control connection so the client can retry
+  it after reconnecting.
+- **`Progress`**: the epoch and last step the client executed. It drives pacing.
 - **`Checkpoint`**: per-lane digests at every checkpoint step (a room
   setting). The server compares members' digests, as described in
   [ARCHITECTURE.md](ARCHITECTURE.md) under "Authority and data flow".
@@ -483,11 +581,17 @@ messages can be in flight when a player leaves, so they are not violations.
 ## Resuming
 
 A player who reconnects joins the room again with the same identity and a
-`Resume`: the last turn it applied and the history that turn belongs to,
+`Resume`: the last turn it accepted, its history, and its producing world epoch,
 which its stream's `TurnStart` named (`TurnFollower::resume_point`). The
 server opens a turn stream that starts right after that turn. The new
 connection replaces the old one, which is closed with `REPLACED`. A client
 checks that the stream continues its log exactly (`TurnFollower::restart`).
+An exact resume preserves the epoch. The agent remembers the hook's last
+load acknowledgement before sending it, then repeats its original load
+frontier before current progress on each new control stream. A connection
+lost between the hook acknowledgement and server handling therefore cannot
+leave that member permanently waiting for a load it already completed.
+A replacement world clears this acknowledgement and receives a new epoch.
 
 A server that can no longer resume a client there (the turns left its
 window, or were lost in a crash) answers `ResumeUnavailable`. The client
@@ -535,7 +639,9 @@ turn (save event 0, turn 0, step 0).
 
 **Saving.** The room saves every ten minutes of play, sooner when someone
 waits for a world, but never twice within a minute, and not at all while
-nothing has changed.
+nothing has changed since the last successfully agreed save. A failed
+demanded save remains retryable after the minimum gap, including while
+paused; the last attempted save does not suppress it indefinitely.
 1. It orders a `Save` event, sealed as the last event of its own turn,
    which runs no new steps. The save point is therefore a turn boundary: a
    stream from the save starts right after that turn.
@@ -543,7 +649,10 @@ nothing has changed.
    earlier event applied and before the event's step runs. It cuts the save
    into its chunk store and reports `Saved` with the world's lane digests
    and the snapshot it holds (or none, if saving failed). Only a member
-   whose stream carried the save may report it.
+  whose stream carried the save may report it.
+   Native save files include the producing world epoch and event sequence,
+   so a replayed event cannot overwrite a previous epoch's file while a
+   delayed ingest reads or removes it.
 3. Once every member pacing the room whose stream carries the save has
    reported, or two minutes have passed, the room judges the lanes as it
    judges a checkpoint's. A lone report stands: that is how a player alone
@@ -557,6 +666,15 @@ nothing has changed.
    off. A snapshot the room already holds needs no upload.
 5. The received snapshot becomes the room's current world. The one before
    stays for downloads that may still run; older ones are released.
+
+Lane majorities can select a combination no complete replica holds. In
+that case every save report diverges, no upload candidate qualifies and
+the server promotes no snapshot. It retains the last agreed world and
+logs an explicit warning. Demanded saves can retry, but automatic repair
+cannot synthesize the missing world or select an arbitrary reporter as a
+replacement. The room continues running; its owner should stop play and
+coordinate restoration from a known agreed save if retries do not converge.
+There is no automatic rollback of the room's log to its older snapshot.
 
 **Receiving a world.** The server opens a turn stream whose `Start` names
 the world, starting right after the save's turn. The client fetches the
@@ -627,10 +745,26 @@ nothing for a minute is given up on, and every chunk must move at
 64 KiB/s for its size (at least 5 s each), so nobody holds a transfer by
 trickling.
 
+The agent publishes its current retention set before scheduling cleanup.
+Queued cleanup reads that live set, rather than a captured older list.
+Counted holds protect each unpublished ingest/fetch result, including two
+operations producing the same snapshot; active transfers pin their world
+until they finish. Completion guards release their hold even if the bridge
+ends with queued work or the result cannot be delivered on its closed channel.
+Collection defers root release during ingest, and its
+chunk scan runs outside the publication lock. A completion for a replaced
+world releases its own hold and sends no saved-world report.
+
 **Persistence.** Next to each room's log, a pointer file names its current
 snapshot and where it stands. A restored room keeps offering that snapshot
 if the store still holds it and the recovered log reaches it. At start, the
 server releases snapshots no restored room refers to.
+Pointer jobs serialize per room and skip obsolete requests. Holds dropped
+by an in-memory promotion are released only after the latest pointer write
+has completed; a failed write retains them. On Unix this includes syncing
+the parent directory after the atomic rename. Windows retains the existing
+file-sync/rename behavior; crash durability of the directory entry remains
+a platform-specific acceptance check.
 
 ## Diagnostics
 

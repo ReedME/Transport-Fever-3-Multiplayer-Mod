@@ -1,5 +1,54 @@
 # The team's plan, from release day on
 
+## ReedME review work (2026-10-11)
+
+This fork's owner authorized the review implementation (D30). The upstream
+plan below is retained as context; this checklist tracks our validation.
+
+- [x] R01: verified Proton portable installation and game-closed checks.
+- [x] R02: producing-world report epochs and stale completion rejection.
+- [x] R03: per-loan timing without retroactive charges.
+- [x] R04: native finance accounting and facade match the game's model.
+- [x] R05: Linux Steam library paths resolved by the Windows Proton client.
+- [x] R06: cleanup cannot remove newly retained or in-flight worlds.
+- [x] R07: ordered durable snapshot pointers and recovery retention.
+- [x] R08: failed demanded saves retry while paused with backoff.
+- [x] Rehosting password policy and its save/reload regressions.
+- [x] ReedME branch protections and protected update-signing environment.
+- [x] Fork server/image/update defaults and portable private verifier tested.
+- [x] Local source checks, Windows crosscheck and synthetic room acceptance.
+- Cross-platform CI and acceptance must pass on the exact pushed candidate;
+  current run results are tracked on [the review PR](https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod/pull/1).
+- [ ] Exact supported Windows archive and private verifier runner available.
+- [ ] Real two-player Proton competitive/recovery session.
+
+Detailed setup and outstanding environmental inputs are in `REEDME_SETUP.md`.
+
+## Compatible upstream refresh (2026-10-20, D31)
+
+ReedME approved integrating upstream `02829e36` and its consent-gated
+external plugin model. Original upstream acceptance reports below remain
+upstream evidence. The fork keeps its own ownership, trust roots, service
+defaults and preservation guards; U-D30's junction exception is not adopted.
+
+- [x] Merge the compatible protocol 24 / bridge 30 / action 28 / log 11
+  layouts while preserving producing-world acknowledgements, retention,
+  ordered pointers, Proton installation and company-password provenance.
+- [x] Validate the merged source with local platform and
+  synthetic recovery checks, including non-default scan plans.
+- [x] Adopt external-plugin identity/consent checks with optional fork sources.
+- [x] Retain ordinary-room acceptance gates, including unadopted U-D30.
+- [x] Build Windows development clients/hook and rehearse model clients through Proton.
+- Exact pushed-revision CI and acceptance results remain live on [PR #1](https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod/pull/1).
+- [ ] Windows edition 40420 and initialized actual game Proton prefix available.
+- [ ] Ordinary two-company Proton gameplay/recovery acceptance completed.
+- [ ] Validate any external plugin package on the exact supported game
+  build before publishing or enabling it for a release.
+
+Details and evidence: `../investigation/REEDME_UPSTREAM_REFRESH_2026-10-20.md`.
+
+## Upstream plan
+
 What the team works on from Transport Fever 3's release (2026-09-29), in
 order, and who takes what. It is the team's plan as agreed on 2026-09-27,
 with the review's changes worked in; each change says why. Tick an item
@@ -300,7 +349,12 @@ the hook):
   demonstrated crosswalk toggles, a lane-connection change and traffic
   lights with matching network checkpoints. Custom phases/reset,
   geometry preservation and the remaining HOOKS.md acceptance checks
-  are still required before enabling it.
+  are still required before enabling it. *Upstream history (U-D30,
+  approved upstream 2026-10-17, not adopted by ReedME):* upstream carries
+  the junction window's double slip switch, as seen in a two-game room on
+  build 40420, with regression scenario `double_slip`. The fork keeps this
+  exception disabled pending ReedME's decision; standalone junction edits
+  and the crossing tool's tram lanes remain refused.
 - [ ] Line priority per line; loading rules per station or line.
 - [ ] The new click-to-assign line creation: a new UI flow, captured from
   scratch.
@@ -388,22 +442,47 @@ Dev B:
   room's world loaded with the room's mods and the player's own, and the
   personal mods' guard for game-script mods. Tick once the two-player test
   in MODS.md passes in the real game, and its measurements are made.
-- [ ] *Added (D29, owner-approved 2026-10-08):* native mods (more than Lua,
-  such as Big Maps) installed by the launcher from the project's signed
-  index, enabled in the hook only for their pinned build, and in a room
-  part of its terms ([NATIVE_MODS.md](NATIVE_MODS.md)). PR #117 and its
-  hardening implement framework only: index validation and signature
-  primitives, the store and registry APIs, the enabled-list handoff, and
-  the hook's fail-closed plan. No production key or index, player-facing
-  installer, built-in native feature, or room terms on the wire exists, so
-  players cannot install or use a native mod yet. Open: the key and signing
-  workflow, the launcher's page, Big Maps as the first package, and the
-  room's terms on the wire.
+- [ ] *Added (D29, owner-approved 2026-10-08; server-index and
+  plugin-consent amendments approved 2026-10-15):* native mods (more than
+  Lua, such as Big Maps) installed by the launcher from the room server's
+  index or the project's signed index, enabled in the hook only for their
+  pinned build, and in a room part of its terms
+  ([NATIVE_MODS.md](NATIVE_MODS.md)). PR #117 and its hardening implement
+  framework only: index validation and signature primitives, the store and
+  registry APIs, the enabled-list handoff, and the hook's fail-closed plan.
+  *Implemented (protocol 22, combined #148/#151/#152):* native room terms
+  with full package identity and settings; the server registry and Mods
+  browser; installed-byte/file-set verification; Windows x86-64 plugin
+  loading with source/settings/content-bound consent; dependency-aware
+  room matching; and installation of enabled packages' game-mod folders.
+  The identity binds every plugin descriptor and declared hook. The Big
+  Maps plugin and package builder are included. Still open: configure the
+  first production registry and publish its package, validate ordinary
+  game startup and Big Maps gameplay before release, and support plugin
+  loading on other platforms. A project-signed index remains optional.
+  The overall item stays unchecked until player-facing acceptance passes.
 
 Dev C:
 
 - [ ] Roads with lane connections, tram lanes and ramps; track types and
   underground segments.
+- [ ] *Added, proposed (for the owner):* level crossing types. A type
+  picked in a crossing's window was dropped in a room without a word
+  (2026-10-16). Built: the hook reads the window's type-only map shape, and
+  its preparatory path forms `SetCrossingType` (action schema 27): the
+  crossing by its nodes' places, the type by its file; the player is told
+  when it is refused; the network lane reads every crossing's type. The PR
+  author reported staged Japan_2 two-player runs on 2026-10-17, but ordinary-
+  start acceptance is not established here, so `acceptance.lua`'s `crossings`
+  gate remains off. The ordinary window may emit a Rebuild even for a plain
+  type swap; the normal UI flow remains unimplemented and refused unless the
+  native proposal has the type-only map shape. Window rebuilds that map nodes
+  while changing segments or junctions are refused because the type-only
+  action cannot prove or reproduce those changes. The type the road and
+  track tools pick for a new crossing (`rcType`) goes with
+  `BuildRoad`/`BuildTrack` (schema 28), behind `crossingTypes`
+  (off; staged two-game runs on 2026-10-17 passed, ordinary-start acceptance not yet). Open: ordinary-start two-player acceptance of the window's
+  path ([HOOKS.md](HOOKS.md), "Level crossing types").
 - [ ] Landmarks, built once: the second on the same turn is refused and
   pays nothing.
 - [ ] Warehouses, specialised terminals, maintenance facilities, noise

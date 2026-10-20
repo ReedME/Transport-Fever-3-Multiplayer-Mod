@@ -32,7 +32,8 @@
 --     edges   = { { node0 =, node1 =, network =, tangent0 = {..}, tangent1 = {..},
 --                   structure = "Ground" | { Bridge = file } | { Tunnel = file },
 --                   template =, style =,
---                   decorations = { { name =, flag = } }, locked =, owned = }, ... },
+--                   decorations = { { name =, flag = } }, locked =, owned =,
+--                   position0 =, position1 = }, ... },  -- where the edge itself ends, if known
 --                                                         -- the proposal's new edges
 --     removed = { { node0 =, node1 =, network = }, ... }, -- the existing edges it removes
 --     removedNodes = { { id =, pos = {x, y, z} }, ... },   -- the existing nodes it removes
@@ -129,6 +130,24 @@ function roads.convert(capture, world)
 		local link = { from = i1, to = i2, tangent0 = t0, tangent1 = t1, structure = e.structure or "Ground",
 			decorations = e.decorations or {}, locked = e.locked == true, owned = e.owned == true,
 			lanes = e.lanes or {}, precedence = e.precedence }
+		-- Where the edge itself ends, where that is not its vertex: the track
+		-- tool starts a track laid onto a street's end on the street's tram
+		-- lane, beside the node, and the game joins the two there only
+		-- (build 40420). Off the vertex by a millimetre or more, as the
+		-- schema rounds.
+		for _, at in ipairs({ { "position0", i1 }, { "position1", i2 } }) do
+			local field, i = at[1], at[2]
+			if e[field] ~= nil then
+				local p, errP = vec3(e[field])
+				if not p then return nil, "edge " .. k .. " " .. field .. ": " .. errP end
+				local v = vertices[i + 1].pos
+				if math.abs(p.x - v.x) >= 0.0005 or math.abs(p.y - v.y) >= 0.0005 or math.abs(p.z - v.z) >= 0.0005 then
+					link[field] = p
+				end
+			end
+		end
+		-- The signals it takes from a track the build cuts (engine.keptInPlace).
+		if e.kept and #e.kept > 0 then link.kept = e.kept end
 		if capture.explicit or e.network ~= own or e.template ~= ownTemplate or e.style ~= capture.style then
 			if e.network ~= "Street" and e.network ~= "Track" then
 				return nil, "edge " .. k .. " is in no network"

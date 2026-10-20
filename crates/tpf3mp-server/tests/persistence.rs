@@ -92,6 +92,7 @@ async fn resume(server: &RunningServer, players: Vec<Player>, invite: &Invite) -
         player
             .client()
             .join_room(JoinRoom {
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 invite: *invite,
                 password: None,
                 resume,
@@ -228,6 +229,7 @@ async fn restored_rooms_need_the_same_secret() {
     let error = ann
         .client
         .join_room(JoinRoom {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             invite,
             password: None,
             resume: None,
@@ -238,4 +240,66 @@ async fn restored_rooms_need_the_same_secret() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     server.shut_down().await;
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn experimental_scan_plan_survives_restart_and_compaction() {
+    use common::{content, join, room};
+    use tpf3mp_proto::{RoomSettings, ScanPlan};
+    for compact_log_at in [None, Some(256)] {
+        let dir = data_dir(if compact_log_at.is_some() {
+            "scan-compact"
+        } else {
+            "scan-restart"
+        });
+        let secret = [28; 32];
+        let plan = ScanPlan::from_values(Some("compare"), Some("5x10")).unwrap();
+        let first = RunningServer::start(compacting(&dir, secret, compact_log_at)).await;
+        let owner = first.client("owner").await;
+        owner.client.declare_content(content(1)).await.unwrap();
+        let (invite, _) = owner
+            .client
+            .create_room(room(
+                "scan",
+                RoomSettings {
+                    scan_plan: plan,
+                    ..FAST
+                },
+            ))
+            .await
+            .unwrap();
+        owner.client.set_ready(true).await.unwrap();
+        owner.client.start_game().await.unwrap();
+        let mut player = Player::new(owner);
+        player.play_until(|p| p.executed >= 20).await;
+        if compact_log_at.is_some() {
+            assert!(
+                !first
+                    .stats
+                    .render_metrics()
+                    .contains("tpf3mp_logs_compacted_total 0\n")
+            );
+        }
+        first.shut_down().await;
+        let second = RunningServer::start(compacting(&dir, secret, compact_log_at)).await;
+        assert_eq!(second.stats.rooms(), 1);
+        let next = second
+            .client_as(Arc::clone(&player.test.identity), "back")
+            .await;
+        assert_eq!(
+            next.client.join_room(join(&invite)).await,
+            Err(ClientError::Refused(RequestError::ScanPlanMismatch))
+        );
+        let request = JoinRoom {
+            scan_plan: plan,
+            resume: player.follower.as_ref().map(|f| f.resume_point()),
+            ..join(&invite)
+        };
+        let restored = next.client.join_room(request).await.unwrap();
+        assert_eq!(restored.settings.scan_plan, plan);
+        player.test = next;
+        player.play_until(|p| p.executed >= 30).await;
+        second.shut_down().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

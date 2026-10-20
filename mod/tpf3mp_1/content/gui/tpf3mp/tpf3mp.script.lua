@@ -70,6 +70,10 @@ function data()
 	local pending = {}
 	-- The notice of the last refusal, until the plugin shows it.
 	local notice = nil
+	-- The last refusal the game script's GUI half told under
+	-- "tpf3mp.notice" (a native click it stopped: the level crossing
+	-- window's), or false before the first read, which only notes it.
+	local toldNotice = false
 	-- Refusals so far, by kind, and the last reason logged of each, for the
 	-- hook's log.
 	local refusals, reasons = {}, {}
@@ -413,6 +417,8 @@ function data()
 		local roster = state and state.companies
 		if type(roster) ~= "table" or type(roster.list) ~= "table" then return nil, "" end
 		local out, sign = { list = {}, members = roster.members or {}, loans = roster.loans or {} }, {}
+		out.passwordNotice = require("tpf3mp.companies").passwordNotice(roster)
+		if out.passwordNotice then sign[#sign + 1] = out.passwordNotice end
 		-- A founded company reads its own persisted offers. Company zero keeps
 		-- the native finance window and its loan script state.
 		pcall(function()
@@ -646,6 +652,7 @@ function data()
 		if not roster then return end
 		local companies = require("tpf3mp.companies")
 		local function line(text) rows[#rows + 1] = label(text, "font-scale-annotation", COMPANIES_WIDTH - 40, 38) end
+		if roster.passwordNotice then line(roster.passwordNotice) end
 		local function row(children)
 			local spaced = {}
 			for i, child in ipairs(children) do
@@ -906,7 +913,7 @@ function data()
 			for _, offer in ipairs(roster.offers or {}) do
 				if type(offer) == "table" and type(offer.amount) == "number" then
 					offers[#offers + 1] = button("Borrow " .. money(offer.amount),
-						string.format("Borrow %s at %g%% a year", money(offer.amount), (offer.percentage or 0) * 100),
+						string.format("Borrow %s with %g%% interest over the full term", money(offer.amount), (offer.percentage or 0) * 100),
 						function()
 							local nextOffer = replacementOffer(offer)
 							if not nextOffer then
@@ -1216,6 +1223,16 @@ function data()
 					end
 				end)
 				if not delivered then say("answering the player's commands failed: " .. tostring(why)) end
+			end
+			if link then
+				local told = link:note("tpf3mp.notice")
+				if toldNotice == false then
+					toldNotice = told or ""
+				elseif told and told ~= toldNotice then
+					toldNotice = told
+					local text = told:match("^%d+	(.+)$")
+					if text then notice = text end
+				end
 			end
 			if notice then
 				shown:set(notice)

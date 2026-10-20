@@ -48,6 +48,9 @@ const REPAIR_ROUNDS: usize = 3;
 pub const MIN_RATE: u64 = 64 * 1024;
 /// The time any one frame gets, however small.
 const FRAME_FLOOR: Duration = Duration::from_secs(5);
+/// A cancelled fetch may still own its sink in a running disk task. Poll
+/// only that local claim; unrelated snapshots can continue concurrently.
+const SINK_RETRY: Duration = Duration::from_millis(10);
 
 /// Why a bulk transfer failed.
 #[derive(Debug, Error)]
@@ -60,6 +63,11 @@ pub enum BulkError {
     Violation(&'static str),
     #[error("the peer sent nothing for {0:?}")]
     Idle(Duration),
+    #[error("a previous local transfer of snapshot {snapshot} did not finish within {waited:?}")]
+    LocalBusy {
+        snapshot: ManifestId,
+        waited: Duration,
+    },
     #[error("the peer no longer has the snapshot")]
     Unavailable,
     #[error("the peer's manifest is not valid: {0}")]
@@ -258,11 +266,7 @@ pub async fn fetch(
     if manifest.id() != *expected {
         return Err(BulkError::WrongManifest);
     }
-    let sink = {
-        let store = store.clone();
-        let manifest = manifest.clone();
-        blocking(move || open_sink(&store, manifest)).await??
-    };
+    let sink = open_sink_when_available(store, &manifest, idle).await?;
     progress(sink.progress());
     match fetch_into(send, recv, sink, &completion, idle, &mut progress).await {
         Ok(()) => {
@@ -326,15 +330,54 @@ async fn fetch_into(
 /// in this store stopped.
 fn open_sink(store: &ChunkStore, manifest: Manifest) -> Result<ChunkSink, SinkError> {
     let id = manifest.id();
-    if store.pending()?.contains(&id) {
-        match ChunkSink::resume(store, &id) {
-            Ok(sink) => return Ok(sink),
-            // The saved state is damaged: start over from the manifest.
-            Err(SinkError::Store(StoreError::DamagedRecord { .. })) => {}
-            Err(error) => return Err(error),
-        }
+    match ChunkSink::resume(store, &id) {
+        Ok(sink) => return Ok(sink),
+        // The previous owner or collector may remove a pending record as it
+        // releases its claim. Missing or damaged state can be recreated from
+        // the validated manifest offered by the peer; other errors stay fatal.
+        Err(SinkError::Store(
+            StoreError::UnknownSnapshot(_) | StoreError::DamagedRecord { .. },
+        )) => {}
+        Err(error) => return Err(error),
     }
     ChunkSink::open(store, manifest)
+}
+
+/// Aborting an async fetch does not cancel disk work already running on the
+/// blocking pool. Wait for its real sink claim to drop before a replacement
+/// takes the same snapshot, without turning local contention into a room rejoin.
+async fn open_sink_when_available(
+    store: &ChunkStore,
+    manifest: &Manifest,
+    idle: Duration,
+) -> Result<ChunkSink, BulkError> {
+    let mut contended = false;
+    let opened = within(idle, async {
+        loop {
+            let store = store.clone();
+            let manifest = manifest.clone();
+            match blocking(move || open_sink(&store, manifest)).await? {
+                Ok(sink) => return Ok(sink),
+                Err(SinkError::AlreadyOpen(snapshot)) => {
+                    if !contended {
+                        tracing::debug!(%snapshot, "waiting for a previous local snapshot transfer to finish");
+                        contended = true;
+                    }
+                    tokio::time::sleep(SINK_RETRY).await;
+                }
+                Err(error) => return Err(BulkError::from(error)),
+            }
+        }
+    })
+    .await;
+    match opened {
+        Ok(result) => result,
+        Err(BulkError::Idle(waited)) if contended => Err(BulkError::LocalBusy {
+            snapshot: manifest.id(),
+            waited,
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 /// Requests every chunk the sink lacks and feeds the answers to it. Each

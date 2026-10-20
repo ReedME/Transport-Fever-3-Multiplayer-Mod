@@ -245,7 +245,11 @@ async fn run(command: Command) -> Result<()> {
                     name: Text::new(room_name).context("room name")?,
                     max_players,
                     password: password.clone(),
-                    settings: RoomSettings::DEFAULT,
+                    settings: RoomSettings {
+                        scan_plan: tpf3mp_proto::ScanPlan::from_environment()
+                            .map_err(anyhow::Error::msg)?,
+                        ..RoomSettings::DEFAULT
+                    },
                     rules: rules.map(Text::new).transpose().context("rules")?,
                     listing: None,
                     competitive: false,
@@ -294,6 +298,8 @@ async fn run(command: Command) -> Result<()> {
             client.declare_content(content.clone()).await?;
             let joined = client
                 .join_room(JoinRoom {
+                    scan_plan: tpf3mp_proto::ScanPlan::from_environment()
+                        .map_err(anyhow::Error::msg)?,
                     invite,
                     password: password.clone(),
                     resume: None,

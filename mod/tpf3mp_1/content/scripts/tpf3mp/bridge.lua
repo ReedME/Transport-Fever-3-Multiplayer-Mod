@@ -5,7 +5,7 @@
 -- `print` one global table, so the mod prints before it looks for it:
 --
 --   tpf3mp_native = {
---     version = 14,                 -- bridge.VERSION; anything else is refused
+--     version = 15,                 -- bridge.VERSION; anything else is refused
 --     command = function(action, password), -- the player acted: an action
 --                                   -- table, for the room to order, and a
 --                                   -- company's password for joining or
@@ -49,7 +49,7 @@
 --                                   -- own actions since the last call,
 --                                   -- { { ticket =, ok =, entity =, why = } }
 --     status  = function(),         -- the room, for the Multiplayer window, or
---                                   -- nil before its game: { room =, speed =,
+--                                   -- nil before its game: { room = (display), room_id = (stable), speed =,
 --                                   -- diverged =, me_id =, players = { {
 --                                   -- name =, connected =, owner =, me =,
 --                                   -- id = } } }
@@ -142,7 +142,7 @@ local bridge = {}
 -- 4: the GUI saves and loads the room's world (`poll`, `saved`, `world`);
 -- 3: the room's actions are taken by the game script (`take`); 2 called the
 -- GUI's handlers; 1 passed bytes the mod encoded itself.
-bridge.VERSION = 14
+bridge.VERSION = 15
 bridge.GLOBAL = "tpf3mp_native"
 
 local Link = {}
@@ -221,7 +221,7 @@ function Link:results()
 	return results
 end
 
--- The room, for the Multiplayer window: { room =, speed =, diverged =,
+-- The room, for the Multiplayer window: { room = (display), room_id = (stable), speed =, diverged =,
 -- players = { { name =, connected =, owner =, me = } } }, or nil before its
 -- game.
 function Link:status()
@@ -330,6 +330,32 @@ function Link:lanes(lanes)
 	return true
 end
 
+-- In the GUI: click `click` (the count before it) was handed to the room
+-- with `ticket`, or not (nil): the street and track tools continue from
+-- what the room built for it (tpf3mp/toolchain.lua). A hook without it
+-- leaves the tools as they are.
+function Link:chainClick(click, ticket)
+	if type(self.native.chainClick) ~= "function" then return end
+	pcall(self.native.chainClick, click, ticket)
+end
+
+-- In the GUI, each frame: the edge the room built where the player's last
+-- street or track click ended, to check in the GUI's state (edge, node0,
+-- node1, end, x, y, z), or nothing.
+function Link:chainPoll()
+	if type(self.native.chainPoll) ~= "function" then return nil end
+	local ok, edge, node0, node1, endIndex, x, y, z = pcall(self.native.chainPoll)
+	if not ok or type(edge) ~= "number" then return nil end
+	return edge, node0, node1, endIndex, x, y, z
+end
+
+-- In the GUI: its state has `edge` as the room built it, with `streets`
+-- street edges and `others` other edges at the clicked end's node.
+function Link:chainSeen(edge, streets, others)
+	if type(self.native.chainSeen) ~= "function" then return end
+	pcall(self.native.chainSeen, edge, streets, others)
+end
+
 -- The player's builds queued in the room's game so far, or nil where the
 -- hook cannot take them to the room (the tools then stay refused).
 function Link:clicks()
@@ -348,6 +374,25 @@ function Link:built(click)
 	local ok, proposal, why = pcall(self.native.built, click)
 	if not ok then return nil, "the hook refused: " .. tostring(proposal) end
 	if type(proposal) == "table" then return proposal end
+	if why ~= nil then return nil, tostring(why) end
+	return nil
+end
+
+-- In the GUI: the level crossing type the street or track tool's click
+-- `click` lays its crossings as, read by the hook from the click's
+-- proposal (docs/HOOKS.md, "Level crossing types"), once: the type (this
+-- game's index); false when it picked none; false and why when the hook
+-- cannot tell (no `toolCrossing`, which is optional, or a profile without
+-- the maps: the GUI then refuses the build); nil and why when it did not
+-- read; nil when nothing was kept for the click.
+function Link:toolCrossing(click)
+	if type(self.native.toolCrossing) ~= "function" then
+		return false, "the hook does not read the tools' level crossing type"
+	end
+	local ok, kind, why = pcall(self.native.toolCrossing, click)
+	if not ok then return nil, "the hook refused: " .. tostring(kind) end
+	if type(kind) == "number" then return kind end
+	if kind == false then return false, why ~= nil and tostring(why) or nil end
 	if why ~= nil then return nil, tostring(why) end
 	return nil
 end
@@ -514,6 +559,22 @@ end
 function Link:terrain(grid)
 	if type(self.native.terrain) ~= "function" then return nil, "this hook cannot apply a terraform" end
 	local ok, result, why = pcall(self.native.terrain, grid)
+	if not ok then return nil, "the hook refused: " .. tostring(result) end
+	return result, why
+end
+
+-- While the room's actions run: arms the next build sent with level crossing
+-- `entity` taking type `index` (true, or nil and why), or with no arguments
+-- disarms, answering whether a build was filled (nil when none was armed).
+-- A hook without `crossing` (it is optional) sets no crossing's type.
+function Link:crossing(entity, index)
+	if type(self.native.crossing) ~= "function" then return nil, "this hook cannot set a crossing's type" end
+	local ok, result, why
+	if entity == nil then
+		ok, result, why = pcall(self.native.crossing)
+	else
+		ok, result, why = pcall(self.native.crossing, entity, index)
+	end
 	if not ok then return nil, "the hook refused: " .. tostring(result) end
 	return result, why
 end

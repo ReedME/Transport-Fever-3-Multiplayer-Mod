@@ -5,6 +5,8 @@
 //! <launcher data>/native-mods/
 //!   native-mods.json, native-mods.json.sig   the last index accepted
 //!   registry.json                            every installed package and file
+//!   package-sources.json                     trusted source per installed version
+//!   consents.json                            exact plugin-identity approvals
 //!   enabled.json                             what the next game runs (crate::enabled)
 //!   <id>/<version>/…                         a package's files
 //!   <id>/.partial-<version>/                 a download in progress
@@ -25,7 +27,7 @@
 #[cfg(feature = "install")]
 use std::time::Duration;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
 };
@@ -47,6 +49,28 @@ pub const REGISTRY: &str = "registry.json";
 const REGISTRY_FORMAT: u32 = 2;
 const PREVIOUS_REGISTRY_FORMAT: u32 = 1;
 const PARTIAL: &str = ".partial-";
+const PACKAGE_SOURCES: &str = "package-sources.json";
+const PACKAGE_SOURCES_FORMAT: u32 = 1;
+const CONSENTS: &str = "consents.json";
+const CONSENTS_FORMAT: u32 = 1;
+
+/// Per-package effective settings supplied to a source-aware install. Each
+/// plugin-bearing package in the resolved closure must have an entry.
+pub type EffectiveSettingsByPackage = BTreeMap<String, BTreeMap<String, Setting>>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackageSources {
+    format: u32,
+    packages: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsentRecords {
+    format: u32,
+    by_source: BTreeMap<String, BTreeSet<String>>,
+}
 
 /// Where packages come from.
 pub trait Source {
@@ -147,6 +171,23 @@ pub enum StoreError {
     NoIndex,
     #[error("the native-mods registry cannot be read: {0}")]
     Registry(String),
+    #[error("the native-mod consent or source records cannot be read: {0}")]
+    ConsentStore(String),
+    #[error("the native package source is not canonical: {0}")]
+    InvalidSource(String),
+    #[error("plugin package {id} {version} has no trusted source recorded")]
+    MissingSource { id: String, version: String },
+    #[error("plugin package {id} {version} needs approval from {source_id} for {digest}")]
+    ConsentRequired {
+        id: String,
+        version: String,
+        source_id: String,
+        digest: String,
+    },
+    #[error("effective settings for plugin package {0} were not supplied")]
+    MissingEffectiveSettings(String),
+    #[error("plugin package {id} cannot be loaded on this target ({platform})")]
+    UnsupportedPluginPlatform { id: String, platform: String },
     #[error("the native mod {0} is not installed")]
     NotInstalled(String),
     #[error("the native mod {0} has no earlier version to go back to")]
@@ -165,8 +206,54 @@ pub enum StoreError {
     Setting(String),
     #[error("native-mod path is unsafe or crosses a symbolic link: {0}")]
     UnsafePath(PathBuf),
+    #[error("{id} cannot be switched on: {why}")]
+    Clash { id: String, why: String },
     #[error("simulation-changing native mod {id} is not pinned to this game build ({build})")]
     SimulationPackageNotForBuild { id: String, build: String },
+}
+
+/// Whether a failed current-version change already made it to registry.json.
+/// Install replacement must keep the new folder when only old-version
+/// cleanup failed after that durable write.
+struct MakeCurrentError {
+    source: StoreError,
+    saved: bool,
+}
+
+impl From<StoreError> for MakeCurrentError {
+    fn from(source: StoreError) -> Self {
+        Self {
+            source,
+            saved: false,
+        }
+    }
+}
+
+impl From<MakeCurrentError> for StoreError {
+    fn from(error: MakeCurrentError) -> Self {
+        error.source
+    }
+}
+
+fn ensure_plugin_platform_supported(
+    package: &Package,
+    platform: Option<&str>,
+) -> Result<(), StoreError> {
+    if package.plugins.is_empty() {
+        return Ok(());
+    }
+    let plugins = platform
+        .map(|platform| package.plugins_for(platform))
+        .unwrap_or_default();
+    if plugins.is_empty() || plugins.iter().any(|plugin| plugin.abi != index::PLUGIN_ABI) {
+        return Err(StoreError::UnsupportedPluginPlatform {
+            id: package.id.clone(),
+            platform: platform
+                .unwrap_or("unsupported operating system or architecture")
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Every installed package.
@@ -222,6 +309,8 @@ impl Installed {
 pub struct Store {
     root: PathBuf,
     registry: Registry,
+    sources: PackageSources,
+    consents: ConsentRecords,
 }
 
 impl Store {
@@ -245,7 +334,14 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Registry::default(),
             Err(error) => return Err(error.into()),
         };
-        Ok(Self { root, registry })
+        let sources = read_package_sources(&root)?;
+        let consents = read_consents(&root)?;
+        Ok(Self {
+            root,
+            registry,
+            sources,
+            consents,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -254,6 +350,53 @@ impl Store {
 
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// Trusted source recorded for one installed package version. Source
+    /// IDs are `project` or a canonical lowercase `host:port` from the
+    /// authenticated room connection.
+    pub fn source_for(&self, id: &str, version: &str) -> Option<&str> {
+        if !self
+            .registry
+            .packages
+            .get(id)
+            .is_some_and(|installed| installed.versions.contains_key(version))
+        {
+            return None;
+        }
+        self.sources
+            .packages
+            .get(id)?
+            .get(version)
+            .map(String::as_str)
+    }
+
+    /// Whether this trusted source approved the exact canonical package
+    /// identity. The digest includes declared metadata, all platform plugin
+    /// descriptors, hooks and effective settings.
+    pub fn has_consent(&self, source_id: &str, digest: &str) -> Result<bool, StoreError> {
+        validate_source_id(source_id)?;
+        validate_digest(digest)?;
+        Ok(self
+            .consents
+            .by_source
+            .get(source_id)
+            .is_some_and(|digests| digests.contains(digest)))
+    }
+
+    /// Records approval for one exact source and canonical package
+    /// identity. Callers must invoke this only after the player approves.
+    pub fn record_consent(&mut self, source_id: &str, digest: &str) -> Result<(), StoreError> {
+        validate_source_id(source_id)?;
+        validate_digest(digest)?;
+        let mut next = self.consents.clone();
+        next.by_source
+            .entry(source_id.to_owned())
+            .or_default()
+            .insert(digest.to_owned());
+        self.save_consents(&next)?;
+        self.consents = next;
+        Ok(())
     }
 
     /// The folder of `id` in `version`.
@@ -416,20 +559,129 @@ impl Store {
         id: &str,
         source: &dyn Source,
     ) -> Result<Vec<String>, StoreError> {
+        self.install_resolved(context, id, None, None, source)
+    }
+
+    /// Installs `id` in exactly `version` (a room's) and what it needs, or
+    /// makes that version current again when it is on disk.
+    pub fn install_exact(
+        &mut self,
+        context: resolve::Context<'_>,
+        id: &str,
+        version: &str,
+        source: &dyn Source,
+    ) -> Result<Vec<String>, StoreError> {
+        self.install_resolved(context, id, Some(version), None, source)
+    }
+
+    /// Source-aware install. Plugin-bearing packages in the entire resolved
+    /// closure must have an approval for their full content identity and
+    /// effective settings before any package is installed or made current.
+    pub fn install_from(
+        &mut self,
+        context: resolve::Context<'_>,
+        id: &str,
+        source_id: &str,
+        effective_settings_by_package: &EffectiveSettingsByPackage,
+        source: &dyn Source,
+    ) -> Result<Vec<String>, StoreError> {
+        self.install_resolved(
+            context,
+            id,
+            None,
+            Some((source_id, effective_settings_by_package)),
+            source,
+        )
+    }
+
+    /// Source-aware exact-version install; see [`Self::install_from`].
+    pub fn install_exact_from(
+        &mut self,
+        context: resolve::Context<'_>,
+        id: &str,
+        version: &str,
+        source_id: &str,
+        effective_settings_by_package: &EffectiveSettingsByPackage,
+        source: &dyn Source,
+    ) -> Result<Vec<String>, StoreError> {
+        self.install_resolved(
+            context,
+            id,
+            Some(version),
+            Some((source_id, effective_settings_by_package)),
+            source,
+        )
+    }
+
+    fn install_resolved(
+        &mut self,
+        context: resolve::Context<'_>,
+        id: &str,
+        version: Option<&str>,
+        source_context: Option<(&str, &EffectiveSettingsByPackage)>,
+        source: &dyn Source,
+    ) -> Result<Vec<String>, StoreError> {
+        if let Some((source_id, _)) = source_context {
+            validate_source_id(source_id)?;
+        }
         let installed: Vec<&Package> = self
             .registry
             .packages
             .values()
             .filter_map(Installed::package)
             .collect();
-        let order: Vec<Package> = resolve::resolve(context, &[id], &installed)?
-            .into_iter()
-            .cloned()
-            .collect();
+        let resolution = match version {
+            Some(version) => resolve::resolve_exact_plan(context, id, version, &installed),
+            None => resolve::resolve_plan(context, &[id], &installed),
+        };
+        let resolution = resolution?;
+        let mut selected_sources = BTreeMap::new();
+        for package in &resolution.closure {
+            let current_index_package = context.index.package(&package.id, &package.version);
+            match source_context {
+                Some((source_id, settings_by_package)) => {
+                    let source = if current_index_package.is_some() {
+                        Some(source_id)
+                    } else {
+                        self.source_for(&package.id, &package.version)
+                    };
+                    let settings = settings_by_package.get(&package.id);
+                    self.require_plugin_consent(package, source, settings)?;
+                    if current_index_package.is_some() {
+                        selected_sources.insert(
+                            (package.id.clone(), package.version.clone()),
+                            source_id.to_owned(),
+                        );
+                    }
+                }
+                None => {
+                    if !package.plugins.is_empty() {
+                        return Err(StoreError::MissingSource {
+                            id: package.id.clone(),
+                            version: package.version.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let order: Vec<Package> = resolution.install.into_iter().cloned().collect();
         let mut done = Vec::new();
         for package in &order {
             self.install_one(package, source)?;
             done.push(format!("{} {}", package.id, package.version));
+        }
+        let mut next_sources = self.sources.clone();
+        for ((id, version), source_id) in selected_sources {
+            next_sources
+                .packages
+                .entry(id)
+                .or_default()
+                .insert(version, source_id);
+        }
+        if source_context.is_some() && !next_sources.packages.is_empty() {
+            self.save_sources(&next_sources)?;
+            self.sources = next_sources;
         }
         Ok(done)
     }
@@ -441,24 +693,30 @@ impl Store {
             .registry
             .packages
             .get(&package.id)
-            .is_some_and(|i| i.versions.contains_key(&package.version));
-        if registered {
-            // The version kept for a rollback: in use again if it is whole,
-            // downloaded again if it is not.
-            if self.damaged(&folder, package)?.is_empty() {
-                return self.make_current(package);
-            }
-            remove_registered(&self.root, &folder, package)?;
-            if let Some(installed) = self.registry.packages.get_mut(&package.id) {
-                installed.versions.remove(&package.version);
-            }
-        } else if folder.exists() {
-            // Left by an install cut short after the rename: taken if it is
-            // exactly the package, refused otherwise.
-            if !self.damaged(&folder, package)?.is_empty() {
+            .and_then(|installed| installed.versions.get(&package.version))
+            .cloned();
+        let expected = package_file_set(package);
+        let present = package_file_set_on_disk(&self.root, &folder)?;
+        if let Some(old) = &registered {
+            // Every file already in this folder must have belonged to the
+            // registered package. In particular, a user file whose path was
+            // only added by the new manifest remains an extra and is never
+            // silently overwritten.
+            let old_files = package_file_set(old);
+            if !present.is_subset(&old_files) {
                 return Err(StoreError::Occupied(folder));
             }
-            return self.make_current(package);
+            if present == expected && self.damaged(&folder, package)?.is_empty() {
+                return self.make_current(package).map_err(StoreError::from);
+            }
+        } else if folder.exists() {
+            // An unregistered folder may be left by an interrupted install.
+            // Take it only when its complete file set and bytes are exactly
+            // those of the signed package.
+            if present != expected || !self.damaged(&folder, package)?.is_empty() {
+                return Err(StoreError::Occupied(folder));
+            }
+            return self.make_current(package).map_err(StoreError::from);
         }
         let partial = self
             .root
@@ -469,8 +727,16 @@ impl Store {
             ensure_no_symlink_tree(&self.root, &partial)?;
             fs::remove_dir_all(&partial)?;
         }
+        let backup = self
+            .root
+            .join(&package.id)
+            .join(format!("{PARTIAL}{}-previous", package.version));
+        ensure_no_symlink_path(&self.root, &backup)?;
+        if backup.exists() {
+            return Err(StoreError::Occupied(backup));
+        }
         fs::create_dir_all(&partial)?;
-        let downloaded = package.files.iter().try_for_each(|file| {
+        let downloaded = package.local_files().iter().try_for_each(|file| {
             let path = partial.join(&file.path);
             ensure_no_symlink_path(&self.root, &path)?;
             if let Some(parent) = path.parent() {
@@ -484,17 +750,53 @@ impl Store {
             return Err(error);
         }
         ensure_no_symlink_tree(&self.root, &partial)?;
+        if package_file_set_on_disk(&self.root, &partial)? != expected
+            || !self.damaged(&partial, package)?.is_empty()
+        {
+            let _ = remove_partial_tree(&self.root, &partial);
+            return Err(StoreError::Fetch(FetchError::Mismatch));
+        }
         ensure_no_symlink_path(&self.root, &folder)?;
-        if let Err(error) = fs::rename(&partial, &folder) {
+        let moved_old = registered.is_some() && folder.exists();
+        if moved_old && let Err(error) = fs::rename(&folder, &backup) {
             let _ = remove_partial_tree(&self.root, &partial);
             return Err(error.into());
         }
-        self.make_current(package)
+        if let Err(error) = fs::rename(&partial, &folder) {
+            if moved_old {
+                let _ = fs::rename(&backup, &folder);
+            }
+            let _ = remove_partial_tree(&self.root, &partial);
+            return Err(error.into());
+        }
+        let registry_before = self.registry.clone();
+        if let Err(error) = self.make_current(package) {
+            if error.saved {
+                // registry.json now describes the new bytes. Keep the new
+                // folder in place; restoring the backup would split the
+                // registry identity from the files it authenticates.
+                if moved_old {
+                    remove_partial_tree(&self.root, &backup)?;
+                }
+                return Err(error.source);
+            }
+            self.registry = registry_before;
+            let _ = fs::rename(&folder, &partial);
+            if moved_old {
+                let _ = fs::rename(&backup, &folder);
+            }
+            let _ = remove_partial_tree(&self.root, &partial);
+            return Err(error.source);
+        }
+        if moved_old {
+            remove_partial_tree(&self.root, &backup)?;
+        }
+        Ok(())
     }
 
     /// Records `package`, on disk, as its id's version in use, keeping the
     /// one before and deleting older ones.
-    fn make_current(&mut self, package: &Package) -> Result<(), StoreError> {
+    fn make_current(&mut self, package: &Package) -> Result<(), MakeCurrentError> {
         let prior_current = self
             .registry
             .packages
@@ -547,12 +849,23 @@ impl Store {
             entry.versions.remove(&package.version);
         }
         self.save()?;
+        if let Err(source) = self.prune_sources() {
+            return Err(MakeCurrentError {
+                source,
+                saved: true,
+            });
+        }
         for package in old {
-            remove_registered(
+            if let Err(source) = remove_registered(
                 &self.root,
                 &self.folder(&package.id, &package.version),
                 &package,
-            )?;
+            ) {
+                return Err(MakeCurrentError {
+                    source,
+                    saved: true,
+                });
+            }
         }
         Ok(())
     }
@@ -600,6 +913,12 @@ impl Store {
         }
         self.registry.packages.remove(id);
         self.save()?;
+        let mut next_sources = self.sources.clone();
+        next_sources.packages.remove(id);
+        if !next_sources.packages.is_empty() || self.root.join(PACKAGE_SOURCES).exists() {
+            self.save_sources(&next_sources)?;
+            self.sources = next_sources;
+        }
         for package in &versions {
             remove_registered(&self.root, &self.folder(id, &package.version), package)?;
         }
@@ -624,15 +943,15 @@ impl Store {
             .and_then(|v| installed.versions.get(v))
             .ok_or_else(|| StoreError::NoPrevious(id.to_owned()))?
             .clone();
-        let damaged = self.damaged(&self.folder(id, &previous.version), &previous)?;
-        if !damaged.is_empty() {
-            return Err(StoreError::Damaged {
-                id: id.to_owned(),
-                version: previous.version,
-                files: damaged,
-            });
-        }
-        self.make_current(&previous)
+        let settings = effective_settings(&previous, &installed.settings);
+        ensure_plugin_platform_supported(&previous, index::current_platform())?;
+        self.require_plugin_consent(
+            &previous,
+            self.source_for(id, &previous.version),
+            Some(&settings),
+        )?;
+        self.verify_package(&self.folder(id, &previous.version), &previous)?;
+        self.make_current(&previous).map_err(StoreError::from)
     }
 
     /// Checks the files of the version of `id` in use.
@@ -643,20 +962,46 @@ impl Store {
             .get(id)
             .and_then(Installed::package)
             .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?;
-        let damaged = self.damaged(&self.folder(id, &package.version), package)?;
-        if damaged.is_empty() {
-            Ok(())
-        } else {
-            Err(StoreError::Damaged {
-                id: id.to_owned(),
-                version: package.version.clone(),
-                files: damaged,
-            })
-        }
+        self.verify_package(&self.folder(id, &package.version), package)
     }
 
     /// Switches `id` on or off for the next game.
     pub fn set_enabled(&mut self, id: &str, on: bool) -> Result<(), StoreError> {
+        self.set_enabled_in(features::BUILT_IN, id, on)
+    }
+
+    /// [`Store::set_enabled`] with the features in `registry`: switching a
+    /// package on whose features clash with those of one already on is
+    /// refused ([`enabled::first_clash`]).
+    pub fn set_enabled_in(
+        &mut self,
+        registry: &[features::FeatureSpec],
+        id: &str,
+        on: bool,
+    ) -> Result<(), StoreError> {
+        if on {
+            let installed = self
+                .registry
+                .packages
+                .get(id)
+                .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?;
+            let package = installed
+                .package()
+                .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?;
+            let settings = effective_settings(package, &installed.settings);
+            ensure_plugin_platform_supported(package, index::current_platform())?;
+            self.require_plugin_consent(
+                package,
+                self.source_for(id, &package.version),
+                Some(&settings),
+            )?;
+            if let Some(why) = self.clash(registry, id) {
+                return Err(StoreError::Clash {
+                    id: id.to_owned(),
+                    why,
+                });
+            }
+        }
         self.registry
             .packages
             .get_mut(id)
@@ -665,20 +1010,149 @@ impl Store {
         self.save()
     }
 
+    /// Why the installed package `id` cannot be on beside those that are,
+    /// with the features in `registry`, if it cannot.
+    pub fn clash(&self, registry: &[features::FeatureSpec], id: &str) -> Option<String> {
+        let mine = self.registry.packages.get(id)?.package()?;
+        let others: Vec<(&str, &[String])> = self
+            .registry
+            .packages
+            .iter()
+            .filter(|(other, installed)| other.as_str() != id && installed.enabled)
+            .filter_map(|(other, installed)| {
+                installed
+                    .package()
+                    .map(|package| (other.as_str(), package.features.as_slice()))
+            })
+            .collect();
+        enabled::first_clash(registry, &mine.features, &others).or_else(|| {
+            self.registry
+                .packages
+                .iter()
+                .filter(|(other, installed)| other.as_str() != id && installed.enabled)
+                .find_map(|(other, installed)| {
+                    let theirs = installed.package()?;
+                    enabled::hooks_clash(&mine.hooks, &theirs.hooks)
+                        .map(|why| format!("it clashes with {other}: {why}"))
+                })
+        })
+    }
+
+    /// Puts the game mods of the packages on for `build` into the game's
+    /// `mods` folder (`mods_dir`), each a copy of its folder in the
+    /// package, and takes away those it put there before for packages no
+    /// longer on. A folder it put there holds [`GAME_MOD_MARK`]; one
+    /// without it is a player's own and is never touched: a package whose
+    /// game mod would take its name is refused. Returns what it did, for
+    /// the log.
+    pub fn sync_game_mods(&self, build: &str, mods_dir: &Path) -> Result<Vec<String>, StoreError> {
+        let mut wanted: BTreeMap<String, (PathBuf, &Package)> = BTreeMap::new();
+        for installed in self.registry.packages.values().filter(|i| i.enabled) {
+            let Some(package) = installed.package().filter(|p| p.runs_on(build)) else {
+                continue;
+            };
+            for folder in &package.game_mods {
+                let name = folder.trim_start_matches("mod/").to_owned();
+                let from = self.folder(&package.id, &package.version).join(folder);
+                wanted.insert(name, (from, package));
+            }
+        }
+        let mut done = Vec::new();
+        // Ours that are no longer wanted go first.
+        if let Ok(entries) = fs::read_dir(mods_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = entry.path();
+                if path.join(GAME_MOD_MARK).is_file() && !wanted.contains_key(&name) {
+                    fs::remove_dir_all(&path)?;
+                    done.push(format!("game mod {name} taken away"));
+                }
+            }
+        }
+        for (name, (from, package)) in wanted {
+            let to = mods_dir.join(&name);
+            let mark = format!("{} {}\n", package.id, package.version);
+            if to.exists() {
+                match fs::read_to_string(to.join(GAME_MOD_MARK)) {
+                    Ok(theirs) if theirs == mark => continue,
+                    Ok(_) => fs::remove_dir_all(&to)?,
+                    Err(_) => {
+                        return Err(StoreError::Occupied(to));
+                    }
+                }
+            }
+            copy_tree(&from, &to)?;
+            fs::write(to.join(GAME_MOD_MARK), mark)?;
+            done.push(format!(
+                "game mod {name} from {} {}",
+                package.id, package.version
+            ));
+        }
+        Ok(done)
+    }
+
+    /// The enabled packages, in the order the game switches them on
+    /// ([`enabled::load_order`]).
+    pub fn load_order(&self) -> Vec<String> {
+        let packages: Vec<(&str, Vec<&str>)> = self
+            .registry
+            .packages
+            .iter()
+            .filter(|(_, installed)| installed.enabled)
+            .filter_map(|(id, installed)| {
+                installed.package().map(|package| {
+                    (
+                        id.as_str(),
+                        package.depends.iter().map(|d| d.id.as_str()).collect(),
+                    )
+                })
+            })
+            .collect();
+        enabled::load_order(&packages)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Puts `id`'s settings back to its package's defaults.
+    pub fn reset_settings(&mut self, id: &str) -> Result<(), StoreError> {
+        let installed = self
+            .registry
+            .packages
+            .get(id)
+            .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?;
+        installed
+            .package()
+            .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?;
+        self.registry
+            .packages
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?
+            .settings
+            .clear();
+        self.save()
+    }
+
     /// Sets one of `id`'s settings: one its package has, with the same type.
     pub fn set_setting(&mut self, id: &str, key: &str, value: Setting) -> Result<(), StoreError> {
         let installed = self
             .registry
             .packages
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?;
         let package = installed
             .versions
             .get(&installed.current)
-            .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?;
+            .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?
+            .clone();
         match package.settings.get(key) {
             Some(default) if default.same_type(&value) => {
-                installed.settings.insert(key.to_owned(), value);
+                self.registry
+                    .packages
+                    .get_mut(id)
+                    .ok_or_else(|| StoreError::NotInstalled(id.to_owned()))?
+                    .settings
+                    .insert(key.to_owned(), value);
                 self.save()
             }
             Some(_) => Err(StoreError::Setting(format!(
@@ -689,12 +1163,18 @@ impl Store {
     }
 
     /// The enabled packages for the game build hashing to `build`, with
-    /// their settings. An enabled package not for this build is left out,
-    /// with its id in the second list.
+    /// their settings. Every enabled package's listed bytes and complete
+    /// file set are verified before its identity is declared. An enabled
+    /// package not for this build is left out, with its id in the second
+    /// list.
     pub fn enabled_for(&self, build: &str) -> Result<(Enabled, Vec<String>), StoreError> {
         let mut packages = Vec::new();
         let mut left_out = Vec::new();
-        for (id, installed) in &self.registry.packages {
+        for id in self.load_order() {
+            let Some(installed) = self.registry.packages.get(&id) else {
+                continue;
+            };
+            let id = &id;
             let Some(package) = installed.package().filter(|_| installed.enabled) else {
                 continue;
             };
@@ -713,16 +1193,36 @@ impl Store {
                 left_out.push(id.clone());
                 continue;
             }
-            check_package_paths(&self.root, &self.folder(id, &package.version), package)?;
-            let mut settings = package.settings.clone();
-            settings.extend(installed.settings.clone());
+            let settings = effective_settings(package, &installed.settings);
+            ensure_plugin_platform_supported(package, index::current_platform())?;
+            self.require_plugin_consent(
+                package,
+                self.source_for(id, &package.version),
+                Some(&settings),
+            )?;
+            self.verify_package(&self.folder(id, &package.version), package)?;
+            let identity_sha256 = crate::terms::package_digest(package, &settings);
             packages.push(EnabledPackage {
                 id: id.clone(),
                 version: package.version.clone(),
                 simulation: package.simulation,
                 features: package.features.clone(),
                 settings,
+                files_sha256: crate::terms::files_digest(&package.files),
+                identity_sha256,
+                depends: package.depends.clone(),
                 root: self.folder(id, &package.version),
+                plugins: crate::index::current_platform()
+                    .map(|platform| package.plugins_for(platform))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|plugin| enabled::EnabledPlugin {
+                        path: plugin.path.clone(),
+                        sha256: plugin.sha256.clone(),
+                        abi: plugin.abi,
+                    })
+                    .collect(),
+                hooks: package.hooks.clone(),
             });
         }
         Ok((
@@ -752,12 +1252,101 @@ impl Store {
     fn damaged(&self, folder: &Path, package: &Package) -> Result<Vec<String>, StoreError> {
         check_package_paths(&self.root, folder, package)?;
         let mut damaged = Vec::new();
-        for file in &package.files {
+        for file in &package.local_files() {
             if !fetch::file_matches(&folder.join(&file.path), file.size, &file.sha256)? {
                 damaged.push(file.path.clone());
             }
         }
         Ok(damaged)
+    }
+
+    fn verify_package(&self, folder: &Path, package: &Package) -> Result<(), StoreError> {
+        let damaged = self.damaged(folder, package)?;
+        if !damaged.is_empty() {
+            return Err(StoreError::Damaged {
+                id: package.id.clone(),
+                version: package.version.clone(),
+                files: damaged,
+            });
+        }
+        if package_file_set_on_disk(&self.root, folder)? != package_file_set(package) {
+            return Err(StoreError::Occupied(folder.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn save_sources(&self, sources: &PackageSources) -> Result<(), StoreError> {
+        ensure_no_symlink_path(&self.root, &self.root)?;
+        fs::create_dir_all(&self.root)?;
+        let json = serde_json::to_vec_pretty(sources)
+            .map_err(|error| StoreError::ConsentStore(error.to_string()))?;
+        write_atomic(&self.root, &self.root.join(PACKAGE_SOURCES), &json)
+    }
+
+    fn save_consents(&self, consents: &ConsentRecords) -> Result<(), StoreError> {
+        ensure_no_symlink_path(&self.root, &self.root)?;
+        fs::create_dir_all(&self.root)?;
+        let json = serde_json::to_vec_pretty(consents)
+            .map_err(|error| StoreError::ConsentStore(error.to_string()))?;
+        write_atomic(&self.root, &self.root.join(CONSENTS), &json)
+    }
+
+    fn prune_sources(&mut self) -> Result<(), StoreError> {
+        let mut next = self.sources.clone();
+        next.packages.retain(|id, versions| {
+            if let Some(installed) = self.registry.packages.get(id) {
+                versions.retain(|version, _| installed.versions.contains_key(version));
+            } else {
+                versions.clear();
+            }
+            !versions.is_empty()
+        });
+        if next.packages.is_empty() && !self.root.join(PACKAGE_SOURCES).exists() {
+            return Ok(());
+        }
+        self.save_sources(&next)?;
+        self.sources = next;
+        Ok(())
+    }
+
+    fn require_plugin_consent(
+        &self,
+        package: &Package,
+        source_id: Option<&str>,
+        settings: Option<&BTreeMap<String, Setting>>,
+    ) -> Result<(), StoreError> {
+        if package.plugins.is_empty() {
+            return Ok(());
+        }
+        let source_id = source_id.ok_or_else(|| StoreError::MissingSource {
+            id: package.id.clone(),
+            version: package.version.clone(),
+        })?;
+        let settings =
+            settings.ok_or_else(|| StoreError::MissingEffectiveSettings(package.id.clone()))?;
+        if package.settings.len() != settings.len()
+            || package.settings.iter().any(|(key, default)| {
+                settings
+                    .get(key)
+                    .is_none_or(|value| !default.same_type(value))
+            })
+        {
+            return Err(StoreError::Setting(format!(
+                "effective settings for {} do not match its signed schema",
+                package.id
+            )));
+        }
+        let digest = crate::terms::package_digest(package, settings);
+        if self.has_consent(source_id, &digest)? {
+            Ok(())
+        } else {
+            Err(StoreError::ConsentRequired {
+                id: package.id.clone(),
+                version: package.version.clone(),
+                source_id: source_id.to_owned(),
+                digest,
+            })
+        }
     }
 
     fn save(&self) -> Result<(), StoreError> {
@@ -775,7 +1364,7 @@ impl Store {
 fn remove_registered(root: &Path, folder: &Path, package: &Package) -> Result<(), StoreError> {
     check_package_paths(root, folder, package)?;
     let mut dirs = Vec::new();
-    for file in &package.files {
+    for file in &package.local_files() {
         let path = folder.join(&file.path);
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -919,15 +1508,103 @@ fn ensure_no_symlink_path(root: &Path, path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The file in a game mod's folder that says the launcher put it there,
+/// and from which package.
+pub const GAME_MOD_MARK: &str = ".tpf3mp-native-mod";
+
+/// Copies the folder `from` to `to`, files and folders, no links.
+fn copy_tree(from: &Path, to: &Path) -> Result<(), StoreError> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &target)?;
+        } else {
+            return Err(StoreError::UnsafePath(entry.path()));
+        }
+    }
+    Ok(())
+}
+
 fn check_package_paths(root: &Path, folder: &Path, package: &Package) -> Result<(), StoreError> {
     ensure_no_symlink_path(root, folder)?;
-    for file in &package.files {
+    for file in &package.local_files() {
         if !index::is_safe_path(&file.path) {
             return Err(StoreError::UnsafePath(folder.join(&file.path)));
         }
         ensure_no_symlink_path(root, &folder.join(&file.path))?;
     }
     Ok(())
+}
+
+/// The paths a package's signed manifest names, case-folded as Windows does.
+fn package_file_set(package: &Package) -> BTreeSet<String> {
+    package
+        .local_files()
+        .iter()
+        .map(|file| file.path.to_ascii_lowercase())
+        .collect()
+}
+
+fn effective_settings(
+    package: &Package,
+    overrides: &BTreeMap<String, Setting>,
+) -> BTreeMap<String, Setting> {
+    let mut settings = package.settings.clone();
+    for (key, value) in overrides {
+        if package
+            .settings
+            .get(key)
+            .is_some_and(|default| default.same_type(value))
+        {
+            settings.insert(key.clone(), value.clone());
+        }
+    }
+    settings
+}
+
+/// Regular files physically present in a package folder, case-folded as
+/// Windows does. Links and special files are refused before being followed.
+fn package_file_set_on_disk(root: &Path, folder: &Path) -> Result<BTreeSet<String>, StoreError> {
+    ensure_no_symlink_tree(root, folder)?;
+    let metadata = match fs::symlink_metadata(folder) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() {
+        return Err(StoreError::Occupied(folder.to_owned()));
+    }
+
+    let mut files = BTreeSet::new();
+    let mut directories = vec![folder.to_owned()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                directories.push(path);
+            } else if kind.is_file() {
+                let relative = path
+                    .strip_prefix(folder)
+                    .map_err(|_| StoreError::UnsafePath(path.clone()))?;
+                files.insert(
+                    relative
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .to_ascii_lowercase(),
+                );
+            } else {
+                return Err(StoreError::Occupied(path));
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn ensure_no_symlink_tree(root: &Path, folder: &Path) -> Result<(), StoreError> {
@@ -961,6 +1638,122 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_package_sources(root: &Path) -> Result<PackageSources, StoreError> {
+    let path = root.join(PACKAGE_SOURCES);
+    ensure_no_symlink_path(root, &path).map_err(consent_store_error)?;
+    let Some(bytes) = read_optional(&path).map_err(consent_store_error)? else {
+        return Ok(PackageSources {
+            format: PACKAGE_SOURCES_FORMAT,
+            packages: BTreeMap::new(),
+        });
+    };
+    let state: PackageSources = serde_json::from_slice(&bytes)
+        .map_err(|error| StoreError::ConsentStore(error.to_string()))?;
+    if state.format != PACKAGE_SOURCES_FORMAT {
+        return Err(StoreError::ConsentStore(format!(
+            "package source format {}",
+            state.format
+        )));
+    }
+    for (id, versions) in &state.packages {
+        if !index::is_id(id) {
+            return Err(StoreError::ConsentStore(format!(
+                "invalid package id {id:?}"
+            )));
+        }
+        for (version, source) in versions {
+            if semver::Version::parse(version).is_err() {
+                return Err(StoreError::ConsentStore(format!(
+                    "invalid version {id} {version:?}"
+                )));
+            }
+            validate_source_id(source).map_err(consent_store_error)?;
+        }
+    }
+    Ok(state)
+}
+
+fn read_consents(root: &Path) -> Result<ConsentRecords, StoreError> {
+    let path = root.join(CONSENTS);
+    ensure_no_symlink_path(root, &path).map_err(consent_store_error)?;
+    let Some(bytes) = read_optional(&path).map_err(consent_store_error)? else {
+        return Ok(ConsentRecords {
+            format: CONSENTS_FORMAT,
+            by_source: BTreeMap::new(),
+        });
+    };
+    let state: ConsentRecords = serde_json::from_slice(&bytes)
+        .map_err(|error| StoreError::ConsentStore(error.to_string()))?;
+    if state.format != CONSENTS_FORMAT {
+        return Err(StoreError::ConsentStore(format!(
+            "consent format {}",
+            state.format
+        )));
+    }
+    for (source, digests) in &state.by_source {
+        validate_source_id(source).map_err(consent_store_error)?;
+        for digest in digests {
+            validate_digest(digest).map_err(consent_store_error)?;
+        }
+    }
+    Ok(state)
+}
+
+fn validate_source_id(source: &str) -> Result<(), StoreError> {
+    let invalid = || StoreError::InvalidSource(source.to_owned());
+    if source == "project" {
+        return Ok(());
+    }
+    if source.is_empty() || source.len() > 255 || source != source.to_ascii_lowercase() {
+        return Err(invalid());
+    }
+    let (host, port) = if let Some(bracketed) = source.strip_prefix('[') {
+        let (address, suffix) = bracketed.split_once(']').ok_or_else(invalid)?;
+        let port = suffix.strip_prefix(':').ok_or_else(invalid)?;
+        let parsed: std::net::Ipv6Addr = address.parse().map_err(|_| invalid())?;
+        if parsed.to_string() != address {
+            return Err(invalid());
+        }
+        (None, port)
+    } else {
+        let (host, port) = source.split_once(':').ok_or_else(invalid)?;
+        if host.contains(':') || host.is_empty() {
+            return Err(invalid());
+        }
+        if !host
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte))
+        {
+            return Err(invalid());
+        }
+        (Some(host), port)
+    };
+    let port_number: u16 = port.parse().map_err(|_| invalid())?;
+    if port_number == 0 || port_number.to_string() != port {
+        return Err(invalid());
+    }
+    if let Some(host) = host
+        && let Ok(address) = host.parse::<std::net::Ipv4Addr>()
+        && address.to_string() != host
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_digest(digest: &str) -> Result<(), StoreError> {
+    if !signed::is_sha256(digest) || digest.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(StoreError::ConsentStore(
+            "invalid package identity digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn consent_store_error(error: StoreError) -> StoreError {
+    StoreError::ConsentStore(error.to_string())
 }
 
 #[cfg(test)]
@@ -1031,6 +1824,44 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn plugin_package(version: &str, path: &str, bytes: &[u8]) -> Package {
+        let mut package = package("plugged", version, &[]);
+        package.simulation = true;
+        package.plugins = vec![crate::index::Plugin {
+            path: path.into(),
+            url: url_of("plugged", version, path),
+            size: bytes.len() as u64,
+            sha256: signed::sha256_hex(bytes),
+            abi: crate::index::PLUGIN_ABI,
+            platform: "windows-x86_64".into(),
+        }];
+        package
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn approval_settings(package: &Package) -> EffectiveSettingsByPackage {
+        BTreeMap::from([(package.id.clone(), package.settings.clone())])
+    }
+
+    #[test]
+    fn plugin_enable_rejects_targets_without_a_loadable_local_plugin() {
+        let mut package = package("plugged", "1.0.0", &[]);
+        package.plugins = vec![crate::index::Plugin {
+            path: "plugin/main.dll".into(),
+            url: "https://example.invalid/plugin/main.dll".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+            abi: crate::index::PLUGIN_ABI,
+            platform: "windows-x86_64".into(),
+        }];
+
+        assert!(ensure_plugin_platform_supported(&package, None).is_err());
+        assert!(ensure_plugin_platform_supported(&package, Some("linux-x86_64")).is_err());
+        assert!(ensure_plugin_platform_supported(&package, Some("macos-aarch64")).is_err());
+        assert!(ensure_plugin_platform_supported(&package, Some("windows-x86_64")).is_ok());
+    }
+
     /// Every file under `dir`, relative, sorted.
     fn tree(dir: &Path) -> Vec<String> {
         let mut out = Vec::new();
@@ -1077,6 +1908,230 @@ mod tests {
         assert_eq!(installed.current, "1.0.0");
         assert!(!installed.enabled);
         assert_eq!(installed.package().unwrap().files.len(), 2);
+    }
+
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn plugin_install_needs_exact_source_approval_and_persists_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("native-mods");
+        let bytes = b"plugin v1";
+        let package = plugin_package("1.0.0", "plugin/main.dll", bytes);
+        let index = index(vec![package.clone()]);
+        let served = Served::default();
+        served.serve("plugged", "1.0.0", &[("plugin/main.dll", bytes)]);
+        let settings = approval_settings(&package);
+        let digest = crate::terms::package_digest(&package, &package.settings);
+        let mut store = Store::open(&root).unwrap();
+
+        assert!(matches!(
+            store.install_exact_from(
+                context(&index),
+                "plugged",
+                "1.0.0",
+                "project",
+                &settings,
+                &served,
+            ),
+            Err(StoreError::ConsentRequired { .. })
+        ));
+        assert!(!store.folder("plugged", "1.0.0").exists());
+
+        store.record_consent("project", &digest).unwrap();
+        store
+            .install_exact_from(
+                context(&index),
+                "plugged",
+                "1.0.0",
+                "project",
+                &settings,
+                &served,
+            )
+            .unwrap();
+        assert_eq!(store.source_for("plugged", "1.0.0"), Some("project"));
+        store.set_enabled("plugged", true).unwrap();
+        let (enabled, _) = store.enabled_for(BUILD).unwrap();
+        assert_eq!(enabled.packages[0].identity_sha256, digest);
+
+        let reopened = Store::open(&root).unwrap();
+        assert_eq!(reopened.source_for("plugged", "1.0.0"), Some("project"));
+        assert!(reopened.has_consent("project", &digest).unwrap());
+        fs::write(root.join(CONSENTS), br#"{"format":1,"by_source":{}}"#).unwrap();
+        let mut without_approval = Store::open(&root).unwrap();
+        assert!(!without_approval.has_consent("project", &digest).unwrap());
+        assert!(matches!(
+            without_approval.set_enabled("plugged", true),
+            Err(StoreError::ConsentRequired { .. })
+        ));
+        without_approval.record_consent("project", &digest).unwrap();
+        without_approval.set_enabled("plugged", true).unwrap();
+    }
+
+    #[test]
+    fn malformed_consent_records_are_not_replaced_with_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("native-mods");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(CONSENTS), b"{ not json").unwrap();
+        assert!(matches!(
+            Store::open(&root),
+            Err(StoreError::ConsentStore(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn source_aware_install_gates_plugin_dependencies_before_any_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("native-mods");
+        let plugin_bytes = b"plugin";
+        let plugin = plugin_package("1.0.0", "plugin/main.dll", plugin_bytes);
+        let addon_bytes = b"addon";
+        let mut addon = package("addon", "1.0.0", &[("addon.lua", addon_bytes)]);
+        addon.depends.push(Dependency {
+            id: "plugged".into(),
+            version: "^1".into(),
+        });
+        let index = index(vec![plugin.clone(), addon.clone()]);
+        let served = Served::default();
+        served.serve("plugged", "1.0.0", &[("plugin/main.dll", plugin_bytes)]);
+        served.serve("addon", "1.0.0", &[("addon.lua", addon_bytes)]);
+        let mut settings = approval_settings(&plugin);
+        settings.extend(approval_settings(&addon));
+        let plugin_digest = crate::terms::package_digest(&plugin, &plugin.settings);
+        let mut store = Store::open(&root).unwrap();
+        assert!(matches!(
+            store.install_from(context(&index), "addon", "project", &settings, &served),
+            Err(StoreError::ConsentRequired { id, .. }) if id == "plugged"
+        ));
+        assert!(store.registry().packages.is_empty());
+        assert!(!root.join("addon").exists());
+
+        store.record_consent("project", &plugin_digest).unwrap();
+        store
+            .install_from(context(&index), "addon", "project", &settings, &served)
+            .unwrap();
+        assert_eq!(store.source_for("plugged", "1.0.0"), Some("project"));
+        assert_eq!(store.source_for("addon", "1.0.0"), Some("project"));
+    }
+
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn installed_plugin_bytes_are_checked_before_enabled_identity_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("native-mods");
+        let bytes = b"plugin v1";
+        let package = plugin_package("1.0.0", "plugin/main.dll", bytes);
+        let index = index(vec![package.clone()]);
+        let served = Served::default();
+        served.serve("plugged", "1.0.0", &[("plugin/main.dll", bytes)]);
+        let settings = approval_settings(&package);
+        let digest = crate::terms::package_digest(&package, &package.settings);
+        let mut store = Store::open(&root).unwrap();
+        store.record_consent("project", &digest).unwrap();
+        store
+            .install_exact_from(
+                context(&index),
+                "plugged",
+                "1.0.0",
+                "project",
+                &settings,
+                &served,
+            )
+            .unwrap();
+        store.set_enabled("plugged", true).unwrap();
+        fs::write(
+            store.folder("plugged", "1.0.0").join("plugin/main.dll"),
+            b"tampered",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.write_enabled(BUILD),
+            Err(StoreError::Damaged { id, .. }) if id == "plugged"
+        ));
+        assert!(!root.join(enabled::FILE).exists());
+    }
+
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn same_version_plugin_rename_replaces_the_exact_installed_file_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("native-mods");
+        let old_bytes = b"old plugin";
+        let old = plugin_package("1.0.0", "plugin/old.dll", old_bytes);
+        let old_index = index(vec![old.clone()]);
+        let served = Served::default();
+        served.serve("plugged", "1.0.0", &[("plugin/old.dll", old_bytes)]);
+        let settings = approval_settings(&old);
+        let old_digest = crate::terms::package_digest(&old, &old.settings);
+        let mut store = Store::open(&root).unwrap();
+        store.record_consent("project", &old_digest).unwrap();
+        store
+            .install_exact_from(
+                context(&old_index),
+                "plugged",
+                "1.0.0",
+                "project",
+                &settings,
+                &served,
+            )
+            .unwrap();
+
+        let new_bytes = b"new plugin";
+        let new = plugin_package("1.0.0", "plugin/new.dll", new_bytes);
+        let new_index = index(vec![new.clone()]);
+        served.serve("plugged", "1.0.0", &[("plugin/new.dll", new_bytes)]);
+        let new_settings = approval_settings(&new);
+        let new_digest = crate::terms::package_digest(&new, &new.settings);
+        assert_ne!(old_digest, new_digest);
+        assert!(matches!(
+            store.install_exact_from(
+                context(&new_index),
+                "plugged",
+                "1.0.0",
+                "project",
+                &new_settings,
+                &served,
+            ),
+            Err(StoreError::ConsentRequired { .. })
+        ));
+        let folder = store.folder("plugged", "1.0.0");
+        assert!(folder.join("plugin/old.dll").exists());
+        assert!(!folder.join("plugin/new.dll").exists());
+
+        store.record_consent("project", &new_digest).unwrap();
+        store
+            .install_exact_from(
+                context(&new_index),
+                "plugged",
+                "1.0.0",
+                "project",
+                &new_settings,
+                &served,
+            )
+            .unwrap();
+        assert!(!folder.join("plugin/old.dll").exists());
+        assert_eq!(fs::read(folder.join("plugin/new.dll")).unwrap(), new_bytes);
+        store.verify("plugged").unwrap();
+    }
+
+    #[test]
+    fn data_only_packages_keep_source_less_install_and_current_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"simulation data";
+        let mut package = package("plain", "1.0.0", &[("data/world.lua", bytes)]);
+        package.simulation = true;
+        let index = index(vec![package]);
+        let served = Served::default();
+        served.serve("plain", "1.0.0", &[("data/world.lua", bytes)]);
+        let mut store = Store::open(dir.path().join("native-mods")).unwrap();
+        store.install(context(&index), "plain", &served).unwrap();
+        store.set_enabled("plain", true).unwrap();
+        let (enabled, _) = store.enabled_for(BUILD).unwrap();
+        assert_eq!(enabled.packages.len(), 1);
+        assert_eq!(enabled.packages[0].identity_sha256.len(), 64);
+        assert_eq!(crate::terms::terms(&enabled, BIG_MAPS).len(), 1);
     }
 
     #[test]
@@ -1396,6 +2451,81 @@ mod tests {
     }
 
     #[test]
+    fn a_same_version_install_replaces_removed_files_and_preserves_untracked_extras() {
+        const RENAMED: &[(&str, &[u8])] = &[
+            ("mod/tpf3mp_bigmap_1/mod.lua", b"-- version 1"),
+            ("data/renamed.toml", b"renamed = true"),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("native-mods");
+        let folder = root.join("bigmap/1.0.0");
+        let served = Served::default();
+        served.serve("bigmap", "1.0.0", V1);
+        served.serve("bigmap", "1.0.0", RENAMED);
+        let old_index = index(vec![package("bigmap", "1.0.0", V1)]);
+        let new_index = index(vec![package("bigmap", "1.0.0", RENAMED)]);
+        let mut store = Store::open(&root).unwrap();
+        store
+            .install(context(&old_index), "bigmap", &served)
+            .unwrap();
+
+        let user_file = folder.join("data/renamed.toml");
+        fs::write(&user_file, b"keep this").unwrap();
+        assert!(matches!(
+            store.install_exact(context(&new_index), "bigmap", "1.0.0", &served),
+            Err(StoreError::Occupied(_))
+        ));
+        assert_eq!(fs::read(&user_file).unwrap(), b"keep this");
+        assert!(folder.join("data/sizes.toml").exists());
+
+        fs::remove_file(user_file).unwrap();
+        store
+            .install_exact(context(&new_index), "bigmap", "1.0.0", &served)
+            .unwrap();
+
+        assert_eq!(
+            tree(&folder),
+            [
+                "data",
+                "data/renamed.toml",
+                "mod",
+                "mod/tpf3mp_bigmap_1",
+                "mod/tpf3mp_bigmap_1/mod.lua"
+            ]
+        );
+        assert!(!folder.join("data/sizes.toml").exists());
+        assert_eq!(
+            store.registry().packages["bigmap"].package().unwrap().files,
+            package("bigmap", "1.0.0", RENAMED).files
+        );
+        store.verify("bigmap").unwrap();
+    }
+
+    #[test]
+    fn enabled_files_must_still_match_their_signed_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = Served::default();
+        served.serve("bigmap", "1.0.0", V1);
+        let index = index(vec![package("bigmap", "1.0.0", V1)]);
+        let mut store = Store::open(dir.path()).unwrap();
+        store.install(context(&index), "bigmap", &served).unwrap();
+        store.set_enabled("bigmap", true).unwrap();
+        fs::write(
+            store.folder("bigmap", "1.0.0").join("data/sizes.toml"),
+            b"tampered simulation data",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.write_enabled(BUILD),
+            Err(StoreError::Damaged { id, files, .. })
+                if id == "bigmap" && files == ["data/sizes.toml"]
+        ));
+        assert!(!dir.path().join(enabled::FILE).exists());
+    }
+
+    #[test]
     fn the_hook_gets_the_enabled_packages_for_its_build_with_settings() {
         let dir = tempfile::tempdir().unwrap();
         let served = Served::default();
@@ -1439,6 +2569,134 @@ mod tests {
             store.write_enabled(OTHER_BUILD),
             Err(StoreError::SimulationPackageNotForBuild { .. })
         ));
+    }
+
+    #[test]
+    fn packages_load_after_their_dependencies_and_never_clash() {
+        use crate::features::{FeatureSpec, replace};
+        const REGISTRY: &[FeatureSpec] = &[
+            FeatureSpec {
+                id: "base.own",
+                effect: Effect::Ui,
+                targets: &[replace("ui::page")],
+            },
+            FeatureSpec {
+                id: "other.own",
+                effect: Effect::Ui,
+                targets: &[replace("ui::page")],
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut add = |id: &str, depends: &[&str], features: &[&str]| {
+            let mut package = package(id, "1.0.0", &[]);
+            package.simulation = false;
+            package.features = features.iter().map(|f| (*f).to_owned()).collect();
+            package.depends = depends
+                .iter()
+                .map(|d| Dependency {
+                    id: (*d).to_owned(),
+                    version: "*".into(),
+                })
+                .collect();
+            store.registry.packages.insert(
+                id.to_owned(),
+                Installed {
+                    current: "1.0.0".into(),
+                    previous: None,
+                    enabled: false,
+                    settings: BTreeMap::new(),
+                    versions: BTreeMap::from([("1.0.0".to_owned(), package)]),
+                },
+            );
+        };
+        add("aaa_needs", &["zzz_base"], &[]);
+        add("zzz_base", &[], &["base.own"]);
+        add("mmm_other", &[], &["other.own"]);
+        store.set_enabled_in(REGISTRY, "aaa_needs", true).unwrap();
+        store.set_enabled_in(REGISTRY, "zzz_base", true).unwrap();
+        assert_eq!(store.load_order(), ["zzz_base", "aaa_needs"]);
+        let (list, _) = store.enabled_for(BUILD).unwrap();
+        let ids: Vec<&str> = list.packages.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["zzz_base", "aaa_needs"],
+            "the game gets them in that order"
+        );
+
+        // Both take the page over: the second is refused, and says why.
+        assert!(store.clash(REGISTRY, "mmm_other").is_some());
+        let refused = store.set_enabled_in(REGISTRY, "mmm_other", true);
+        assert!(
+            matches!(&refused, Err(StoreError::Clash { id, why }) if id == "mmm_other" && why.contains("zzz_base")),
+            "{refused:?}"
+        );
+        assert!(!store.registry.packages["mmm_other"].enabled);
+        // Switching off is never refused; then the other may go on.
+        store.set_enabled_in(REGISTRY, "zzz_base", false).unwrap();
+        store.set_enabled_in(REGISTRY, "mmm_other", true).unwrap();
+    }
+
+    #[test]
+    fn game_mods_go_into_the_games_mods_while_their_package_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = Served::default();
+        let files: &[(&str, &[u8])] = &[
+            ("mod/tpf3mp_bigmap_1/mod.lua", b"-- big"),
+            ("mod/tpf3mp_bigmap_1/content/gui/page.tl", b"-- page"),
+        ];
+        served.serve("bigmap", "0.3.0", files);
+        let mut package = big_maps();
+        package.files = files
+            .iter()
+            .map(|(path, bytes)| FileEntry {
+                path: (*path).to_owned(),
+                url: url_of("bigmap", "0.3.0", path),
+                size: bytes.len() as u64,
+                sha256: crate::signed::sha256_hex(bytes),
+            })
+            .collect();
+        package.game_mods = vec!["mod/tpf3mp_bigmap_1".into()];
+        assert_eq!(package.validate(), Ok(()));
+        let index = index(vec![package]);
+        let mut store = Store::open(dir.path().join("native")).unwrap();
+        store.install(context(&index), "bigmap", &served).unwrap();
+        let mods = dir.path().join("game").join("mods");
+        fs::create_dir_all(mods.join("players_own_1")).unwrap();
+
+        assert!(
+            store.sync_game_mods(BUILD, &mods).unwrap().is_empty(),
+            "not on yet"
+        );
+        store.set_enabled("bigmap", true).unwrap();
+        let done = store.sync_game_mods(BUILD, &mods).unwrap();
+        assert_eq!(done, ["game mod tpf3mp_bigmap_1 from bigmap 0.3.0"]);
+        assert_eq!(
+            fs::read(mods.join("tpf3mp_bigmap_1/content/gui/page.tl")).unwrap(),
+            b"-- page"
+        );
+        assert!(
+            store.sync_game_mods(BUILD, &mods).unwrap().is_empty(),
+            "already there"
+        );
+
+        store.set_enabled("bigmap", false).unwrap();
+        let done = store.sync_game_mods(BUILD, &mods).unwrap();
+        assert_eq!(done, ["game mod tpf3mp_bigmap_1 taken away"]);
+        assert!(!mods.join("tpf3mp_bigmap_1").exists());
+        assert!(
+            mods.join("players_own_1").exists(),
+            "a player's own is never touched"
+        );
+
+        // A player's own of the same name: refused, and left alone.
+        fs::create_dir_all(mods.join("tpf3mp_bigmap_1")).unwrap();
+        store.set_enabled("bigmap", true).unwrap();
+        assert!(matches!(
+            store.sync_game_mods(BUILD, &mods),
+            Err(StoreError::Occupied(_))
+        ));
+        assert!(mods.join("tpf3mp_bigmap_1").exists());
     }
 
     #[test]

@@ -16,7 +16,8 @@ use common::{FAST, Player, RunningServer, TestClient, content, join, new_identit
 use quinn::{RecvStream, SendStream};
 use tpf3mp_agent::{ClientError, ConnectError, connect};
 use tpf3mp_net::{
-    Identity, client_config, read_message, read_preamble, write_message, write_preamble,
+    Identity, ServerIdentity, client_config, read_message, read_preamble, write_message,
+    write_preamble,
 };
 use tpf3mp_proto::{
     CONTROL_MAX_FRAME, ClientMessage, Code, EventBody, FRAME_HEADER_LEN, FixedBytes, Hello,
@@ -24,7 +25,7 @@ use tpf3mp_proto::{
     RejectReason, Request, RequestError, Response, RoomSettings, Seal, Secret, ServerMessage,
     Signature, Text, TurnMessage, decode_frame,
 };
-use tpf3mp_server::ServerConfig;
+use tpf3mp_server::{RecoveryError, RoomLogError, Server, ServerConfig, ServerError};
 
 fn data_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tpf3mp-sec-{name}-{}", std::process::id()));
@@ -335,6 +336,7 @@ async fn a_room_password_cannot_be_guessed_at_line_rate() {
         let request = ClientMessage::Request {
             id: pin,
             request: Request::JoinRoom(JoinRoom {
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 invite,
                 password: Some(Text::new(format!("{pin:04}")).unwrap()),
                 resume: None,
@@ -424,6 +426,7 @@ async fn pipelined_invite_resolution_uses_the_join_rate_gate() {
 
 /// Fast pacing so a test reaches hundreds of checkpoints in seconds.
 const CHECKS: RoomSettings = RoomSettings {
+    scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
     steps_per_second: 240,
     input_delay_ms: 40,
     checkpoint_interval: 10,
@@ -481,7 +484,10 @@ async fn divergences_reported_to_cat(attack: bool) -> Vec<(u64, Vec<u16>)> {
             // opens a fresh round that no other member will ever complete,
             // until MAX_OPEN_ROUNDS (64) is reached.
             for step in (1..=72).map(|k| k * 10) {
-                let _ = mallory.client().report_checkpoint(step, lanes(1)).await;
+                let _ = mallory
+                    .client()
+                    .report_checkpoint(mallory.world_epoch(), step, lanes(1))
+                    .await;
             }
         }
     }
@@ -552,13 +558,6 @@ fn records(bytes: &[u8]) -> Vec<(usize, &[u8])> {
     found
 }
 
-fn dir_bytes(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len())
-        .sum()
-}
-
 /// Runs a one-player game with a log in `dir` until it has a few dozen
 /// turns, then stops the server.
 async fn logged_game(dir: &Path, secret: [u8; 32]) {
@@ -575,10 +574,9 @@ async fn logged_game(dir: &Path, secret: [u8; 32]) {
 
 /// FINDING: `RoomLog::open` cuts the file at the first record whose length
 /// or CRC does not hold *before* anyone decides whether the log is usable.
-/// A damaged start record therefore truncates the whole log to zero bytes,
-/// and only then is the (now empty) file renamed to `*.broken`. OPERATIONS.md
-/// promises the opposite: "renamed to `*.broken` and kept for diagnosis.
-/// Nothing is deleted."
+/// A damaged start record therefore truncated the whole log to zero bytes
+/// before preserving it. Startup now refuses an unidentified first record
+/// before any recovery mutation, retaining every original byte in place.
 #[tokio::test]
 async fn a_damaged_log_is_kept_for_diagnosis() {
     let dir = data_dir("broken-start");
@@ -586,20 +584,23 @@ async fn a_damaged_log_is_kept_for_diagnosis() {
     logged_game(&dir, secret).await;
     let log = only_log(&dir);
     let mut bytes = std::fs::read(&log).unwrap();
-    let original = bytes.len();
     bytes[8] ^= 0x01; // one flipped bit in the start record
     std::fs::write(&log, &bytes).unwrap();
 
-    let server = RunningServer::start(persistent(&dir, secret)).await;
-    assert_eq!(server.stats.rooms(), 0);
-    server.shut_down().await;
-    let broken = log.with_extension("broken");
-    let kept = std::fs::metadata(&broken).map(|m| m.len()).unwrap_or(0);
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(
-        kept, original as u64,
-        "the damaged log ({original} bytes) was kept as {kept} bytes"
-    );
+    let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+    let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), identity);
+    persistent(&dir, secret)(&mut config);
+    let error = Server::bind(config).err().expect("startup must refuse");
+    assert!(matches!(
+        error,
+        ServerError::Recovery(RecoveryError::UnknownFormat {
+            path,
+            source: RoomLogError::Damaged(0)
+        }) if path == log
+    ));
+    assert_eq!(std::fs::read(&log).unwrap(), bytes);
+    assert!(!log.with_extension("broken").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// FINDING: the same cut applies to a record in the middle of a log. One
@@ -612,24 +613,18 @@ async fn one_damaged_turn_does_not_erase_the_rest_of_the_log() {
     logged_game(&dir, secret).await;
     let log = only_log(&dir);
     let mut bytes = std::fs::read(&log).unwrap();
-    let original = bytes.len() as u64;
     let offsets: Vec<usize> = records(&bytes).iter().map(|(offset, _)| *offset).collect();
     let damaged = offsets.len() / 2;
-    let turns_before = offsets.len() - 1;
+    assert!(damaged > 0, "the start record remains intact");
     bytes[offsets[damaged] + 8] ^= 0x01;
     std::fs::write(&log, &bytes).unwrap();
 
     let server = RunningServer::start(persistent(&dir, secret)).await;
-    let restored = server.stats.rooms();
+    assert_eq!(server.stats.rooms(), 0, "the damaged room is quarantined");
     server.shut_down().await;
-    let on_disk = dir_bytes(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        on_disk >= original,
-        "one flipped bit in turn record {damaged} of {turns_before}: {restored} room restored \
-         and {} of {original} log bytes deleted from disk",
-        original - on_disk
-    );
+    assert!(!log.exists());
+    assert_eq!(std::fs::read(log.with_extension("broken")).unwrap(), bytes);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// FINDING: after a lossy recovery (power loss; OPERATIONS.md says the last
@@ -692,6 +687,7 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
     let refused = bob
         .client()
         .join_room(JoinRoom {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             invite,
             password: None,
             resume: Some(bob_old.follower.as_ref().unwrap().resume_point()),
@@ -726,6 +722,7 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
     let resumed = ann
         .client()
         .join_room(JoinRoom {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             invite,
             password: None,
             resume: ann_resume,

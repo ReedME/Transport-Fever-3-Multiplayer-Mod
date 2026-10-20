@@ -3,6 +3,14 @@
 This page records the integration into `dev`, not all work on Silver's
 branch. It is not evidence of a fresh two-player game acceptance run.
 
+The current ReedME refresh uses protocol **24**, bridge **30**, action
+schema **28** and room-log format **11**. Dated game observations below are
+credited upstream evidence, not a new fork playthrough. The fork keeps its
+D30 repairs and D31 source/consent policy; exact-build Proton competitive
+and recovery acceptance remains open. All formats 8/9/10 require preserved
+old binaries/data/snapshots and fresh data/snapshot directories for this
+candidate; no running-room migration is claimed.
+
 ## Enabled ports
 
 | Area | Integrated behavior | Evidence |
@@ -34,19 +42,27 @@ load gating and save setup. This is not a fresh two-player game playthrough.
 
 ## Implemented, refused pending game acceptance
 
-Line waypoints have capture, schema and replay code, but
-`content/scripts/tpf3mp/acceptance.lua` disables them. Both command
-submission and replay refuse this channel. Entity renaming and vehicle
+Line waypoints passed local two-player acceptance on build 40420 on
+2026-10-16 (a line edited with waypoints in a room, both games' rolling
+world checks alike) and are enabled. Entity renaming and vehicle
 recolouring
 ([the validation record](../investigation/TPF3_RENAME_2026-10-07.md)) and
 subsidies, with their settlement between companies
 ([the validation record](../investigation/TPF3_SUBSIDIES_2026-10-07.md)),
-passed two-player acceptance on 2026-10-07 and are enabled. Bridge/tunnel window rebuilds remain gated at
-capture behind `bridges`. Industry Greenification and marketing campaigns
-remain gated at both submission and replay behind `perks`. Historic Preservation is likewise gated behind `preservation`. Mechanics fixtures explicitly enable a channel
-only in their own Lua state. Enable a channel only after ordinary two-player
-acceptance demonstrates matching outcomes, ownership and money. The gate
-file is part of the installed-mod fingerprint.
+passed two-player acceptance on 2026-10-07 and are enabled. Bridge/tunnel window rebuilds, gated at
+capture behind `bridges`, passed it on 2026-10-11 and are enabled
+([the validation record](../investigation/TPF3_BRIDGE_TUNNEL_WINDOW_2026-10-11.md)). Industry Greenification and marketing campaigns
+remain gated at both submission and replay behind `perks`. Historic Preservation
+is likewise gated behind `preservation`. A level crossing's type from its
+window remains gated behind `crossings`; the PR author reported staged Japan_2
+two-player runs on 2026-10-17, but ordinary-start acceptance is not established
+here. The type-only mechanics fixtures explicitly enable the channel in their
+own Lua state, and the crossing-window rebuild fixture proves segment/junction
+rebuilds are refused. The type the road and track tools' toolbar picks for a
+new crossing (`crossing_type` on `BuildRoad`/`BuildTrack`) is behind
+`crossingTypes` (off; staged two-game runs on 2026-10-17 passed, ordinary-start acceptance not yet). Enable a channel only after ordinary two-player
+acceptance demonstrates matching outcomes, ownership and money. The gate file
+is part of the installed-mod fingerprint.
 
 ## Deliberately excluded
 
@@ -68,11 +84,18 @@ the 2026-10-02 two-game height-brush validation: raise, lower, smooth,
 flatten and heightmap produced matching native ground. The validation
 record distinguishes complete comparison windows from runs with missing
 probe samples; oversized replay bands still have fixture-only coverage.
-Terrain paint and asset brushes remain refused. The track tools travel as
+Terrain paint (`Paint`, action schema 27) and the asset brush
+(`PlantAssets`, schema 27) passed local two-player acceptance on build 40420
+on 2026-10-16 and are enabled: strokes of several sizes, large ones in
+bands, and tree strokes of 78 and 124 trees, each applied alike in both
+games. The track tools travel as
 `BuildTrack`, as the road modifiers do, and each upgrade is logged.
 
-The existing junction gate remains off pending its own game acceptance.
-The station-access decision is recorded in D22; other proposed policies remain unchanged.
+Both `junctions.strict_junctions` and `junctions.double_slip_only` remain
+false in the fork. Upstream's double-slip exception is archived as U-D30,
+not adopted by ReedME. Disposable acceptance copies may explicitly enable
+the intended fixture gate; no standalone junction edit is enabled by this
+merge. The station-access decision is recorded in D22; other proposed policies remain unchanged.
 
 ## Company tools and stop follow-up (2026-10-03)
 
@@ -81,8 +104,9 @@ and tool company selection, refreshed Lua APIs, room-company map markers,
 stop/station ownership and names, and station entrance junction filtering.
 The current branch-pruning algorithm and all existing acceptance gates stay.
 The line-viewer probe remains diagnostic; it does not repair invalid route data.
-Trees and rocks can be removed through the room only with
-`TPF3MP_TREE_BULLDOZE=1`; they are still disabled by default.
+Trees and rocks removed with the bulldozer passed local two-player
+acceptance on build 40420 on 2026-10-16 and go through the room by default
+(`TPF3MP_TREE_BULLDOZE=0` turns them off).
 Lua fixtures and native helper/static-profile checks cover this integration;
 no fresh ordinary two-player game acceptance is claimed.
 
@@ -127,7 +151,9 @@ profitability or demand for a passenger service.
 
 ## Compatibility
 
-This selected combination is distinct from both the previous `dev` and PR #37:
-protocol **16**, bridge **23**, action schema **25**. Update launcher, hook,
-mod and relay together before release. Older peers must fail version checks;
-this branch is not compatible with the currently deployed relay until upgraded.
+The earlier selected-port milestone used protocol 16, bridge 23 and action
+schema 25; those numbers describe that historical integration only. The
+current fork uses protocol **24**, bridge **30**, action schema **28** and
+room-log format **11**. Update launcher, hook, mod and fork server together.
+Older peers fail version checks, earlier logs refuse startup unchanged, and
+this merge does not upgrade or configure any upstream service.

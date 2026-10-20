@@ -39,6 +39,7 @@ pub mod build_data;
 pub mod builds;
 pub mod cadence;
 pub mod clipboard;
+pub mod crossings;
 pub mod drawing;
 pub mod edgewatch;
 pub mod emission;
@@ -56,6 +57,7 @@ pub mod lua;
 pub mod menu;
 pub mod modules;
 pub mod native_mods;
+pub mod netread;
 pub mod network;
 pub mod order;
 /// Tests' harness: the game's own functions, relocated from the
@@ -65,6 +67,7 @@ pub(crate) mod original;
 pub mod perf;
 pub mod persons;
 mod platform;
+pub mod plugins;
 pub mod previewcancel;
 pub mod previews;
 pub mod probe;
@@ -78,6 +81,7 @@ pub mod stoptool;
 pub mod streettrace;
 pub mod terrain;
 pub mod ticks;
+pub mod toolchain;
 pub mod toolplayer;
 pub mod townfield;
 pub mod towntrace;
@@ -138,6 +142,10 @@ pub fn bootstrap() {
             // rooms.
             if let Some(reason) = native_mods::decide(&profiles, &profile.build.sha256, &mut log) {
                 log.line(&format!("multiplayer disabled (fail-closed): {reason}"));
+            } else if let Err(reason) = native_mods::load_plugins(&profiles, &mut log) {
+                log.line(&format!(
+                    "multiplayer disabled (fail-closed): native mods' plugins: {reason}"
+                ));
             } else {
                 match install::install(&profile, &link_name, Logger::open(data_dir.as_deref())) {
                     install::Installed::Yes { step_rva } => log.line(&format!(
@@ -174,7 +182,13 @@ fn install_menu(profiles: &[Profile], log: &mut Logger, data_dir: Option<&Path>)
                 let log_path = data_dir.map(|dir| dir.join("hook.log"));
                 // SAFETY: the launcher loaded the hook into the suspended game,
                 // so no game code runs yet, and the targets are profile-verified.
-                match unsafe { menu_entry::install(&targets, log_path.as_deref()) } {
+                match unsafe {
+                    menu_entry::install(
+                        &targets,
+                        log_path.as_deref(),
+                        menu_entry::manager_window_supported(profile),
+                    )
+                } {
                     Ok(()) => log.line(&format!(
                         "main-menu Multiplayer entry armed from profile {:?} (loader at {:#x})",
                         profile.name, targets.loadfile

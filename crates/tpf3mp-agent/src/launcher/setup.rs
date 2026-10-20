@@ -27,13 +27,12 @@ pub fn game_build(given: Option<&str>, installed: Option<&steam::Installed>) -> 
     }
 }
 
-/// The project's public relay: the launcher's default server when its
-/// package names none (`TPF3MP_DEFAULT_SERVER`), for every build, a
-/// developer's too. It has a certificate from a public authority, so the
-/// launcher trusts it as it trusts any server, without a pin.
-pub const RELAY: &str = "tpf3mp.213-133-98-90.sslip.io:29470";
+/// This fork's development default. Public packages must explicitly name
+/// their operated server with `TPF3MP_DEFAULT_SERVER`; local sessions use a
+/// pinned certificate. Never fall back to the upstream production relay.
+pub const RELAY: &str = "127.0.0.1:29470";
 /// What players see of [`RELAY`] in place of its address.
-pub const RELAY_NAME: &str = "EU";
+pub const RELAY_NAME: &str = "Local";
 
 /// Where the per-user files live: `TPF3-MP` in the user's local data
 /// directory.
@@ -422,6 +421,7 @@ impl LauncherArgs {
             content: split.manifest,
             mods: split.lists,
             picker,
+            native: None,
             installed,
             link: self.game_link.clone(),
             worlds: open_worlds(self.worlds.as_deref(), self.worlds_gib, &self.game_link)?,
@@ -528,7 +528,7 @@ mod tests {
         let names: Vec<&str> = listed.iter().map(|server| server.name.as_str()).collect();
         assert_eq!(
             names,
-            ["EU", "US", "ASIA"],
+            [RELAY_NAME, "US", "ASIA"],
             "the default first, then the other servers in release order"
         );
         assert_eq!(listed[0].address, RELAY);
@@ -559,14 +559,9 @@ mod tests {
             .is_err(),
             "the release validator and runtime use the same port parser"
         );
+        let duplicate_name = format!("{RELAY_NAME}=another.example.org:29470");
         assert!(
-            listed_servers(
-                None,
-                Some(RELAY),
-                Some(RELAY_NAME),
-                Some("EU=another.example.org:29470")
-            )
-            .is_err(),
+            listed_servers(None, Some(RELAY), Some(RELAY_NAME), Some(&duplicate_name)).is_err(),
             "the default name cannot be reused"
         );
         assert_eq!(super::super::server_address(RELAY).as_deref(), Ok(RELAY));

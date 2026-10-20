@@ -27,6 +27,7 @@ use crate::scenario::{link_name, player_options, seat_and_start, toy_content};
 /// server allows, so the world runs thousands of steps a second, with the
 /// shortest input delay, and a checkpoint comparison often.
 pub const FAST: RoomSettings = RoomSettings {
+    scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
     steps_per_second: 240,
     input_delay_ms: 20,
     checkpoint_interval: 25,

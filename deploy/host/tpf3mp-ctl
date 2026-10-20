@@ -5,8 +5,13 @@
 # docs/OPERATIONS.md, "Developer access".
 #
 #   status                        the server's container, health and version
-#   logs [--since 2h] [--tail 200] [--follow]
-#                                 the server's log
+#   logs [--since 2h] [--tail 200] [--follow] [--grep <id>]
+#                                 the server's log, or only its lines naming
+#                                 one support code, player (p-…) or room (r-…)
+#   rooms [--invite <code> | --name <name> | --player <p-id>]
+#                                 the rooms open now, with their players: the
+#                                 one an invite opens, or those of a player or
+#                                 a name (any case); an invite is never logged
 #   diagnostics [<code> [<source>]]
 #                                 players' diagnostics: all sessions, or one
 #                                 session's (support code) or launcher run's
@@ -25,7 +30,7 @@ set -eu
 
 REPO=/opt/tpf3mp
 DEPLOY="$REPO/deploy"
-ORIGIN=https://github.com/Juliansgith/Transport-Fever-3-Multiplayer-Mod.git
+ORIGIN=https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod.git
 ADMIN=http://127.0.0.1:9470
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -40,12 +45,37 @@ compose() {
 }
 
 usage() {
-  sed -n '7,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '/^#   status/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 command=${1:-help}
 [ $# -gt 0 ] && shift
-logger -t tpf3mp-ctl -- "${SUDO_USER:-root}: $command $*" || true
+# Logged with the developer's name, but never an invite: it lets anyone in.
+logged=
+hide=
+for arg in "$@"; do
+  if [ -n "$hide" ]; then
+    logged="$logged <invite>"
+    hide=
+    continue
+  fi
+  if [ "$arg" = --invite ]; then
+    hide=1
+  fi
+  logged="$logged $arg"
+done
+logger -t tpf3mp-ctl -- "${SUDO_USER:-root}: $command$logged" || true
+
+# An invite or support code typed in either case, upper-cased; empty when it
+# is not six of the code's letters and digits.
+code_of() {
+  code=$(printf '%s' "$1" | tr abcdefghjkmnpqrstuvwxyz ABCDEFGHJKMNPQRSTUVWXYZ)
+  case $code in
+    *[!23456789ABCDEFGHJKMNPQRSTUVWXYZ]* | '') return 0 ;;
+  esac
+  [ ${#code} -eq 6 ] && printf '%s' "$code"
+  return 0
+}
 
 case "$command" in
   status)
@@ -75,13 +105,55 @@ case "$command" in
           args="$args --follow"
           shift
           ;;
-        *) die "logs takes --since, --tail and --follow" ;;
+        --grep)
+          [ "${2:-}" != --end ] || die "--grep needs a support code, player ID or room ID"
+          [ "$(printf '%s' "$2" | wc -l)" -eq 0 ] || die "--grep takes one ID, on one line"
+          if printf '%s' "$2" | grep -Eqx 'p-[0-9a-f]{16}|r-[0-9a-f]{32}'; then
+            grep=$2
+          else
+            grep=$(code_of "$2")
+            [ -n "$grep" ] || die "--grep takes a support code (K7QM2X), a player ID (p- and 16 hexadecimal digits) or a room ID (r- and 32)"
+          fi
+          shift 2
+          ;;
+        *) die "logs takes --since, --tail, --follow and --grep" ;;
       esac
     done
     # $args holds only the options checked above: split, never globbed.
     set -f
-    # shellcheck disable=SC2086
-    compose logs --no-color --timestamps $args tpf3mp-server
+    if [ -n "${grep:-}" ]; then
+      # shellcheck disable=SC2086
+      compose logs --no-color --timestamps $args tpf3mp-server 2>&1 | grep -F --line-buffered -- "$grep" || true
+    else
+      # shellcheck disable=SC2086
+      compose logs --no-color --timestamps $args tpf3mp-server
+    fi
+    ;;
+  rooms)
+    case $# in
+      0)
+        curl -sS --fail-with-body --max-time 20 "$ADMIN/rooms"
+        exit
+        ;;
+      2) [ "$(printf '%s' "$2" | wc -l)" -eq 0 ] || die "rooms $1 takes one value, on one line" ;;
+      *) die "rooms takes nothing, or --invite, --name or --player and one value" ;;
+    esac
+    case $1 in
+      --invite)
+        code=$(code_of "$2")
+        [ -n "$code" ] || die "an invite is six letters and digits, such as K7QM2X"
+        curl -sS --fail-with-body --max-time 20 "$ADMIN/rooms?invite=$code"
+        ;;
+      --name)
+        printf '%s' "$2" | grep -Eqx '[A-Za-z0-9 ._-]{1,32}' || die "a name to look for is up to 32 letters, digits, spaces, dots, dashes or underscores"
+        curl -sS --fail-with-body --max-time 20 "$ADMIN/rooms?name=$(printf '%s' "$2" | tr ' ' '+')"
+        ;;
+      --player)
+        printf '%s' "$2" | grep -Eqx 'p-[0-9a-f]{16}' || die "a player ID is p- and 16 hexadecimal digits, such as p-3f2a91c0d4e5b6a7"
+        curl -sS --fail-with-body --max-time 20 "$ADMIN/rooms?player=$2"
+        ;;
+      *) die "rooms takes --invite, --name or --player" ;;
+    esac
     ;;
   diagnostics)
     case ${1:-} in

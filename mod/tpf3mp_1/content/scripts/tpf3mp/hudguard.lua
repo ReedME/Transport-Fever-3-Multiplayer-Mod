@@ -260,7 +260,8 @@ end
 function hudguard.install(cmd, link, api, where)
 	local guard = module("guard")
 	module("capture")
-	local refusals = {}
+	-- Refusals so far, by kind, and the last reason logged of each.
+	local refusals, reasons = {}, {}
 	local label = where or "the HUD's state"
 	local routed = type(link.native) == "table" and type(link.native.note) == "function"
 	if routed then
@@ -302,7 +303,9 @@ function hudguard.install(cmd, link, api, where)
 			local name = kind or "command no factory made"
 			local count = (refusals[name] or 0) + 1
 			refusals[name] = count
-			if count == 1 or count % 100 == 0 then
+			local changed = reason ~= nil and reason ~= reasons[name]
+			if changed then reasons[name] = reason end
+			if count == 1 or count % 100 == 0 or changed then
 				link:log("refused the player's " .. name .. " in the room's game (" .. count .. " so far) in "
 					.. label .. (reason and (": " .. tostring(reason)) or "")
 					.. (from and (", from the mod " .. tostring(from)) or ""))

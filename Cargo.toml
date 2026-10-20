@@ -3,11 +3,11 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.3.1"
+version = "1.3.2-reedme.2"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
-repository = "https://github.com/Juliansgith/Transport-Fever-3-Multiplayer-Mod"
+repository = "https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod"
 publish = false
 
 [workspace.dependencies]
@@ -24,6 +24,7 @@ tpf3mp-modscan = { path = "crates/tpf3mp-modscan" }
 tpf3mp-buildinfo = { path = "crates/tpf3mp-buildinfo" }
 # The hook takes it without the installer; the launcher adds `install`.
 tpf3mp-nativemods = { path = "crates/tpf3mp-nativemods", default-features = false }
+tpf3mp-plugin-abi = { path = "crates/tpf3mp-plugin-abi" }
 
 anyhow = "1.0.104"
 base64 = "0.23.1"

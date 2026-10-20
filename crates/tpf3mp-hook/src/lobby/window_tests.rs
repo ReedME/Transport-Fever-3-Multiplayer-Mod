@@ -569,7 +569,8 @@ fn in_the_room_the_owner_starts_once_everyone_is_ready() {
         assert!(shown.contains(word), "{word}: {shown}");
     }
     assert!(!enabled(&lua, "Start the game"), "Bob is not ready");
-    click(&lua, "Not ready");
+    // The owner's button says Ready, and a click takes it back.
+    click(&lua, "Ready");
     assert_eq!(sent(&lua), [LobbyAction::Ready { ready: false }]);
     show(
         &lua,
@@ -1415,7 +1416,8 @@ fn a_guest_gets_ready_and_chats_but_neither_starts_nor_removes() {
     open(&lua, None);
     assert!(!has_button(&lua, "Start the game"));
     assert!(!has_button(&lua, "Remove Ann from the room"));
-    click(&lua, "Ready");
+    // Bob's button says Not ready, and a click makes him ready.
+    click(&lua, "Not ready");
     assert_eq!(sent(&lua), [LobbyAction::Ready { ready: true }]);
     call(&lua, "type_into", ("Say something to the room", "hi all"));
     assert_eq!(
@@ -1451,7 +1453,11 @@ fn while_the_rooms_world_comes_the_window_says_how_far_and_stays_usable() {
     );
     assert!(shown.contains("you lack stations 3"));
     assert!(shown.contains("The room's game is under way."));
-    assert!(!has_button(&lua, "Ready") && !has_button(&lua, "Start the game"));
+    assert!(
+        !has_button(&lua, "Ready")
+            && !has_button(&lua, "Not ready")
+            && !has_button(&lua, "Start the game")
+    );
     // The chat and Leave still work.
     call(
         &lua,

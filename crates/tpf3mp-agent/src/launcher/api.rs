@@ -68,6 +68,21 @@ pub(crate) struct View {
     pub(crate) on_list: bool,
     /// The round trip to the server played on, last read.
     pub(crate) home_ping: Option<std::time::Duration>,
+    /// The native mods panel, as last read (docs/NATIVE_MODS.md).
+    pub(crate) native: crate::native_mods::NativeView,
+    /// The native mods that change the simulation which the game runs, or
+    /// with no game running from here, which the next one will: what this
+    /// player declares beside their mods.
+    pub(crate) native_terms: Vec<tpf3mp_proto::NativeMod>,
+    /// What the launcher is doing with native mods now, such as installing
+    /// the room's.
+    pub(crate) native_busy: Option<String>,
+    /// An executable native plugin that needs explicit consent before this
+    /// action can continue.
+    pub(crate) native_consent: Option<crate::native_mods::PendingPluginConsent>,
+    /// Whether the player asked to see the mods proposed for the server's
+    /// registry.
+    pub(crate) native_proposed: bool,
 }
 
 /// Something the player asks for.
@@ -184,6 +199,43 @@ pub enum Action {
     /// Finds the installed mods again, as after installing one from Mod
     /// Hub, and declares anew what changed.
     RescanMods,
+    /// Fetches the signed index of native mods again (docs/NATIVE_MODS.md).
+    NativeRefresh,
+    /// Installs a native mod's newest version for this game, or upgrades it.
+    NativeInstall {
+        id: String,
+    },
+    NativeUninstall {
+        id: String,
+    },
+    /// Goes back to the version installed before.
+    NativeRollback {
+        id: String,
+    },
+    /// Switches a native mod on or off for the next game.
+    NativeEnable {
+        id: String,
+        on: bool,
+    },
+    /// Shows or hides the mods proposed for the server's registry: open
+    /// pull requests nobody has reviewed yet.
+    NativeShowProposed {
+        on: bool,
+    },
+    /// Installs a mod only proposed for the server's registry.
+    NativeInstallProposed {
+        id: String,
+    },
+    /// Gets the room's native mods with the room's settings, and starts the
+    /// game again with them if it runs: what joining a room's lobby does by
+    /// itself.
+    NativeMatchRoom,
+    /// Approves or declines the exact plugin packages shown in the current
+    /// consent prompt. The request ID binds the answer to that prompt.
+    NativeConsentDecision {
+        request_id: String,
+        approved: bool,
+    },
 }
 
 /// One mod the owner picked in the game's mod selector.
@@ -377,6 +429,52 @@ pub struct State {
     pub start: Option<RoomStart>,
     /// For the room's owner: the save they named on its way to the room.
     pub start_upload: Option<StartProgress>,
+    /// The native mods panel: the signed index's mods for this game, and
+    /// those installed (docs/NATIVE_MODS.md).
+    pub native: crate::native_mods::NativeView,
+    /// The room's native mods, and whether this player's game runs each
+    /// alike; empty while the room has none or has not told them.
+    pub room_native: Vec<RoomNativeRow>,
+    /// What the launcher is doing with native mods now.
+    pub native_busy: Option<String>,
+    /// Plugin packages that must be reviewed before an install, enable,
+    /// rollback, or room join can proceed.
+    pub native_consent: Option<crate::native_mods::PluginConsentPrompt>,
+}
+
+/// One of the room's native mods, as the lobby lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoomNativeRow {
+    pub id: String,
+    pub name: String,
+    /// The room's version of the package.
+    pub version: String,
+    /// `yes` when this game runs it alike, `other_version` in another
+    /// version or with other settings, `no` without it.
+    pub have: ModHave,
+}
+
+/// The room's native mods against those this game runs.
+fn room_native(view: &View, status: &Status) -> Vec<RoomNativeRow> {
+    let Some(room) = status.room_mods.as_ref().filter(|_| view.in_room) else {
+        return Vec::new();
+    };
+    room.native
+        .iter()
+        .map(|native| {
+            let have = match view.native_terms.iter().find(|own| own.id == native.id) {
+                Some(own) if own.version == native.version => ModHave::Yes,
+                Some(_) => ModHave::OtherVersion,
+                None => ModHave::No,
+            };
+            RoomNativeRow {
+                id: native.id.as_str().to_owned(),
+                name: native.name.as_str().to_owned(),
+                version: native.package_version().to_owned(),
+                have,
+            }
+        })
+        .collect()
 }
 
 /// The save a room starts from, as the room names it.
@@ -831,6 +929,13 @@ pub(crate) fn snapshot(view: &View, status: &Status) -> State {
                 save: upload.save.clone(),
                 percent: upload.percent.min(100),
             }),
+        native: view.native.clone(),
+        room_native: room_native(view, status),
+        native_busy: view.native_busy.clone(),
+        native_consent: view
+            .native_consent
+            .as_ref()
+            .map(|pending| pending.prompt.clone()),
     }
 }
 
@@ -940,6 +1045,110 @@ mod tests {
             }
         );
         assert!(serde_json::from_str::<Action>(r#"{"action":"format_disk"}"#).is_err());
+        assert!(
+            serde_json::from_str::<Action>(
+                r#"{"action":"native_setting","id":"bigmap","key":"depth","value":12}"#,
+            )
+            .is_err(),
+            "a native mod's settings are not the player's to change"
+        );
+        let action: Action = serde_json::from_str(r#"{"action":"native_match_room"}"#).unwrap();
+        assert_eq!(action, Action::NativeMatchRoom);
+        let action: Action = serde_json::from_str(
+            r#"{"action":"native_consent_decision","request_id":"review-1","approved":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            Action::NativeConsentDecision {
+                request_id: "review-1".into(),
+                approved: true,
+            }
+        );
+    }
+
+    #[test]
+    fn the_page_sees_only_the_exact_native_consent_prompt() {
+        let prompt = crate::native_mods::PluginConsentPrompt {
+            request_id: "review-1".into(),
+            action: "Install Big Maps".into(),
+            packages: vec![crate::native_mods::PluginConsentPackage {
+                id: "bigmap".into(),
+                name: "Big Maps".into(),
+                version: "1.0.0".into(),
+                authors: vec!["Map Team".into()],
+                source: "project".into(),
+                digest: "0123456789abcdef".repeat(4),
+                approved: false,
+            }],
+        };
+        let view = View {
+            native_consent: Some(crate::native_mods::PendingPluginConsent {
+                prompt,
+                operation: crate::native_mods::PendingPluginOperation::Change(
+                    crate::native_mods::Change::Install("bigmap".into()),
+                ),
+            }),
+            ..View::default()
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&render(&view, &Status::default())).unwrap();
+        assert_eq!(json["native_consent"]["request_id"], "review-1");
+        assert_eq!(json["native_consent"]["action"], "Install Big Maps");
+        assert_eq!(json["native_consent"]["packages"][0]["source"], "project");
+        assert_eq!(
+            json["native_consent"]["packages"][0]["digest"],
+            "0123456789abcdef".repeat(4)
+        );
+        assert!(json["native_consent"]["operation"].is_null());
+    }
+
+    /// The lobby lists the room's native mods, and whether this game runs
+    /// each alike: the same version and settings, or not.
+    #[test]
+    fn the_state_says_which_native_mods_the_game_runs_alike() {
+        let native = |id: &str, version: &str| tpf3mp_proto::NativeMod {
+            id: tpf3mp_proto::Text::lossy(id),
+            version: tpf3mp_proto::Text::lossy(&format!("{}{}", version, "a".repeat(64))),
+            name: tpf3mp_proto::Text::lossy(id),
+            settings: Vec::new(),
+        };
+        let status = Status {
+            room_mods: Some(tpf3mp_proto::RoomMods {
+                game: tpf3mp_proto::Text::lossy("40420"),
+                mods: Vec::new(),
+                params: Vec::new(),
+                native: vec![
+                    native("bigmap", "0.3.0+0123456789"),
+                    native("density", "1.0.0+aaaaaaaaaa"),
+                    native("trees", "2.0.0+bbbbbbbbbb"),
+                ],
+            }),
+            ..Status::default()
+        };
+        let view = View {
+            in_room: true,
+            native_terms: vec![
+                native("bigmap", "0.3.0+0123456789"),
+                native("density", "1.0.0+cccccccccc"),
+            ],
+            ..View::default()
+        };
+        let rows = snapshot(&view, &status).room_native;
+        let have: Vec<(&str, &str, ModHave)> = rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.version.as_str(), row.have))
+            .collect();
+        assert_eq!(
+            have,
+            [
+                ("bigmap", "0.3.0", ModHave::Yes),
+                ("density", "1.0.0", ModHave::OtherVersion),
+                ("trees", "2.0.0", ModHave::No),
+            ]
+        );
+        // Outside a room, none.
+        assert!(snapshot(&View::default(), &status).room_native.is_empty());
     }
 
     #[test]

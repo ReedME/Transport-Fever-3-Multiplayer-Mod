@@ -1,0 +1,321 @@
+{
+  "recorded_utc": "2026-10-20T09:12:00.561204+00:00",
+  "fork_baseline": "9261e8eafd4cec315c2c91d817533ceabefc3b28",
+  "shared_baseline": "538733611cc5e4c8ea30d48513d5b0df761db05a",
+  "upstream_dev": "02829e3608011351789b6ca0117093177f64b201",
+  "upstream_imported_commits": 191,
+  "version": "1.3.2-reedme.2",
+  "protocol_version": 24,
+  "ipc_bridge_version": 30,
+  "action_schema_version": 28,
+  "lua_contract_version": 15,
+  "room_log_format": 11,
+  "code_tree_sha256": "16e84ad4d0c63b951fcc7ad026b3304d804e580f3a2606684529e5dff78e2388",
+  "code_tree_hash_scope": "Sorted tracked and nonignored task files under crates/, mod/, profiles/, tools/, .github/, deploy/, packaging/, plus root Cargo.toml, Cargo.lock and rust-toolchain.toml; path NUL raw SHA256 digest for each file.",
+  "local_checks": {
+    "workspace_tests": {
+      "passed": 1966,
+      "failed": 0,
+      "ignored": 10
+    },
+    "linux_all_targets_clippy": true,
+    "windows_gnu_all_targets_clippy": true,
+    "cargo_format": true,
+    "git_diff_check": {
+      "fork_delta_against_upstream_dev_passed": true,
+      "inherited_upstream_trailing_whitespace_preserved": {
+        "file": "crates/tpf3mp-bigmap-plugin/package/mod/tpf3mp_bigmap_1/content/gui/menu/new_game_or_map_settings_page.tl",
+        "lines": 14
+      }
+    },
+    "pending_offer_regression_fails_without_new_guard": true,
+    "loan_fixture_unequal_cooldown_reproduction_and_boundaries": true,
+    "unix_installer_cases": {
+      "passed": 7,
+      "failed": 0,
+      "multicall_original_failure_reproduced": true,
+      "multicall_repaired_suite_passed": true,
+      "production_installer_unchanged": true
+    },
+    "tpfre": {
+      "passed": 49,
+      "failed": 0,
+      "ignored": 1
+    },
+    "python_helpers": [
+      {
+        "script": "tools/dayone/test_dayone.py",
+        "exit_code": 0
+      },
+      {
+        "script": "tools/lobby/test_make_main_page.py",
+        "exit_code": 0
+      },
+      {
+        "script": "tools/test_lane_diff.py",
+        "exit_code": 0
+      },
+      {
+        "script": "tools/probe/check_lua.py",
+        "exit_code": 0
+      },
+      {
+        "script": "tools/probe/test_tf3_detprobe.py",
+        "exit_code": 0
+      },
+      {
+        "script": "tools/probe/test_compare_runs.py",
+        "exit_code": 0
+      },
+      {
+        "script": "tools/github/test_announce_release.py",
+        "exit_code": 0
+      },
+      {
+        "script": "tools/github/test_release_server_validation.py",
+        "exit_code": 0
+      },
+      {
+        "script": "tools/github/test_verify_game_build.py",
+        "exit_code": 0
+      },
+      {
+        "script": "tools/github/test_setup_update_key.py",
+        "exit_code": 0
+      }
+    ],
+    "optimized_regressions": {
+      "passed": 42,
+      "failed": 0,
+      "repeats": 3
+    },
+    "optimized_load_cases": [
+      {
+        "scenario": "paced",
+        "arguments": [
+          "--rooms",
+          "10",
+          "--bots",
+          "8",
+          "--steps",
+          "1500",
+          "--paced"
+        ],
+        "exit_code": 0,
+        "passed": true
+      },
+      {
+        "scenario": "bad-network",
+        "arguments": [
+          "--rooms",
+          "4",
+          "--bots",
+          "4",
+          "--steps",
+          "1000",
+          "--paced",
+          "--latency-ms",
+          "60",
+          "--jitter-ms",
+          "20",
+          "--loss-percent",
+          "2"
+        ],
+        "exit_code": 0,
+        "passed": true
+      },
+      {
+        "scenario": "tunnel",
+        "arguments": [
+          "--rooms",
+          "4",
+          "--bots",
+          "4",
+          "--steps",
+          "1000",
+          "--paced",
+          "--tunneled"
+        ],
+        "exit_code": 0,
+        "passed": true
+      },
+      {
+        "scenario": "compaction",
+        "arguments": [
+          "--rooms",
+          "8",
+          "--bots",
+          "4",
+          "--steps",
+          "1500",
+          "--data-dir",
+          "/home/reedme/Documents/ChatGPT/TransportFever3/target/reedme-oct20-final-load-data/compaction",
+          "--compact-log-kib",
+          "8"
+        ],
+        "exit_code": 0,
+        "passed": true
+      }
+    ],
+    "teal_new_errors_compared_with_installed_original": 0,
+    "launcher_screenshots": {
+      "render_tests_passed": 2,
+      "images": 21,
+      "inspected_screens": [
+        "native-plugin-consent",
+        "mod-browser",
+        "mod-manager",
+        "lobby-native-mods"
+      ],
+      "scope": "static Linux 1100x690 sample backend, no actual Proton window or live download"
+    },
+    "linux_optimized_binaries_built": true,
+    "windows_gnu_development_clients_and_hook_built": true
+  },
+  "proton_synthetic": {
+    "proton_version": "experimental-11.0-20261014-x86_64",
+    "disposable_test_prefix": true,
+    "cross_stack_result": {
+      "native_linux_server": true,
+      "windows_clients_under_proton": true,
+      "real_game": false,
+      "players": 2,
+      "steps_each": 1200,
+      "divergences": 0,
+      "all_final_lane_digests_equal": true,
+      "exit_code": 0,
+      "binary_sha256": {
+        "target/optimized-candidate/release/tpf3mp-server": "3d16d38f387d28edc89d0f1896d27a87219490f7bfdf62b850dbe91658ee8c1c",
+        "target/cross-windows/x86_64-pc-windows-gnu/debug/tpf3mp-rig.exe": "bdf39b25652585e6a213e59fa2735744dde5f25202e2df094dab0350ec396700",
+        "target/cross-windows/x86_64-pc-windows-gnu/debug/tpf3mp-fakegame.exe": "6626029239734cd9e2de9f2160193b218ba4d6ab85a4ad46985c783443388156"
+      }
+    },
+    "windows_native_mod_tests": {
+      "passed": 72,
+      "failed": 0,
+      "ignored": 0
+    },
+    "engine_injection_tested": false
+  },
+  "external_plugins": {
+    "owner_authorized": true,
+    "decision": "D31",
+    "project_signature_or_deliberately_configured_authenticated_server_index": true,
+    "source_and_full_package_identity_consent_required": true,
+    "native_registry_configured": false,
+    "native_signing_key_configured": false,
+    "plugin_installed_or_published": false
+  },
+  "real_game": {
+    "verified": false,
+    "installed_edition": "Linux ELF x86_64",
+    "steam_app_id": 3493540,
+    "steam_depot_build_id": "25754343",
+    "linux_elf_build_id": "b2998b4cff435c28729e980e6c2779543187bd4b",
+    "windows_game_executable_available": false,
+    "actual_game_proton_prefix_initialized": false,
+    "game_install_or_steam_configuration_modified": false,
+    "supported_windows_game_build": 40420,
+    "supported_windows_executable_sha256": "74861ac43b041aebc5179154345b3cf1ec83154c8e6cc58e0d9e02ff5fa602e4",
+    "verified_preview_40422_profile": false
+  },
+  "remaining_acceptance": [
+    "Owner makes the Windows TF3 edition available through Proton and initializes its actual game prefix.",
+    "Verify the exact supported Windows 40420 executable and native hook inputs.",
+    "Validate tools/game automation for native Linux server with Proton clients if agent-driven testing is used.",
+    "Ordinary-start two-company ownership, balances, permissions, traffic and save/join/reconnect/server-recovery gameplay.",
+    "Exact private native archive verification and signed release review."
+  ],
+  "mpfever_reference": {
+    "version": "0.3.20",
+    "url": "https://github.com/dkdknight/MPFever/releases/tag/0.3.20",
+    "code_imported": false
+  },
+  "hosted_validation": {
+    "pull_request": "https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod/pull/1",
+    "exact_commit_runs_recorded_after_push": "target/reedme-oct20-final-validation.json"
+  },
+  "local_evidence": {
+    "target/reedme-oct20-final-workspace-tests.log": {
+      "sha256": "c2d986173fc2aa440bd568fd8b92cdc1fe0d4f603ab2f30cea7a61806df9c08b",
+      "bytes": 171604
+    },
+    "/tmp/tpf3mp-pending-offer-regression.log": {
+      "sha256": "edadf01f749820c5e72de7076abc757f6a93115a742ba58b50cab17c020e1669",
+      "bytes": 480
+    },
+    "/tmp/tpf3mp-pending-offer-mutation.log": {
+      "sha256": "3bea4909411091c18ce040e5f56896d95c721fb25dabf9fbdac1bf09bba052fa",
+      "bytes": 7238
+    },
+    "target/reedme-oct20-loan-lua-tests.log": {
+      "sha256": "9e67b2068b2e30979ca985a06bca91c823ee757ca198ec471687af5ceb948fb5",
+      "bytes": 27081
+    },
+    "target/reedme-oct20-unix-installer-fixture.log": {
+      "sha256": "3ccaf79a2678f5cf40c1a6482c547ca1fe32f1a8f41fa89d7d6f7993e6f06562",
+      "bytes": 497
+    },
+    "target/reedme-coreutils-compat/baseline.log": {
+      "sha256": "9612bd99a7d4e2b53fd837101ca5392407c017f154719234f6ee5ae6c3d30eca",
+      "bytes": 1212
+    },
+    "target/reedme-coreutils-compat/fixed.log": {
+      "sha256": "f5ff8068289d75fc0a83171cdbd48c8f65c7db8db94faf8b473bdc4ea28457d0",
+      "bytes": 497
+    },
+    "target/reedme-oct20-final-linux-clippy.log": {
+      "sha256": "6c9e74bbb126ef412cf4011eb8f43a7585dfadb262eddddf49729bc52b1be743",
+      "bytes": 764
+    },
+    "target/reedme-oct20-final-windows-clippy.log": {
+      "sha256": "6e8f414513989d7523579b8cdcc04c52b4bf3b510f829b08393abca55af32256",
+      "bytes": 518
+    },
+    "target/reedme-oct20-final-release-build.log": {
+      "sha256": "67ba149d992c1c0c56ffad74632d1fa6e9c51833be7f0394e7f61d608d0f80ae",
+      "bytes": 447
+    },
+    "target/reedme-oct20-final-windows-build.log": {
+      "sha256": "c30e41d4f494a5caa9532c9c48831ead23262060c59a662db784625aeb7ec332",
+      "bytes": 791
+    },
+    "target/reedme-oct20-tpfre.log": {
+      "sha256": "03dac71e4a29880d867cb671f69ed3591ee041b20daad556bc5349cbcb7c9890",
+      "bytes": 5239
+    },
+    "target/reedme-oct20-launcher-screenshots.log": {
+      "sha256": "5c40779f89bd68ea28ad3274526b455107e9a61aa2adb388ffffa01abddb2d8d",
+      "bytes": 448
+    },
+    "target/reedme-oct20-python-checks.log": {
+      "sha256": "5d741b2faaedd6a90174f2b329d9d6d4bf3ea7e1a11da4ce4908aa8b361e5421",
+      "bytes": 4006
+    },
+    "target/reedme-oct20-teal-compare.log": {
+      "sha256": "617c16e6c67b306179aafdf3f6de9487cfc14505a5b3971303e8f9430ff9c3a7",
+      "bytes": 159
+    },
+    "target/reedme-oct20-final-regress.log": {
+      "sha256": "5000eec1602bbf5fc31a6ffe3c281ff1ac10adf9bf090d3cf08cc9740bace510",
+      "bytes": 3526
+    },
+    "target/reedme-oct20-final-load-results.json": {
+      "sha256": "8c9308d42e1048a7705688b7daf2f52ffa706b62a218a444a438a6ecb8024dc5",
+      "bytes": 1086
+    },
+    "target/reedme-oct20-proton-stack-v3/linux-server/clients.txt": {
+      "sha256": "28be69ba6aaab95ba1b778491ec7fb92c134748565c1c32a73b8c33b00bf7441",
+      "bytes": 1653
+    },
+    "target/reedme-oct20-proton-stack-v3/linux-server/result.json": {
+      "sha256": "ece47e96d1682d26261b149913163c15fa090804d4c2dafc7fb4b221b62d5e1e",
+      "bytes": 644
+    },
+    "target/reedme-oct20-proton-stack-v2/plugin-tests.txt": {
+      "sha256": "9de9037320be5eaf5099cfe0541ecf461ef3641836f4d063a9e022edb77c22f3",
+      "bytes": 5564
+    }
+  },
+  "player_release": false
+}

@@ -6,7 +6,10 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tpf3mp_net::tunnel::TunnelUrl;
 use tpf3mp_net::{ServerIdentity, ServerTrust};
 use tpf3mp_proto::{RoomSettings, Speed};
@@ -14,9 +17,11 @@ use tpf3mp_server::{Server, ServerConfig, ServerError, ServerStats, SnapshotConf
 use tpf3mp_snapshot::StoreError;
 use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
+    fake_hook::HookNotice,
     netem::{Impairment, Netem},
     scenario::{
-        BridgedPlan, BridgedPlayer, RoomPlan, latency_summary, play_bridged_room, play_room,
+        BridgedControl, BridgedPlan, BridgedPlayer, RoomPlan, latency_summary, play_bridged_room,
+        play_bridged_room_controlled, play_room,
     },
     toy::{ToyWorld, lane, toy_rules_menu},
 };
@@ -70,6 +75,14 @@ impl TestServer {
         data: Option<(PathBuf, [u8; 32])>,
         snapshots: Option<SnapshotConfig>,
     ) -> Self {
+        // Keep CI quiet normally; opt in to the real bridge/server diagnostics
+        // when reproducing a scenario failure, including connection close reasons.
+        if let Ok(filter) = std::env::var("TPF3MP_TEST_TRACE") {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_test_writer()
+                .try_init();
+        }
         let trust = ServerTrust::Pinned(identity.leaf().clone());
         let mut config = ServerConfig::new(listen, identity);
         if let Some((dir, secret)) = data {
@@ -200,6 +213,7 @@ async fn eight_bots_agree_over_a_lossy_high_latency_link() {
     .await
     .unwrap();
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 100,
         input_delay_ms: 250,
         checkpoint_interval: 50,
@@ -240,6 +254,7 @@ async fn paced_players_feel_their_round_trip_plus_a_small_buffer() {
     .unwrap();
     // A long input delay, so that feeling it could not pass for noise.
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 20,
         input_delay_ms: 1000,
         checkpoint_interval: 20,
@@ -274,6 +289,7 @@ async fn paced_players_feel_their_round_trip_plus_a_small_buffer() {
 async fn games_behind_the_bridge_and_gate_agree() {
     let server = TestServer::start().await;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 100,
         input_delay_ms: 60,
         checkpoint_interval: 20,
@@ -332,6 +348,7 @@ async fn games_ride_out_a_server_restart() {
     .await;
     let address = first.address;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 50,
         input_delay_ms: 60,
         checkpoint_interval: 25,
@@ -385,6 +402,7 @@ async fn games_ride_out_a_server_restart() {
 async fn a_drifting_replica_is_singled_out() {
     let server = TestServer::start().await;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 100,
         input_delay_ms: 60,
         checkpoint_interval: 50,
@@ -434,6 +452,7 @@ async fn a_drifting_replica_is_singled_out() {
 async fn the_server_refuses_what_a_company_cannot_afford() {
     let server = TestServer::start().await;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 50,
         input_delay_ms: 60,
         checkpoint_interval: 25,
@@ -456,6 +475,25 @@ fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tpf3mp-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+async fn wait_for_room_snapshot_pointer(directory: &std::path::Path) {
+    let saved = async {
+        loop {
+            let exists = std::fs::read_dir(directory).is_ok_and(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.path().extension() == Some(std::ffi::OsStr::new("snapshot")))
+            });
+            if exists {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(90), saved)
+        .await
+        .expect("the room did not persist its agreed snapshot before restart");
 }
 
 fn saving_players(count: u64, target_step: u64) -> Vec<BridgedPlayer> {
@@ -498,6 +536,67 @@ fn assert_same_last_load(reports: &[tpf3mp_testkit::fake_hook::HookReport]) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridged_seats_and_late_joins_keep_the_rooms_non_default_scan_plan() {
+    let root = temp_dir("scan-plan");
+    let server = TestServer::start_saving(
+        "127.0.0.1:0".parse().unwrap(),
+        ServerIdentity::self_signed(&["localhost"]).unwrap(),
+        None,
+        root.join("server"),
+    )
+    .await;
+    let scan_plan = tpf3mp_proto::ScanPlan::from_values(Some("compare"), Some("5x10")).unwrap();
+    let settings = RoomSettings {
+        scan_plan,
+        steps_per_second: 100,
+        input_delay_ms: 60,
+        checkpoint_interval: 20,
+    };
+    let mut players = saving_players(3, 300);
+    players[2].join_after = Some(Duration::from_millis(50));
+    let (start, wait_to_start) = oneshot::channel();
+    let (release, late_joins) = mpsc::unbounded_channel();
+    let (notices, mut received) = mpsc::unbounded_channel();
+    let game = tokio::spawn(play_bridged_room_controlled(
+        BridgedPlan {
+            server: server.address,
+            server_name: "localhost".into(),
+            trust: server.trust.clone(),
+            settings,
+            players,
+            deadline: Duration::from_secs(60),
+            worlds: Some(root.join("players")),
+            start_world: None,
+        },
+        BridgedControl {
+            start: Some(wait_to_start),
+            late_joins: Some(late_joins),
+            notices: Some(notices),
+            ..BridgedControl::default()
+        },
+    ));
+    start.send(()).unwrap();
+    release.send("game2".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match received.recv().await {
+                Some(HookNotice::WorldLoaded { player, .. }) if player == "game2" => break,
+                Some(_) => {}
+                None => panic!("the scenario ended before the late player's world loaded"),
+            }
+        }
+    })
+    .await
+    .expect("the late player loaded under the room's non-default plan");
+    let reports = game.await.unwrap().unwrap();
+    assert_worlds_agree(&reports);
+    assert_same_last_load(&reports);
+    assert!(reports.iter().all(|report| report.scan_plan == scan_plan));
+    server.stop().await;
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_player_joins_a_running_game_from_the_rooms_world() {
     let root = temp_dir("late-join");
     let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
@@ -509,6 +608,7 @@ async fn a_player_joins_a_running_game_from_the_rooms_world() {
     )
     .await;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 100,
         input_delay_ms: 60,
         checkpoint_interval: 20,
@@ -562,6 +662,7 @@ async fn a_player_behind_a_udp_block_joins_late_through_the_tunnel() {
     )
     .await;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 100,
         input_delay_ms: 60,
         checkpoint_interval: 20,
@@ -614,6 +715,7 @@ async fn every_player_starts_from_the_owners_world() {
     )
     .await;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 100,
         input_delay_ms: 60,
         checkpoint_interval: 20,
@@ -664,6 +766,7 @@ async fn every_game_starts_from_the_save_the_owner_named_at_once() {
     )
     .await;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 100,
         input_delay_ms: 60,
         checkpoint_interval: 20,
@@ -721,6 +824,7 @@ async fn a_diverged_replica_is_rebased_onto_the_agreed_world() {
     )
     .await;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 100,
         input_delay_ms: 60,
         checkpoint_interval: 50,
@@ -774,6 +878,7 @@ async fn a_restored_room_still_hands_on_its_world() {
     .await;
     let address = first.address;
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: 50,
         input_delay_ms: 60,
         checkpoint_interval: 25,
@@ -781,24 +886,46 @@ async fn a_restored_room_still_hands_on_its_world() {
     // Long enough that the second player still plays when the last one's
     // world is handed on (it reloads it too).
     let mut players = saving_players(3, 1200);
-    // One player joins early, so the room saves before the restart; the
-    // last joins after it, from the world the restored room kept.
+    // One player joins early. Restart only after its snapshot really loaded;
+    // disk work and debug-build speed must not decide whether that happened.
     players[1].join_after = Some(Duration::from_secs(1));
-    players[2].join_after = Some(Duration::from_secs(6));
-    let game = tokio::spawn(play_bridged_room(BridgedPlan {
-        server: address,
-        server_name: "localhost".into(),
-        trust: first.trust.clone(),
-        settings,
-        players,
-        deadline: Duration::from_secs(90),
-        worlds: Some(root.join("players")),
-        start_world: None,
-    }));
+    players[2].join_after = players[1].join_after;
+    let (loaded, mut loaded_worlds) = tokio::sync::mpsc::unbounded_channel();
+    let (restart_done, join_after_restart) = oneshot::channel();
+    let control = BridgedControl {
+        snapshot_loaded: [(1, loaded)].into(),
+        before_join: [(2, join_after_restart)].into(),
+        ..BridgedControl::default()
+    };
+    let game = tokio::spawn(play_bridged_room_controlled(
+        BridgedPlan {
+            server: address,
+            server_name: "localhost".into(),
+            trust: first.trust.clone(),
+            settings,
+            players,
+            deadline: Duration::from_secs(90),
+            worlds: Some(root.join("players")),
+            start_world: None,
+        },
+        control,
+    ));
 
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    tokio::time::timeout(Duration::from_secs(90), loaded_worlds.recv())
+        .await
+        .expect("the second player did not load before the restart deadline")
+        .expect("the second player ended before loading its first snapshot");
+    wait_for_room_snapshot_pointer(&root.join("rooms")).await;
     first.stop().await;
     let second = TestServer::start_saving(address, identity, data, root.join("snapshots")).await;
+    assert_eq!(
+        second.stats.rooms(),
+        1,
+        "the room is restored before the late join"
+    );
+    restart_done
+        .send(())
+        .expect("the scenario ended before the restored server was ready");
 
     let reports = game.await.unwrap().unwrap();
     assert_worlds_agree(&reports);
@@ -806,8 +933,14 @@ async fn a_restored_room_still_hands_on_its_world() {
     // The second player loaded the room's world when it joined. The room
     // does not keep, across its restart, which world each game plays, so
     // the others load the third player's with it; the third loaded one.
-    assert_eq!(reports[1].received, 2);
-    assert_eq!(reports[2].received, 1);
+    assert_eq!(
+        reports[1].received, 2,
+        "the second player loads once before and once after restart: {reports:#?}"
+    );
+    assert_eq!(
+        reports[2].received, 1,
+        "the late player loads the restored room's world once: {reports:#?}"
+    );
     second.stop().await;
     let _ = std::fs::remove_dir_all(&root);
 }

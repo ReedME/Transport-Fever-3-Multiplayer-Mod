@@ -43,13 +43,15 @@ registry.KINDS = { "vehicles", "lines", "groups", "towns", "industries" }
 local COMPONENT = { vehicles = "TRANSPORT_VEHICLE", lines = "LINE", groups = "STATION_GROUP",
 	towns = "TOWN", industries = "CONSTRUCTION" }
 
--- Whether `entity` is still one of `kind` in this world.
+-- Whether `entity` is still one of `kind` in this world. An unreadable
+-- component is unknown, not proof that a saved binding has gone away.
 local function exists(kind, entity)
 	local ok, c = pcall(function()
 		if api.engine.entityExists and not api.engine.entityExists(entity) then return nil end
 		return api.engine.getComponent(entity, api.type.ComponentType[COMPONENT[kind]])
 	end)
-	return ok and c ~= nil
+	if not ok then return nil end
+	return c ~= nil
 end
 
 -- The industries' constructions. The game keeps an industry's INDUSTRY
@@ -125,7 +127,7 @@ function registry.sync(reg, made)
 		for _, pair in ipairs(r.bound) do
 			-- Kept while it exists, listed or not; where the kind could not
 			-- be listed, as it was.
-			if present[pair[2]] or not listed or exists(kind, pair[2]) then
+			if present[pair[2]] or not listed or exists(kind, pair[2]) ~= false then
 				kept[#kept + 1] = pair
 				known[pair[2]] = true
 			end

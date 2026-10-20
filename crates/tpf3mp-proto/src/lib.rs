@@ -21,6 +21,7 @@ mod diagnostics;
 mod ids;
 pub mod lua;
 mod room_mods;
+mod scan_plan;
 mod snapshot;
 mod text;
 mod turn;
@@ -32,15 +33,18 @@ pub use bounded::{BoundedVec, TooMany};
 pub use bytes::{FixedBytes, MAX_PAYLOAD, Payload, PayloadTooLarge};
 pub use content::{
     ContentDiff, ContentManifest, GameBuilds, MAX_DIFF_LISTED, MAX_LISTED_MODS, MAX_MANIFEST_BYTES,
-    ModChange, ModId, ModRef, ModVersion, OWN_MOD, Unlisted, own_mod_short,
+    MAX_MOD_VERSION, MAX_NATIVE_PACKAGE_VERSION, MAX_NATIVE_TERMS, ModChange, ModId, ModRef,
+    ModVersion, NATIVE_PREFIX, NATIVE_TERM_DIGEST_HEX, OWN_MOD, Unlisted,
+    native_term_version_is_full, own_mod_short,
 };
 pub use control::{
     AUTH_DOMAIN, AUTH_EXPORTER_LABEL, BANNERS, BannerId, ChatText, ClientMessage,
     ContentFingerprint, ContentStatus, CreateRoom, GameMessage, Hello, IntentRejection, JoinRoom,
-    LaneDigest, ListedRoom, LoadingStage, MAX_CHECKPOINT_LANES, MAX_PREVIEW, MAX_ROOM_MEMBERS,
-    MemberView, PORTRAITS, ROOMS_PER_PAGE, Reject, RejectReason, Request, RequestError, Response,
-    Resume, RoomListing, RoomPage, RoomPhase, RoomSettings, RoomView, RulesName, RulesOffer,
-    Secret, ServerMessage, Speed, StartSave, StartView, Welcome, is_banner, is_portrait,
+    LaneDigest, ListedRoom, LoadingStage, MAX_CHECKPOINT_LANES, MAX_NATIVE_INDEX_PAGES,
+    MAX_PREVIEW, MAX_ROOM_MEMBERS, MemberView, NATIVE_INDEX_PAGE, NativeIndexPage, PORTRAITS,
+    ROOMS_PER_PAGE, Reject, RejectReason, Request, RequestError, Response, Resume, RoomListing,
+    RoomPage, RoomPhase, RoomSettings, RoomView, RulesName, RulesOffer, Secret, ServerMessage,
+    Speed, StartSave, StartView, Welcome, is_banner, is_portrait,
 };
 pub use diagnostics::{
     DiagnosticBatch, DiagnosticEvent, DiagnosticLevel, DiagnosticTarget, DiagnosticText, LogSource,
@@ -52,9 +56,10 @@ pub use ids::{
 };
 pub use room_mods::{
     GAME_SETTINGS, MAX_ROOM_DECLARATION_BYTES, MAX_ROOM_MODS, MAX_ROOM_PARAMS, MODIO_SOURCE,
-    ModInfo, ModParam, ModParams, RoomConfig, RoomDeclaration, RoomMod, RoomMods, RoomModsError,
-    is_mod_id,
+    ModInfo, ModParam, ModParams, NativeMod, NativeSetting, NativeValue, RoomConfig,
+    RoomDeclaration, RoomMod, RoomMods, RoomModsError, is_mod_id,
 };
+pub use scan_plan::{SCAN_MODE_ENV, SCAN_PLAN_ENV, ScanMode, ScanPlan};
 pub use snapshot::{
     BULK_REQUEST_MAX_FRAME, BULK_RESPONSE_MAX_FRAME, BulkOpen, BulkRequest, BulkResponse,
     ChunkHash, MAX_CHUNKS_PER_REQUEST, SavedWorld, SnapshotId, WorldOffer,
@@ -91,8 +96,19 @@ pub use turn::{Event, EventBody, Seal, Turn, TurnMessage, TurnStart};
 /// ([`Request::DeclareRoom`]), tells every member the room's mods
 /// ([`ServerMessage::RoomMods`]) and how each member's game differs
 /// ([`MemberView::differs`]); version 19 checks an invite on a server without
-/// joining its room ([`Request::ResolveInvite`], [`Response::InviteMatch`]).
-pub const PROTOCOL_VERSION: u32 = 19;
+/// joining its room ([`Request::ResolveInvite`], [`Response::InviteMatch`]);
+/// version 20 carries a game's native mods that change the simulation in its
+/// content manifest ([`ContentManifest::native`]) and the room's, with their
+/// settings, beside its mods ([`RoomConfig::native`], [`RoomMods::native`]);
+/// version 21 lets a server hand out its own index of native mods and the
+/// mods proposed for it ([`Request::NativeIndex`], [`NativeIndexPage`]);
+/// version 22 carries a full SHA-256 package identity in each native room
+/// term, while keeping ordinary mod versions limited to 32 bytes.
+/// Version 23 negotiates the world-check scan plan before joining a room.
+/// Version 24 retains the upstream native-mod and scan-plan additions together
+/// with ReedME producing-world epochs and acknowledged-load reports. ReedME
+/// version 20 used an incompatible layout to upstream version 20.
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Application protocol name negotiated during the TLS handshake.
 pub const ALPN: &[u8] = b"tpf3mp";
@@ -293,10 +309,13 @@ mod tests {
 
     #[test]
     fn game_message_wire_format_is_stable() {
-        let progress = ClientMessage::Game(GameMessage::Progress { step: 300 });
+        let progress = ClientMessage::Game(GameMessage::Progress {
+            world_epoch: 1,
+            step: 300,
+        });
         let frame = encode_frame(&progress, CONTROL_MAX_FRAME).unwrap();
         // Game variant, Progress variant, varint 300.
-        assert_eq!(frame, [4, 0, 0, 0, 2, 1, 0xac, 0x02]);
+        assert_eq!(frame, [5, 0, 0, 0, 2, 1, 1, 0xac, 0x02]);
         // Version 12: a member's loading progress, the last variant.
         let loading = ClientMessage::Game(GameMessage::Loading(Some(LoadingStage::Fetching {
             percent: 42,
@@ -382,9 +401,29 @@ mod tests {
         );
     }
 
+    /// A native-mods index goes in pages that each fit a control frame, and
+    /// one too large for every page is not offered.
     #[test]
-    fn invite_resolution_round_trips_at_protocol_19() {
-        assert_eq!(PROTOCOL_VERSION, 19);
+    fn native_index_pages_fit_a_frame() {
+        let json = vec![b'{'; NATIVE_INDEX_PAGE * 2 + 1];
+        let pages = NativeIndexPage::split(3, &json).unwrap();
+        assert_eq!(pages.len(), 3);
+        assert!(pages.iter().all(|p| p.serial == 3 && p.pages == 3));
+        let joined: Vec<u8> = pages.iter().flat_map(|p| p.bytes.to_vec()).collect();
+        assert_eq!(joined, json);
+        let full = ServerMessage::Response {
+            id: u32::MAX,
+            result: Ok(Response::NativeIndex(Some(pages[0].clone()))),
+        };
+        assert!(encode_frame(&full, CONTROL_MAX_FRAME).is_ok());
+        let huge = vec![0; NATIVE_INDEX_PAGE * usize::from(MAX_NATIVE_INDEX_PAGES) + 1];
+        assert!(NativeIndexPage::split(1, &huge).is_none());
+        assert_eq!(NativeIndexPage::split(1, b"").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invite_resolution_round_trips_at_protocol_24() {
+        assert_eq!(PROTOCOL_VERSION, 24);
         let request = ClientMessage::Request {
             id: 7,
             request: Request::ResolveInvite {

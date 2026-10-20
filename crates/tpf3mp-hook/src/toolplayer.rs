@@ -472,6 +472,9 @@ fn before(tool: Tool, this: usize) {
 
 extern "system" fn before_street(this: usize) {
     before(Tool::Street, this);
+    // The street and track tools continue from the room's segment, from
+    // the tool's own frame ([`crate::toolchain`]).
+    let _ = std::panic::catch_unwind(|| crate::toolchain::on_step(this));
 }
 extern "system" fn before_modifier(this: usize) {
     before(Tool::Modifier, this);
@@ -706,6 +709,11 @@ fn install_tools(resolved: &ResolvedProfile) -> Vec<String> {
         match detour(step_at.address, entry, original) {
             Ok(()) => {
                 any = true;
+                if tool == Tool::Street {
+                    // Its frame also lets the tools continue from the
+                    // room's segment ([`crate::toolchain`]).
+                    crate::toolchain::set_step_hooked(true);
+                }
                 if tool == Tool::Bulldozer {
                     lines.push(install_setter(resolved));
                 }

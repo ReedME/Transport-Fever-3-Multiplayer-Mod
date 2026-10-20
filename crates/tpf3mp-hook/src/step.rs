@@ -65,8 +65,8 @@ use tpf3mp_bridge::{
     StepGate,
 };
 use tpf3mp_proto::{
-    ChatText, Event, EventBody, FixedBytes, LaneDigest, Payload, PlayerId, Seal, Secret, Speed,
-    action::Action,
+    ChatText, Event, EventBody, FixedBytes, LaneDigest, Payload, PlayerId, RoomId, Seal, Secret,
+    Speed, action::Action,
 };
 
 use crate::cadence::{Cadence, Choice, Pick};
@@ -187,6 +187,8 @@ pub trait GameControl: Send {
     fn room_notice(&mut self, notice: &Notice);
     /// Tells the game's Multiplayer window which player is this game's.
     fn set_me(&mut self, player: PlayerId);
+    /// The stable room identity, which survives reconnects and restores.
+    fn set_room(&mut self, room: RoomId);
     /// The mods the room's worlds load with (`ToHook::Begin`'s `mods`).
     fn set_mods(&mut self, mods: Option<ModLists>);
     /// The number of a world whose GUI started with the mod linked, since
@@ -969,6 +971,7 @@ impl<G: RoomGate> StepDriver<G> {
         let now = Instant::now();
         match notice {
             Notice::Diverged { step, lanes } => {
+                crate::log::lines(&crate::persons::freed_ids::trace::incident_lines(*step));
                 let Some(ask) =
                     self.dumps
                         .diverged(*step, lanes, next, self.checkpoint_interval, now)
@@ -1005,6 +1008,9 @@ impl<G: RoomGate> StepDriver<G> {
                 {
                     None => {}
                     Some(Ok(ask)) => {
+                        crate::log::lines(&crate::persons::freed_ids::trace::incident_lines(
+                            ask.diverged,
+                        ));
                         self.log.push(format!(
                             "{} asks for a lane dump: lanes {} at steps {} (step {} diverged there)",
                             from.as_str(),
@@ -1261,6 +1267,10 @@ impl<G: RoomGate> StepDriver<G> {
     /// The room began a game: follow it from here. `place` says where the
     /// game is, for the log.
     fn began(&mut self, begin: &Begin, place: &str) {
+        if let Err(why) = validate_scan_plan(begin.scan_plan, crate::netread::configured_plan()) {
+            self.hold(why);
+            return;
+        }
         self.log.push(format!(
             "the room began a game{place}: rules {}, {} steps a second, checkpoints every {}",
             begin.rules.as_str(),
@@ -1272,6 +1282,7 @@ impl<G: RoomGate> StepDriver<G> {
         crate::interval::SLOTS.next_epoch();
         self.game.me = Some(begin.player);
         self.control.set_me(begin.player);
+        self.control.set_room(begin.room);
         match &begin.mods {
             Some(mods) => self.log.push(format!(
                 "the room's worlds load with the {} shared mods and this player's {} personal ones",
@@ -1411,6 +1422,7 @@ impl<G: RoomGate> StepDriver<G> {
     /// The room's world is loaded and runs `next_step` next: the reseed and
     /// the order measurement number updates by the room's steps from here.
     fn world_loaded(&mut self, next_step: u64) {
+        crate::persons::freed_ids::trace::reset_world();
         self.next_step = Some(next_step);
         // The released counter starts again here, whatever world ran before;
         // so do the batches the interval times (new GameSims).
@@ -1614,6 +1626,20 @@ pub fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::remove_file(from)
 }
 
+/// Validate before loads, rules, cadence or room steps can mutate this game.
+fn validate_scan_plan(
+    room: tpf3mp_proto::ScanPlan,
+    local: Result<tpf3mp_proto::ScanPlan, &str>,
+) -> Result<(), String> {
+    let local = local.map_err(|why| format!("invalid local world scan configuration: {why}"))?;
+    if !room.is_valid() || room != local {
+        return Err(format!(
+            "world scan plan differs from the room: local {local:?}, room {room:?}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{collections::VecDeque, path::PathBuf};
@@ -1622,7 +1648,8 @@ pub(crate) mod tests {
     use tpf3mp_proto::{FixedBytes, PlayerId, RulesName};
 
     use super::*;
-    use crate::lua::tests::depot_build;
+    // Driver calls update the process-wide seed step used by the Lua link.
+    use crate::lua::tests::{SERIAL, depot_build};
 
     /// A room that answers from a script.
     #[derive(Default)]
@@ -1838,6 +1865,7 @@ pub(crate) mod tests {
         pub(crate) load_failure: Option<String>,
         pub(crate) room_notices: Vec<Notice>,
         pub(crate) me: Option<PlayerId>,
+        pub(crate) room: Option<RoomId>,
         pub(crate) mods: Option<ModLists>,
         pub(crate) world_up: Option<u64>,
         /// The worlds the game has had ([`GameControl::world_mark`]).
@@ -1889,6 +1917,9 @@ pub(crate) mod tests {
         fn set_me(&mut self, player: PlayerId) {
             self.state.lock().unwrap().me = Some(player);
         }
+        fn set_room(&mut self, room: RoomId) {
+            self.state.lock().unwrap().room = Some(room);
+        }
         fn set_mods(&mut self, mods: Option<ModLists>) {
             self.state.lock().unwrap().mods = mods;
         }
@@ -1919,6 +1950,8 @@ pub(crate) mod tests {
 
     pub(crate) fn begin() -> Begin {
         Begin {
+            room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             rules: RulesName::new("native").unwrap(),
             steps_per_second: 5,
             checkpoint_interval: 50,
@@ -1984,11 +2017,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_mismatched_scan_plan_holds_before_load_or_step() {
+        let mut script = Script::default();
+        let mut wrong = begin();
+        wrong.scan_plan = tpf3mp_proto::ScanPlan::from_values(Some("on"), Some("5x10")).unwrap();
+        script.begin.push_back(Some(wrong));
+        script.gates.push_back(StepGate::Load(Load {
+            file: None,
+            next_step: 1,
+            world_epoch: 1,
+        }));
+        let (mut driver, state) = driver_with(script);
+        let mut calls = Vec::new();
+        assert_eq!(call(&mut driver, &mut calls), Updates::Exactly(0));
+        assert!(matches!(driver.phase(), Phase::Holding(why) if why.contains("scan plan")));
+        assert_eq!(driver.game.me, None);
+        assert_eq!(driver.gate.gates.len(), 1, "the load was never polled");
+        assert!(state.lock().unwrap().load_requests.is_empty());
+    }
+
+    #[test]
+    fn scan_contract_validation_rejects_malformed_configuration_and_invalid_wire_values() {
+        use tpf3mp_proto::ScanPlan;
+        assert!(validate_scan_plan(ScanPlan::DEFAULT, Err("malformed")).is_err());
+        assert!(
+            validate_scan_plan(
+                ScanPlan {
+                    parts: 0,
+                    ..ScanPlan::DEFAULT
+                },
+                Ok(ScanPlan::DEFAULT)
+            )
+            .is_err()
+        );
+        let plan = ScanPlan::from_values(Some("compare"), Some("5x10")).unwrap();
+        assert!(validate_scan_plan(plan, Ok(plan)).is_ok());
+    }
+
+    #[test]
     fn the_rooms_actions_apply_while_the_next_step_is_withheld() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -2039,6 +2114,9 @@ pub(crate) mod tests {
 
     #[test]
     fn ordered_actions_finish_before_resuming_and_are_not_applied_twice() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([StepGate::Wait, StepGate::Run]);
@@ -2068,6 +2146,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_foreign_world_holds_before_pending_room_actions_can_finish() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.push_back(StepGate::Run);
@@ -2092,6 +2173,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_save_waits_for_all_preceding_ordered_actions() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script
@@ -2116,6 +2200,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_failed_or_timed_out_replay_holds_before_any_update() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for timeout in [false, true] {
             let mut script = Script::default();
             script.begin.push_back(Some(begin()));
@@ -2143,10 +2230,14 @@ pub(crate) mod tests {
 
     #[test]
     fn a_batch_ending_at_a_checkpoint_reports_the_lanes_the_game_read() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin_every(3)));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -2191,10 +2282,14 @@ pub(crate) mod tests {
     /// the room began is the game's own.
     #[test]
     fn a_batch_says_whether_it_is_the_rooms_and_the_step_it_starts_at() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.extend([None, Some(begin())]);
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -2226,10 +2321,14 @@ pub(crate) mod tests {
 
     #[test]
     fn a_checkpoint_without_the_worlds_lanes_holds_the_world() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin_every(2)));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -2253,6 +2352,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_game_that_did_not_apply_the_rooms_actions_holds_the_world() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([StepGate::Run, StepGate::Run]);
@@ -2272,6 +2374,9 @@ pub(crate) mod tests {
 
     #[test]
     fn an_action_the_game_cannot_read_holds_the_world_before_its_step() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([StepGate::Run]);
@@ -2291,6 +2396,9 @@ pub(crate) mod tests {
 
     #[test]
     fn the_players_actions_go_to_the_room_only_in_its_game() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(None);
         script.begin.push_back(Some(begin()));
@@ -2311,10 +2419,14 @@ pub(crate) mod tests {
 
     #[test]
     fn the_players_own_actions_come_back_with_their_tickets() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -2380,6 +2492,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_command_the_room_refuses_fails_its_ticket() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(None);
         script.begin.push_back(Some(begin()));
@@ -2418,11 +2533,15 @@ pub(crate) mod tests {
 
     #[test]
     fn the_menus_window_talks_to_the_launcher_before_during_and_after_the_rooms_game() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.lobbies.push_back(lobby_named("at the menu"));
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -2457,6 +2576,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_lobby_that_cannot_be_read_is_logged_once_and_holds_nothing() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let script = Script {
             lobby_fails: true,
             ..Script::default()
@@ -2472,6 +2594,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_link_lost_before_any_room_began_leaves_the_game_playing_alone() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let script = Script {
             begin_fails: true,
             ..Script::default()
@@ -2493,6 +2618,9 @@ pub(crate) mod tests {
 
     #[test]
     fn before_the_room_begins_the_game_steps_as_it_would() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut d, mut calls) = driver(Script::default());
         assert_eq!(call(&mut d, &mut calls), Updates::Own);
         assert_eq!(d.phase(), &Phase::BeforeBegin);
@@ -2500,6 +2628,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_world_up_in_the_lobby_is_told_to_the_agent_once_and_not_in_the_rooms_game() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.extend([None, None, None, Some(begin())]);
         script.gates.push_back(StepGate::Wait);
@@ -2525,10 +2656,14 @@ pub(crate) mod tests {
 
     #[test]
     fn released_steps_run_one_by_one_and_a_withheld_one_holds_the_world() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -2559,6 +2694,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_room_far_ahead_is_caught_up_a_bounded_number_of_steps_a_call() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend((0..40).map(|_| StepGate::Run));
@@ -2576,6 +2714,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_lost_agent_holds_the_world() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([StepGate::Run, StepGate::Run]);
@@ -2592,6 +2733,9 @@ pub(crate) mod tests {
 
     #[test]
     fn the_speed_is_the_rooms_from_the_room_s_game_on_until_it_ends() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(None);
         script.begin.push_back(Some(begin()));
@@ -2615,6 +2759,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_change_in_the_speed_row_asks_the_room_and_joining_asks_nothing() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         let (mut d, mut calls) = driver(script);
@@ -2642,6 +2789,9 @@ pub(crate) mod tests {
 
     #[test]
     fn the_multiplayer_window_hears_the_room_through_the_game_control() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         let heard = vec![
@@ -2657,6 +2807,7 @@ pub(crate) mod tests {
         call(&mut d, &mut calls);
         let state = state.lock().unwrap();
         assert_eq!(state.me, Some(begin().player), "the game's own player");
+        assert_eq!(state.room, Some(begin().room), "the stable room identity");
         assert_eq!(state.room_notices, heard, "what the room said, in order");
     }
 
@@ -2680,6 +2831,7 @@ pub(crate) mod tests {
         let mut script = Script::default();
         script.begin.push_back(Some(begin_every(interval)));
         script.gates.push_back(StepGate::Load(Load {
+            world_epoch: 1,
             file: None,
             next_step: 1,
         }));
@@ -2691,6 +2843,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_divergence_asks_every_game_for_a_lane_dump_and_dumps_here_too() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = room_running(10, 60);
         script.notices.push_back(vec![Notice::Diverged {
             step: 10,
@@ -2724,6 +2879,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_game_that_did_not_diverge_dumps_what_the_rooms_chat_asks() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = room_running(10, 60);
         let ask = crate::lanedump::Ask {
             lanes: vec![0, 3],
@@ -2752,6 +2910,9 @@ pub(crate) mod tests {
 
     #[test]
     fn the_environments_lanes_are_dumped_at_every_checkpoint() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut d, _) = driver(room_running(10, 30));
         d.set_lane_dumps(LaneDumps::new(
             crate::lanedump::Setting::from_env(Some("3")).0,
@@ -2776,6 +2937,9 @@ pub(crate) mod tests {
 
     #[test]
     fn what_the_player_says_reaches_the_room_in_its_game_only() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         let (mut d, mut calls) = driver(script);
@@ -2798,6 +2962,9 @@ pub(crate) mod tests {
 
     #[test]
     fn the_players_preview_reaches_the_room_in_its_game_only() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         let (mut d, mut calls) = driver(script);
@@ -2815,6 +2982,9 @@ pub(crate) mod tests {
 
     #[test]
     fn after_the_room_ends_the_game_steps_on_its_own() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.push_back(StepGate::Ended);
@@ -2826,6 +2996,9 @@ pub(crate) mod tests {
 
     #[test]
     fn leaving_after_a_world_closes_drains_its_session_only_at_the_menu() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([StepGate::Run, StepGate::Run]);
@@ -2850,6 +3023,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_batch_interval_that_is_not_armed_leaves_even_steps_measuring() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend((0..4).map(|_| StepGate::Run));
@@ -2865,6 +3041,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_call_with_nothing_released_is_a_wait_for_the_interval() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([StepGate::Wait, StepGate::Run]);
@@ -2878,6 +3057,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_speed_heard_at_the_menu_paces_the_world_loaded_after() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Joining a 4x room from the main menu: its speed comes before the
         // world, and only once.
         let mut script = Script::default();
@@ -2894,6 +3076,9 @@ pub(crate) mod tests {
 
     #[test]
     fn another_room_can_begin_only_after_returning_to_the_menu() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script {
             reset_ended: true,
             ..Script::default()
@@ -2928,6 +3113,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_save_holds_the_world_until_the_game_saved_and_is_moved_to_the_room() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!("tpf3mp-step-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let written = dir.join("written.sav");
@@ -2963,6 +3151,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_save_the_game_could_not_make_is_reported_failed_and_the_game_goes_on() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([
@@ -2980,11 +3171,15 @@ pub(crate) mod tests {
 
     #[test]
     fn the_rooms_save_is_loaded_and_its_world_plays_once_it_is_up() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         let file = PathBuf::from("worlds/room.sav");
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: Some(file.clone()),
                 next_step: 101,
             }),
@@ -3026,10 +3221,14 @@ pub(crate) mod tests {
     /// state, and the room split.
     #[test]
     fn a_world_the_room_did_not_load_is_held_never_stepped_nor_saved() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -3075,22 +3274,28 @@ pub(crate) mod tests {
     /// makes the room's world the loaded one again.
     #[test]
     fn a_load_the_room_orders_replaces_its_world_and_plays_on() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         let file = PathBuf::from("worlds/room.sav");
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
             StepGate::Run,
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: Some(file.clone()),
                 next_step: 2,
             }),
             StepGate::Run,
             StepGate::Wait,
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: Some(file.clone()),
                 next_step: 3,
             }),
@@ -3128,17 +3333,22 @@ pub(crate) mod tests {
     /// (a rejoin, a rebase) and a held world included.
     #[test]
     fn every_call_says_why_it_runs_the_updates_it_does() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         let file = PathBuf::from("worlds/room.sav");
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
             StepGate::Run,
             StepGate::Wait,
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: Some(file),
                 next_step: 2,
             }),
@@ -3163,15 +3373,20 @@ pub(crate) mod tests {
     /// doing when it held: here a room's load the game could not start.
     #[test]
     fn a_call_that_holds_the_world_says_hold() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
             StepGate::Run,
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: Some(PathBuf::from("worlds/room.sav")),
                 next_step: 2,
             }),
@@ -3194,6 +3409,9 @@ pub(crate) mod tests {
     /// load.
     #[test]
     fn without_closes_another_worlds_gui_tells_a_world_the_room_did_not_load() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let then = WorldMark {
             closed: None,
             started: 1,
@@ -3214,6 +3432,7 @@ pub(crate) mod tests {
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -3234,11 +3453,15 @@ pub(crate) mod tests {
     /// loaded world on: what the per-update reseed numbers updates by.
     #[test]
     fn the_driver_counts_the_rooms_steps_from_the_loaded_world() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(None);
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -3257,6 +3480,9 @@ pub(crate) mod tests {
 
     #[test]
     fn at_the_menu_the_agent_is_told_once_per_arrival_until_the_room_begins() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.extend([None, None, None, None, Some(begin())]);
         script.gates.push_back(StepGate::Wait);
@@ -3282,11 +3508,15 @@ pub(crate) mod tests {
 
     #[test]
     fn the_rooms_save_is_loaded_from_the_menu_and_played_once_its_world_runs() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         let file = PathBuf::from("worlds/room.sav");
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: Some(file.clone()),
                 next_step: 41,
             }),
@@ -3324,9 +3554,13 @@ pub(crate) mod tests {
 
     #[test]
     fn a_load_the_menu_could_not_start_holds_the_world() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.push_back(StepGate::Load(Load {
+            world_epoch: 1,
             file: Some(PathBuf::from("room.sav")),
             next_step: 1,
         }));
@@ -3343,10 +3577,14 @@ pub(crate) mod tests {
 
     #[test]
     fn the_menu_leaves_the_owners_world_and_a_save_to_a_world_up() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut script = Script::default();
         script.begin.push_back(Some(begin()));
         script.gates.extend([
             StepGate::Load(Load {
+                world_epoch: 1,
                 file: None,
                 next_step: 1,
             }),
@@ -3378,6 +3616,8 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod even_steps_over_a_real_link {
     use std::time::Duration;
+
+    use crate::lua::tests::SERIAL;
 
     use tpf3mp_bridge::{BRIDGE_VERSION, ToHook, encode};
     use tpf3mp_ipc::{Config, Link, Role};
@@ -3412,6 +3652,8 @@ mod even_steps_over_a_real_link {
         say(
             &agent,
             &ToHook::Begin {
+                room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 rules: RulesName::new("native").unwrap(),
                 steps_per_second: 5,
                 checkpoint_interval,
@@ -3424,6 +3666,7 @@ mod even_steps_over_a_real_link {
         say(
             &agent,
             &ToHook::Load {
+                world_epoch: 1,
                 file: None,
                 next_step,
             },
@@ -3466,6 +3709,9 @@ mod even_steps_over_a_real_link {
 
     #[test]
     fn steps_released_before_an_event_all_run_at_once_and_none_after_it() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut driver, agent) = playing("barrier", 50, 1, 400);
         release(&agent, 1, 5);
         say(&agent, &ToHook::Apply(left(6)));
@@ -3487,6 +3733,9 @@ mod even_steps_over_a_real_link {
 
     #[test]
     fn a_short_backlog_is_kept_in_reserve_and_the_checkpoint_still_ends_a_batch() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut driver, agent) = playing("reserve", 5, 1, 100);
         release(&agent, 1, 1);
         // At 1x one a call; the only step released is kept back once, so a
@@ -3513,6 +3762,9 @@ mod even_steps_over_a_real_link {
 
     #[test]
     fn a_world_loaded_far_along_counts_its_releases_from_there() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut driver, agent) = playing("far-along", 50, 100_001, 400);
         release(&agent, 100_001, 100_006);
         assert_eq!(step(&mut driver).0, Updates::Exactly(4));
@@ -3524,6 +3776,9 @@ mod even_steps_over_a_real_link {
 
     #[test]
     fn far_behind_it_catches_up_sixteen_a_call() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut driver, agent) = playing("far", 50, 1, 100);
         release(&agent, 1, 40);
         assert_eq!(step(&mut driver).0, Updates::Exactly(16));
@@ -3535,6 +3790,9 @@ mod even_steps_over_a_real_link {
 
     #[test]
     fn a_paused_room_runs_on_to_its_frontier() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut driver, agent) = playing("paused", 50, 1, 100);
         release(&agent, 1, 3);
         say(&agent, &ToHook::Speed(Speed::PAUSED));
@@ -3547,6 +3805,9 @@ mod even_steps_over_a_real_link {
 
     #[test]
     fn off_it_runs_every_step_released() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut driver, agent) = playing("off", 50, 1, 400);
         driver.set_even_steps(false);
         release(&agent, 1, 9);

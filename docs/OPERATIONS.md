@@ -1,8 +1,11 @@
 # Operations
 
-How to run `tpf3mp-server` on a Linux host, starting with the German server
-that already runs `tf2mp-relay`. The deployment mirrors the relay's
-hardened container profile.
+How to run `tpf3mp-server` on a Linux host. The original deployment examples
+below describe upstream's German relay host; they are not an operated
+ReedME service or permission to modify upstream infrastructure. The fork
+uses its own configured servers, repository, images and signing roots.
+Current integration is protocol **24**, bridge **30**, action schema **28**
+and room-log format **11**; see "Upgrades" before opening old room data.
 
 ## What the server needs
 
@@ -21,8 +24,9 @@ hardened container profile.
   - `/data/rooms/snapshots/`: the world snapshots, deduplicated chunks of
     the games' saves. At most 64 GiB by default (`--snapshot-gib`).
 
-  Back up the key and the logs. Snapshots are rebuilt by the next save, so
-  losing them only makes late joiners wait for one.
+  Back up the key, logs and complete snapshot directory together. A missing
+  agreed snapshot can block late joins or restoration; a new save requires
+  a connected replica that still holds that world.
 
 ## First deployment
 
@@ -55,7 +59,7 @@ Compose project (`name: tpf3mp`, so it never mixes with the relay's
 `deploy` project), its own hostname and ports.
 
 1. **The code:** `git clone
-   https://github.com/Juliansgith/Transport-Fever-3-Multiplayer-Mod.git
+   https://github.com/ReedME/Transport-Fever-3-Multiplayer-Mod.git
    /opt/tpf3mp`, at the commit `main` holds.
 2. **The certificate:** `certbot certonly --nginx -d <host>`. Certbot's
    nginx plugin answers the challenge; no site changes.
@@ -87,6 +91,10 @@ sudo rule. It checks every argument and runs no shell:
 ```sh
 ssh <you>@<server> status                 # the container, health, deployed commit
 ssh <you>@<server> logs --since 2h        # --tail 200, --follow
+ssh <you>@<server> logs --grep K7QM2X     # only a session's lines; or a player's (p-…) or room's (r-…)
+ssh <you>@<server> rooms                  # the rooms open now, with their players
+ssh <you>@<server> rooms --invite K7QM2X  # the room a player's invite opens
+ssh <you>@<server> rooms --name ann       # the rooms of players named like ann; --player p-… one player's
 ssh <you>@<server> diagnostics K7QM2X     # a player's diagnostics, or all
 ssh <you>@<server> diagnostics AB2CD3 hook  # one source of a run's
 ssh <you>@<server> diagnostics --name ann   # the sessions of players named like ann
@@ -99,7 +107,8 @@ ssh <you>@<server> deploy 3ad6364         # an earlier commit of main
 commits on it, which passed every check; one deploy runs at a time. SSH
 refuses those accounts a shell, a terminal, file transfer and any
 forwarding, and each use is logged to syslog as `tpf3mp-ctl`, with the
-developer's name (`journalctl -t tpf3mp-ctl`).
+developer's name (`journalctl -t tpf3mp-ctl`), and an invite they looked up
+as `<invite>`: it lets anyone into its room.
 
 - **Setting it up,** once, and after any of its files change:
   `sh deploy/host/install.sh` as root. It checks the sudo rule with
@@ -155,6 +164,12 @@ disk. The log never contains IP addresses or invites.
   launcher shows the player their support code. `docker compose logs |
   grep session=K7QM2X` shows that session; the player ID shows all of that player's sessions,
   and a room ID (`r-…`) the room's life.
+- **A room, by its invite.** A player quotes the invite of a room that
+  misbehaves: `curl http://127.0.0.1:9470/rooms?invite=K7QM2X` gives that
+  room (404 when none open now has it), with its ID, name, phase and
+  players (ID, name, connected). `/rooms` lists every room open now,
+  `?player=p-…` and `?name=ann` (any case) those of a player. The invite
+  itself is never written to a log; the room's ID is: grep for it.
 - **For a bug report:** `./collect-logs.sh` in `deploy/` writes one
   archive: the log of the last 24 hours (`--since 2h` for another window,
   `--for <ID>` for one session, player or room), the container's state
@@ -224,6 +239,21 @@ reach the server: late joiners then wait.
 
 ## Upgrades
 
+The 2026-10-20 ReedME refresh uses protocol 24, bridge 30, action schema 28
+and room-log format 11. This follows the fork's protocol-20 / bridge-29 /
+format-9 repair candidate and upstream's protocol-23 / bridge-29 / format-10
+branch; those reused numbers do not make their layouts compatible. There is
+no old-log migration. Preserve the old server binaries, secret, logs and
+complete snapshot directories together, use fresh data and snapshot
+directories for this fork, and start fresh rooms. Every earlier room-log
+format, including 8, 9 and 10, is refused without rewriting it. Startup checks every log before opening the snapshot store or running
+recovery cleanup. Unidentified first-record formats also refuse startup;
+archive or repair those files deliberately, preserving the complete old data
+directory. Do not point the candidate at live upstream room data. Importing a game
+save into a fresh room applies the documented company-password reset policy.
+The resume upgrade check below applies only to compatible persisted formats;
+it cannot certify this incompatible transition as preserving running rooms.
+
 Before promoting a release that changes the protocol or persistence, run
 the check with the published player/server binaries and the candidate binaries:
 
@@ -238,10 +268,22 @@ save it, restart the server, and verify both players resume the same world.
 It needs the loopback admin port and two consecutive launcher HTTP ports;
 `TPF3MP_CHECK_UI_PORT` changes the first launcher port from its default 47471.
 
+The combined protocol 24 / bridge 30 adds exact room agreement for the
+experimental native scanner alongside producing-world acknowledgements;
+it requires an updated agent, hook and server together. Format-11 room
+starts persist mode, parts and stride. Earlier formats are never recovered
+through upstream's legacy readers in this fork. Existing native-mod
+validation remains in force. A restored
+room cannot silently switch scan algorithms. Native modes remain opt-in,
+with no hard per-update latency bound; all members must start the launcher
+and game with the same valid scan environment settings. The default `off`
+path remains rolling-v1. A scanner mismatch on join or reconnect is refused
+before replacing a seat or loading a world.
+
 Every player must run the server's protocol version. The handshake tells
 players on another version which side to update, and their launchers
 update themselves. Upgrade the server when a release is published, which
-also publishes its image, `ghcr.io/juliansgith/tpf3mp-server:<version>`
+also publishes its image, `ghcr.io/reedme/tpf3mp-server:<version>`
 and `:latest` (`.github/workflows/image.yml`):
 
 ```sh
@@ -461,6 +503,37 @@ the others play on. Their saves are larger too: a 1.4 GB world must upload
 within the 90-minute limit, so at least about 260 KB/s from the player who
 uploads it.
 
+## Native mods
+
+A server can offer its players native mods such as Big Maps
+([NATIVE_MODS.md](NATIVE_MODS.md), "A server's own index"; a proposed
+amendment to D29). Name a registry, a git repository whose `mods.txt` lists
+the mods' own repositories:
+
+```sh
+tpf3mp-server ... --native-mods-registry https://github.com/<owner>/<registry>   --native-mods-every-minutes 60
+```
+
+The server reads the list and each mod's `tpf3mp-native.json` when it
+starts and again every hour (at least every five minutes), and serves the
+index made of them to every launcher that connects. A mod that cannot be
+read, or is malformed, or claims another mod's id is left out with a
+warning in the log; a registry that cannot be read keeps the last index.
+For a GitHub registry it also reads the open pull requests and serves the
+mods they would add as *proposed*, which players see only when they ask
+and install only by choosing them. For each mod on GitHub it reads the
+mod's releases too (and, with none, the repository), for the downloads and
+dates the mod browser shows. Each reading takes one or two of GitHub's API
+calls per mod and one for the pull requests; GitHub lets an unnamed caller
+make 60 an hour, so with more than a couple of dozen mods give a token
+(`TPF3MP_GITHUB_TOKEN`, read-only, public repositories). Without it the
+mods are still served, and those GitHub refused show no downloads. Without
+`--native-mods-registry` the server offers none.
+
+Players trust a server's index as they trust its rooms: the launcher gets
+a room's native mods by itself only from a server the release lists; from a
+server a player set in Settings, only when they ask.
+
 ## Before the first release
 
 Once, in this order. The update key and the server are built into the
@@ -516,7 +589,7 @@ and ping, host new rooms on the closest, and resolve a typed invite only
 after every listed server confirms exactly one credential match. The
 servers know nothing of each other. This is a deployment guide: this code
 change has not configured or deployed regional servers or changed the
-live relay. Regional clients and servers must all run protocol 19 together.
+live relay. Regional clients and servers must all run protocol 24 together.
 
 For each further server:
 
@@ -543,7 +616,7 @@ For each further server:
    a list that does not read.
 4. **Release**: only packages built with the variable know the server.
    Launchers of earlier releases keep playing on the default server alone.
-   Every listed server must be upgraded to the same protocol-19 release
+   Every listed server must be upgraded to the same protocol-24 release
    before publishing that regional client package.
 
 A server that is down is passed over for hosting. A typed invite waits up

@@ -323,6 +323,8 @@ enum Violation {
     SecondHello,
     #[error("a checkpoint or save with more than {MAX_CHECKPOINT_LANES} lanes")]
     TooManyLanes,
+    #[error("the room could not queue a load acknowledgement")]
+    LoadQueueFull,
 }
 
 /// The server side of one admitted client.
@@ -515,7 +517,9 @@ impl Client {
                         GameMessage::Preview(_) => self.previews.take(now, 1),
                         // Like checkpoints: the room ignores reports of
                         // saves it is not deciding.
-                        GameMessage::Checkpoint { .. } | GameMessage::Saved { .. } => true,
+                        GameMessage::Checkpoint { .. }
+                        | GameMessage::Saved { .. }
+                        | GameMessage::Loaded { .. } => true,
                     };
                     if allowed {
                         self.game(message)?;
@@ -552,6 +556,7 @@ impl Client {
                 invite: join.invite,
                 password: join.password,
                 resume: join.resume,
+                scan_plan: join.scan_plan,
                 reply,
             })
             .await?;
@@ -607,6 +612,9 @@ impl Client {
                 }
                 result.map(|()| Response::InviteMatch)
             }
+            Request::NativeIndex { proposed, page } => Ok(Response::NativeIndex(
+                self.shared.native.page(proposed, page),
+            )),
             Request::LeaveRoom => {
                 let handle = self.set_room(None).ok_or(RequestError::NotInRoom)?;
                 let player = self.player;
@@ -867,18 +875,34 @@ impl Client {
                     });
                 }
             }
-            GameMessage::Progress { step } => {
+            GameMessage::Progress { step, world_epoch } => {
                 room.notify(RoomCommand::Progress {
+                    world_epoch,
                     player: self.player,
                     link: self.link.id,
                     step,
                 });
             }
-            GameMessage::Checkpoint { step, lanes } => {
+            GameMessage::Loaded { step, world_epoch } => {
+                if !room.notify(RoomCommand::Loaded {
+                    player: self.player,
+                    link: self.link.id,
+                    world_epoch,
+                    step,
+                }) {
+                    return Err(Violation::LoadQueueFull);
+                }
+            }
+            GameMessage::Checkpoint {
+                step,
+                lanes,
+                world_epoch,
+            } => {
                 if lanes.len() > MAX_CHECKPOINT_LANES {
                     return Err(Violation::TooManyLanes);
                 }
                 room.notify(RoomCommand::Checkpoint {
+                    world_epoch,
                     player: self.player,
                     link: self.link.id,
                     step,
@@ -886,6 +910,7 @@ impl Client {
                 });
             }
             GameMessage::Saved {
+                world_epoch,
                 event,
                 lanes,
                 world,
@@ -894,6 +919,7 @@ impl Client {
                     return Err(Violation::TooManyLanes);
                 }
                 room.notify(RoomCommand::Saved {
+                    world_epoch,
                     player: self.player,
                     link: self.link.id,
                     event,

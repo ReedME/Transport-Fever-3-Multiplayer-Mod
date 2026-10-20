@@ -58,7 +58,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The repository releases come from.
 pub const REPOSITORY: &str = match option_env!("TPF3MP_REPOSITORY") {
     Some(repository) => repository,
-    None => "Juliansgith/Transport-Fever-3-Multiplayer-Mod",
+    None => "ReedME/Transport-Fever-3-Multiplayer-Mod",
 };
 /// The public halves of the keys releases may be signed with, as base64 of
 /// their 32 bytes, separated by commas or spaces. More than one lets the

@@ -9,15 +9,16 @@ use proptest::{collection::vec, prelude::*, sample::Index};
 use tpf3mp_proto::{
     BoundedVec, MAX_PAYLOAD, Payload, Text,
     action::{
-        ACTION_SCHEMA_VERSION, Action, ActionError, AssignLine, Bulldoze, BuyVehicle, CompanyId,
-        CompanyOp, ConsistPart, ConstructionBuild, ConstructionRef, CreateLine, Decoration,
-        EdgeEnds, EdgeKind, EdgeObjectKind, EdgeRef, EditLine, Fraction, LineChange, LineData,
-        LineId, LineStop, Link, Load, LoadMode, LoanOp, LoanTerms, MAX_EDGES, MAX_VERTICES,
-        Network, NewSignal, NodeRef, OldSignal, Param, ParamValue, PlaceSignals, PlaceStop,
-        Polyline, Pos, Pos2, Prospect, ReplaceVehicle, ReplacedPart, Resolve, RoadBuild,
-        SignalEdge, StationId, StopRules, Structure, SubsidyOp, SubsidyRef, Tangent, Terminal,
-        Terraform, TerrainCell, Tint, TownId, TrackBuild, Tram, Transform, UnitDir, VehicleChange,
-        VehicleId, VehicleOp, Vertex,
+        ACTION_SCHEMA_VERSION, Action, ActionError, AssetStroke, AssignLine, Bulldoze, BuyVehicle,
+        CompanyId, CompanyOp, ConsistPart, ConstructionBuild, ConstructionRef, CreateLine,
+        CrossingType, Decoration, EdgeEnds, EdgeKind, EdgeObjectAt, EdgeObjectKind, EdgeRef,
+        EditLine, Fraction, LineChange, LineData, LineId, LineStop, Link, Load, LoadMode, LoanOp,
+        LoanTerms, MAX_EDGES, MAX_VERTICES, Network, NewSignal, NodeRef, OldSignal, PaintGrid,
+        PaintRun, Param, ParamValue, PlaceSignals, PlaceStop, PlacedAsset, Polyline, Pos, Pos2,
+        Prospect, ReplaceVehicle, ReplacedPart, Resolve, RoadBuild, SignalEdge, StationId,
+        StopRules, Structure, SubsidyOp, SubsidyRef, Tangent, Terminal, Terraform, TerrainCell,
+        TerrainPaint, Tint, TownId, TrackBuild, Tram, Transform, UnitDir, VehicleChange, VehicleId,
+        VehicleOp, Vertex,
     },
     lua,
 };
@@ -78,6 +79,9 @@ fn polyline() -> Polyline {
         list(vec![
             Link {
                 precedence: None,
+                position0: None,
+                position1: None,
+                kept: BoundedVec::default(),
 
                 from: 0,
                 to: 1,
@@ -100,6 +104,9 @@ fn polyline() -> Polyline {
             },
             Link {
                 precedence: None,
+                position0: None,
+                position1: None,
+                kept: BoundedVec::default(),
 
                 from: 1,
                 to: 2,
@@ -248,12 +255,14 @@ fn samples() -> Vec<Action> {
             bus_lane: true,
             tram: Tram::Electric,
             polyline: polyline(),
+            crossing_type: None,
         }),
         Action::BuildTrack(TrackBuild {
             track: text("high_speed.lua"),
             style: None,
             catenary: true,
             polyline: polyline(),
+            crossing_type: Some(text("railroad_crossing/era_c_eu.rcr")),
         }),
         Action::Bulldoze(Bulldoze::Edges {
             network: Network::Track,
@@ -276,6 +285,22 @@ fn samples() -> Vec<Action> {
             },
             at: pos(45_000, 3_000, 0),
             model: text("station/street/bus_stop.mdl"),
+        }),
+        Action::Bulldoze(Bulldoze::EdgeObjects {
+            edge: EdgeRef {
+                network: Network::Street,
+                ends: ends(pos(10, 0, 0), pos(90_000, 0, 0)),
+            },
+            objects: list(vec![
+                EdgeObjectAt {
+                    at: pos(45_000, 3_000, 0),
+                    model: text("stations/street/small_stops/small_new_twosided.con"),
+                },
+                EdgeObjectAt {
+                    at: pos(45_000, -3_000, 0),
+                    model: text("stations/street/small_stops/small_new_twosided.con"),
+                },
+            ]),
         }),
         Action::BuildConstruction(ConstructionBuild {
             file: text("station/rail/modular_station/modular_station.con"),
@@ -598,6 +623,29 @@ fn samples() -> Vec<Action> {
                 },
             ]),
         }),
+        Action::Paint(TerrainPaint {
+            materials: PaintGrid::new(-1, 2, 2, 1, list(vec![PaintRun { value: 3, count: 2 }]))
+                .unwrap(),
+            mask: None,
+        }),
+        Action::PlantAssets(AssetStroke {
+            models: list(vec![text("tree.con")]),
+            removed: BoundedVec::empty(),
+            groups: list(vec![list(vec![PlacedAsset {
+                model: 0,
+                transform: Transform {
+                    basis: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+                    origin: pos(1, 0, 0),
+                },
+            }])]),
+        }),
+        Action::SetCrossingType(CrossingType {
+            nodes: list(vec![
+                pos(-4_000, 120_500, 3_250),
+                pos(4_000, 120_500, 3_250),
+            ]),
+            crossing_type: text("infrastructure/railroad_crossing/era_c_eu/era_c_eu.rcr"),
+        }),
     ]
 }
 
@@ -711,6 +759,52 @@ fn a_vehicle_sold_on_arrival_at_its_depot_is_refused_on_the_wire_and_in_lua() {
     assert_eq!(Action::from_payload(&payload).unwrap(), good);
 }
 
+#[test]
+fn a_two_sided_stop_bulldoze_requires_two_refs_for_one_construction() {
+    let action = |objects: Vec<EdgeObjectAt>| {
+        Action::Bulldoze(Bulldoze::EdgeObjects {
+            edge: EdgeRef {
+                network: Network::Street,
+                ends: ends(pos(0, 0, 0), pos(10_000, 0, 0)),
+            },
+            objects: list(objects),
+        })
+    };
+    let object = |x, model| EdgeObjectAt {
+        at: pos(x, 0, 0),
+        model: text(model),
+    };
+    let malformed = [
+        action(vec![]),
+        action(vec![object(2_000, "stations/street/twosided.con")]),
+        action(vec![
+            object(2_000, "stations/street/twosided.con"),
+            object(2_000, "stations/street/twosided.con"),
+        ]),
+        action(vec![
+            object(2_000, "stations/street/twosided.con"),
+            object(2_000, "stations/street/other.con"),
+        ]),
+    ];
+    for bad in malformed {
+        assert!(bad.validate().is_err());
+        assert!(bad.to_payload().is_err());
+        let wire = postcard::to_stdvec(&(ACTION_SCHEMA_VERSION, &bad)).unwrap();
+        assert!(Action::from_payload(&Payload::new(wire).unwrap()).is_err());
+        assert!(lua::action_from_lua(&lua::action_to_lua(&bad).unwrap()).is_err());
+    }
+
+    let good = action(vec![
+        object(2_000, "stations/street/twosided.con"),
+        object(8_000, "stations/street/twosided.con"),
+    ]);
+    assert!(good.validate().is_ok());
+    assert_eq!(
+        Action::from_payload(&good.to_payload().unwrap()).unwrap(),
+        good
+    );
+}
+
 /// A train's replacement: its locomotive kept, turned, and a new coach
 /// behind it.
 fn replacement() -> ReplaceVehicle {
@@ -764,13 +858,13 @@ fn check(bytes: &[u8]) {
 #[test]
 fn every_variant_round_trips() {
     let samples = samples();
-    // Every top-level variant is sampled: postcard tags them 0..=24.
+    // Every top-level variant is sampled: postcard tags them 0..=27.
     let mut tags: Vec<u8> = samples
         .iter()
         .map(|action| postcard::to_stdvec(action).unwrap()[0])
         .collect();
     tags.dedup();
-    assert_eq!(tags, (0..=24).collect::<Vec<u8>>());
+    assert_eq!(tags, (0..=27).collect::<Vec<u8>>());
 
     for action in samples {
         let bytes = postcard::to_stdvec(&action).unwrap();
@@ -957,6 +1051,7 @@ fn a_link_to_a_missing_vertex_is_refused() {
         removals: Vec<EdgeRef>,
         removed_nodes: Vec<NodeRef>,
         junctions: Vec<tpf3mp_proto::action::JunctionChange>,
+        crossing_type: Option<String>,
     }
     let good = polyline();
     let mut vertices = good.vertices.to_vec();
@@ -978,6 +1073,7 @@ fn a_link_to_a_missing_vertex_is_refused() {
         removals: Vec::new(),
         removed_nodes: Vec::new(),
         junctions: Vec::new(),
+        crossing_type: None,
     };
     // The schema version, then Action::BuildTrack.
     let bytes = postcard::to_stdvec(&(ACTION_SCHEMA_VERSION, 1u32, &track)).unwrap();
@@ -1070,5 +1166,85 @@ proptest! {
         let mut versioned = vec![ACTION_SCHEMA_VERSION as u8];
         versioned.extend(bytes);
         check(&versioned);
+    }
+}
+
+/// A level crossing travels as the places of all its nodes, sorted and each
+/// once, and its type by name; a crossing with no node, nodes out of order or
+/// named twice, or a type with no name is refused on the wire and from the mod.
+#[test]
+fn a_crossing_type_names_every_node_once_in_order() {
+    let crossing = samples()
+        .into_iter()
+        .find_map(|action| match action {
+            Action::SetCrossingType(crossing) => Some(crossing),
+            _ => None,
+        })
+        .unwrap();
+    let table = lua::action_to_lua(&Action::SetCrossingType(crossing.clone())).unwrap();
+    let lua::LuaValue::Table(nodes) = table.get("SetCrossingType").unwrap().get("nodes").unwrap()
+    else {
+        panic!("nodes are a sequence");
+    };
+    assert_eq!(
+        nodes[0].1.get("x"),
+        Some(&lua::LuaValue::Number(-4.0)),
+        "a node's place is in metres in the mod"
+    );
+
+    let refused = |crossing: CrossingType, why: &str| {
+        let action = Action::SetCrossingType(crossing);
+        match action.validate() {
+            Err(ActionError::Crossing(said)) => assert_eq!(said, why),
+            other => panic!("{why}: {other:?}"),
+        }
+        let wire = postcard::to_stdvec(&(ACTION_SCHEMA_VERSION, &action)).unwrap();
+        assert!(Action::from_payload(&Payload::new(wire).unwrap()).is_err());
+        assert!(lua::action_from_lua(&lua::action_to_lua(&action).unwrap()).is_err());
+    };
+    let mut none = crossing.clone();
+    none.nodes = BoundedVec::empty();
+    refused(none, "a crossing with no node");
+    let mut reversed = crossing.clone();
+    reversed.nodes = list(vec![crossing.nodes[1], crossing.nodes[0]]);
+    refused(reversed, "nodes not sorted, or one named twice");
+    let mut twice = crossing.clone();
+    twice.nodes = list(vec![crossing.nodes[0], crossing.nodes[0]]);
+    refused(twice, "nodes not sorted, or one named twice");
+    let mut nameless = crossing;
+    nameless.crossing_type = text("");
+    refused(nameless, "a type with no name");
+}
+
+/// A road or track build carries the toolbar's crossing type by its file,
+/// through the wire and the mod's tables alike; one with no name is refused.
+#[test]
+fn a_build_carries_its_toolbars_crossing_type_by_name() {
+    let mut builds: Vec<Action> = samples()
+        .into_iter()
+        .filter(|a| matches!(a, Action::BuildRoad(_) | Action::BuildTrack(_)))
+        .collect();
+    assert_eq!(builds.len(), 2);
+    if let Action::BuildRoad(road) = &mut builds[0] {
+        road.crossing_type = Some(text("railroad_crossing/era_a_eu.rcr"));
+    }
+    for action in &builds {
+        let payload = action.to_payload().unwrap();
+        assert_eq!(&Action::from_payload(&payload).unwrap(), action);
+        let table = lua::action_to_lua(action).unwrap();
+        assert_eq!(&lua::action_from_lua(&table).unwrap(), action);
+    }
+    for mut action in builds {
+        match &mut action {
+            Action::BuildRoad(road) => road.crossing_type = Some(text("")),
+            Action::BuildTrack(track) => track.crossing_type = Some(text("")),
+            _ => unreachable!(),
+        }
+        match action.validate() {
+            Err(ActionError::Crossing(said)) => assert_eq!(said, "a type with no name"),
+            other => panic!("a nameless crossing type: {other:?}"),
+        }
+        let wire = postcard::to_stdvec(&(ACTION_SCHEMA_VERSION, &action)).unwrap();
+        assert!(Action::from_payload(&Payload::new(wire).unwrap()).is_err());
     }
 }

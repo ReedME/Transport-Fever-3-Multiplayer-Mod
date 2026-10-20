@@ -62,16 +62,41 @@ installs also removes the launcher and shortcuts after the setup window
 closes. Windows Settings → Apps has the same uninstall entry. Saves,
 identities and settings remain; removed files go to TPF3-MP's backups.
 
+### Proton and Wine: the Windows ZIP package
+
+Use the Windows x64 ZIP, extract it, and run its `TPF3-MP.exe` in the
+**same Proton/Wine prefix as the Windows game**. The standalone managed
+EXE requires native Windows PowerShell for shortcuts and removal, and
+refuses setup under Wine before changing files. Wine's bundled PowerShell
+is a stub that can report success without executing an installer.
+
+The portable launcher's setup copies only `tpf3mp_1` into the account's
+`3493540/local/staging_area`, verifies every bundled file and its installation
+record, and keeps replaced files in its data folder's `backups`. Repair and
+mod removal use this same Rust path. Game-process enumeration must succeed
+and find no running game before changes; close games in other Wine prefixes
+too, since a prefix can only inspect its own Windows processes. Managed
+Windows shortcuts and registry installation are unavailable in this path.
+
+Linux Steam library paths, including secondary libraries, are translated
+through Wine's `Z:` drive. If auto-discovery still finds another executable,
+pass `--game-exe` with the Windows game's full path. The current native hook
+requires the exact supported Windows build; a native Linux executable cannot
+use the Windows hook. These installation checks do not establish game or
+injection compatibility under Proton; real-game acceptance is still required.
+
 ### Portable packages and other platforms
 
 1. Unpack the package anywhere you can write to, such as your Documents
    folder: the launcher updates the files in it (see "Updates").
 2. **The mod.** Start Transport Fever 3 once, so Steam makes its folder for
    your mods, and close it again. Then:
-   - **Windows:** double-click `INSTALL_TPF3MP.cmd` in the package.
+   - **Native Windows:** double-click `INSTALL_TPF3MP.cmd` in the package.
+   - **Proton/Wine:** start the packaged `TPF3-MP.exe` and use its setup,
+     as described above; do not use the PowerShell scripts.
    - **Linux and macOS:** run `./install.sh` from the package's folder.
 
-   The installer is a script, not a program: open `tools\install.ps1`
+   Native Windows and Linux/macOS installers are readable scripts: open `tools\install.ps1`
    (Windows) or `install.sh` (Linux and macOS) to read exactly what it
    changes. It puts the TPF3-MP mod, `tpf3mp_1`, in Steam's folder for
    your Transport Fever 3 mods, `<Steam>/userdata/<account>/3493540/local/staging_area`,
@@ -451,8 +476,14 @@ protected folder such as Program Files.
   follows you into the next room you create or join: no need to restart
   it.
 - **Your world disagrees.** Every few seconds everyone's game compares the
-  world with the room's. If yours has drifted, the room sends you its world
-  and your game reloads it. A notice says so.
+  world with the room's. If yours has drifted, the room tries to send an
+  agreed replacement for your game to reload. A notice says so. With three
+  or more different worlds, the votes can agree on parts that no one whole
+  world contains. The room then keeps its last agreed save and cannot
+  repair that disagreement automatically; it continues running. If the
+  notices keep returning, the owner should pause play and coordinate a
+  return to a known agreed save with the server operator. There is no
+  automatic rollback to that older save.
 - **Saving.** The room saves everyone's game together from time to time,
   which you notice as a short pause, like an autosave.
 - **Room saves in your save folder.** To load the room's world, your game
@@ -480,9 +511,22 @@ protected folder such as Program Files.
   game's subsidy cards show every taken subsidy as accepted, another
   company's too. A "Transport Workers" subsidy still completes by anyone's
   commuters.
-- **Line waypoints, bridge/tunnel window type changes, Industry
-  Greenification marketing campaigns and Historic Preservation.**
-  These new channels are refused pending a two-player game acceptance run.
+- **Bridge and tunnel types.** Click a bridge or tunnel and pick another
+  type, or none, in its window as usual: it is rebuilt in every player's
+  game. A stop on it stays where it was.
+- **Level crossing types.** The preparatory route supports only a native
+  type-only map proposal. The ordinary window may emit a rebuild even for a
+  type swap; that UI flow is not carried and remains refused, as do rebuilds
+  that change segments or junction settings. `crossings` stays gated off
+  pending ordinary-start two-player acceptance. The type picked in the road
+  or track tool's toolbar for a new crossing is built and waits for its
+  acceptance too: until then each game lays the era's type, as before.
+- **Line waypoints.** Add waypoints to a line's route in the line
+  manager as usual: the line is changed in every player's game, each
+  waypoint on the same lane or, for an aircraft, at the same place.
+- **Industry Greenification marketing campaigns and Historic
+  Preservation.**
+  These channels remain refused pending a two-player game acceptance run.
   Their mechanics are implemented but are not enabled for play yet; see
   [COVERAGE.md](COVERAGE.md).
 - **Prospecting.** Prospect for resources near a town from the
@@ -499,7 +543,11 @@ protected folder such as Program Files.
   there. The company window shows your company's own rank and permits.
 - **Roads, tracks, stations and depots.** Build them with the game's own
   street, track and construction tools: every player's game builds them
-  together, a moment after your click, and your company pays as usual. A
+  together, a moment after your click, and your company pays as usual.
+  After the room builds a segment, choose the next start point. Continuing
+  automatically from that segment is available for controlled testing with
+  `TPF3MP_TOOL_CONTINUE=1`; it is off by default pending an input-cancellation
+  check in the real game. A
   station or depot placed by a road is joined to it, as in single player.
   Street stops, on one side or both, go on with the stop tool; the stop
   goes where your cursor is on the road. The road tools tab works too:
@@ -508,7 +556,8 @@ protected folder such as Program Files.
   with stops keeps them. So do the track menu's tools: electrification,
   a track's type and its decorations (seen with the road tools; the track
   tools are not yet tried in a real game). Remove them, and roads and
-  tracks, with the bulldozer.
+  tracks, with the bulldozer: a two-sided stop goes with one click, and
+  a track takes its signals with it.
 - **Airfields and airports.** Build the game's stock airfield or airport
   from **Air** with a hangar if you want to buy aircraft there. Place roads
   near the passenger building as in the base game. Use **Configure** on
@@ -529,8 +578,11 @@ protected folder such as Program Files.
   pays. Your own game changes the ground only when the room's copy of a
   stroke arrives, so while you hold the mouse down the brush works on the
   ground as it was before your last strokes came back. A stroke of more
-  than 65,536 cells (a square about 1 km across) is refused. Painting the
-  ground and the asset brush (trees, rocks) are not in multiplayer yet.
+  than 65,536 cells (a square about 1 km across) is refused.
+- **Painting the ground and planting.** Paint the ground and use the asset
+  brush (trees, rocks, bushes) as usual: every player's game paints the
+  same texels and builds the same groups of trees, a moment after each
+  stroke, and your company pays. A large stroke goes as several parts.
 - **Town buildings.** Bulldoze a town's building as usual: every player's
   game removes the same building, a moment after your click; your company
   pays the demolition, and the town's opinion of it changes as in single
@@ -538,12 +590,15 @@ protected folder such as Program Files.
   buildings along it with it, as in single player; if by the time it
   arrives the game would take another building than the ones you saw go
   (the town grew meanwhile), nothing is removed in any game and the
-  hook's log says why. Bulldozing trees and other assets is not in
-  multiplayer yet: the bulldozer says so and removes nothing.
+  hook's log says why. Bulldozing trees and rocks works the same way:
+  every game takes the same ones out of their group.
 - **Vehicles and lines.** Buy vehicles in a depot's store, make and change
   lines in the line manager, and send vehicles out, stop them or sell
   them, as usual: every player's game does it together, and your window
-  hears it a moment after your click.
+  hears it a moment after your click. On Steam build 40420, station clicks
+  made while a new line waits for the room are kept in order. On other
+  supported builds, wait for the new line to appear before adding its next
+  station; the copied line window has only been verified for build 40420.
 - **Companies.** Everyone starts in the save's own company, together. In
   the Multiplayer window you can found a company of your own, join
   another, rename or recolour yours, and dissolve it once you are its last
@@ -594,19 +649,28 @@ protected folder such as Program Files.
   depots. The room's first company is everyone's: it has no head and no
   password. The game's company window renames your company too.
 - **Terrain.** Raise, lower, smooth, flatten and the heightmap brush share
-  their height changes through the room. Terrain paint and asset brushes
-  are still refused until their own multiplayer support is validated.
+  their height changes through the room, and so do terrain paint and the
+  asset brush.
 - **Achievements.** A game with TPF3-MP active still earns achievements:
   the mod keeps them on, as the game lets a mod do. This holds even when
   the save has other mods that would switch them off.
 - **Not in multiplayer yet.** What the room cannot share with everyone yet
   does not happen in your game either. The game bar says "Not in
   multiplayer yet: …" for what the game's windows do that the room does
-  not carry yet. Junction tools (lane arrows, crosswalks and traffic-light
-  settings) have an implementation behind `strict_junctions`, off until
-  the two-player acceptance check in HOOKS.md passes. With it off, these
-  tools, and a tool that would move a stop or signal onto another stretch of road, show "Not in
-  multiplayer yet" and build nothing: the tool says why.
+  not carry yet. Full junction editing (lane arrows, crosswalks, lights,
+  phases and reset) remains behind `strict_junctions`, off by default. With
+  it off, only the junction window's double-slip toggle is accepted; at a
+  track-only node, its observed Auto-to-No preference side effect is kept.
+  Other junction edits and crossing-tool tram-lane edits still show "Not in
+  multiplayer yet" and build nothing. So does a tool that would move a stop
+  or signal onto another stretch of road. A track started
+  or ended between a track's signals now keeps each signal on the piece of
+  the cut track the tool chose (`splitSignals`; accepted in a two-game room
+  on build 40420). Mods' signals go too. A waypoint on the cut track still
+  stops the build. A track started close to a node of a track with
+  signals, where the tool moves that node and puts the signal back on the
+  redrawn track, keeps the old signal there too (`refitSignals`; accepted
+  in a two-game room on build 40420).
 
 ## Playtesting before the game is out
 

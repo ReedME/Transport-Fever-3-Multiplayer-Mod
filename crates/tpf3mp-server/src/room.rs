@@ -16,14 +16,15 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::MissedTickBehavior,
 };
+use tpf3mp_nativemods::{index::Setting, terms::settings_digest};
 use tpf3mp_net::{bulk, close};
 use tpf3mp_proto::{
     BannerId, ChatText, ContentFingerprint, ContentManifest, Event, EventBody, FRAME_HEADER_LEN,
-    FixedBytes, IntentRejection, Invite, LaneDigest, LoadingStage, MemberView, Payload, Platform,
-    PlayerId, RequestError, Resume, RoomDeclaration, RoomId, RoomListing, RoomMods, RoomPhase,
-    RoomSettings, RoomView, RulesName, SavedWorld, Seal, Secret, ServerMessage, SnapshotId, Speed,
-    StartSave, StartView, TURN_MAX_FRAME, Text, Turn, TurnMessage, TurnStart, WorldOffer,
-    decode_frame, encode_frame,
+    FixedBytes, IntentRejection, Invite, LaneDigest, LoadingStage, MemberView, NativeMod, Payload,
+    Platform, PlayerId, RequestError, Resume, RoomDeclaration, RoomId, RoomListing, RoomMods,
+    RoomPhase, RoomSettings, RoomView, RulesName, SavedWorld, Seal, Secret, ServerMessage,
+    SnapshotId, Speed, StartSave, StartView, TURN_MAX_FRAME, Text, Turn, TurnMessage, TurnStart,
+    WorldOffer, decode_frame, encode_frame, native_term_version_is_full,
 };
 use tpf3mp_snapshot::{Manifest, ManifestId};
 use tracing::{debug, error, info, warn};
@@ -37,8 +38,8 @@ use crate::{
     persist::{self, Base, LogError, RoomLog, StartMember, StartRecord},
     ruleset::{RulesMenu, Ruleset},
     snapshots::{
-        self, Agreed, Candidates, Pointer, SAVE_DEADLINE, SavePoint, SaveReport, SaveRound, Saves,
-        Snapshots, UPLOAD_START, Upload,
+        self, Agreed, Candidates, Pointer, PointerWrites, SAVE_DEADLINE, SavePoint, SaveReport,
+        SaveRound, Saves, Snapshots, UPLOAD_START, Upload,
     },
     verdict::{self, Report, Verdict},
 };
@@ -150,14 +151,13 @@ impl Declared {
         }
     }
 
-    /// A running game's content as its log keeps it, the manifest alone,
-    /// after a restart: the room's mods are told again from it, each by its
-    /// id, so a newcomer still learns the whole list rather than what a
-    /// `ContentDiff` names. What players were told of each (name, source,
-    /// Mod Hub number) and the settings are not kept: the game's world
-    /// carries its own settings. A manifest that is no room's list (a
-    /// summarised tail, too many mods) tells none, as before.
-    pub(crate) fn restored(manifest: ContentManifest) -> Self {
+    /// Restores a current-format declaration with the exact native settings its
+    /// manifest names. Native mismatch is an inconsistent start record and
+    /// must stop recovery rather than becoming invented defaults.
+    pub(crate) fn restored_with_native(
+        manifest: ContentManifest,
+        native: Vec<NativeMod>,
+    ) -> Result<Self, tpf3mp_proto::RoomModsError> {
         let info = manifest
             .mods
             .iter()
@@ -172,11 +172,31 @@ impl Declared {
             room: tpf3mp_proto::RoomConfig {
                 info,
                 params: Vec::new(),
+                native,
             },
         };
         match declaration.validate() {
-            Ok(()) => Self::with_room(declaration),
-            Err(_) => Self::new(declaration.manifest),
+            Ok(()) => {
+                if let Some(native) = declaration
+                    .room
+                    .native
+                    .iter()
+                    .find(|native| !native_settings_match_version(native))
+                {
+                    return Err(tpf3mp_proto::RoomModsError::NativeSetting(
+                        native.id.as_str().to_owned(),
+                    ));
+                }
+                Ok(Self::with_room(declaration))
+            }
+            Err(_)
+                if declaration.manifest.native.is_empty() && declaration.room.native.is_empty() =>
+            {
+                // Preserve the old behavior for non-native manifests that
+                // did not describe a complete room mod list.
+                Ok(Self::new(declaration.manifest))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -199,6 +219,38 @@ impl Declared {
     fn told(&self) -> Option<(RoomMods, [u8; 32])> {
         self.room.clone()
     }
+}
+
+fn native_settings_match_version(native: &NativeMod) -> bool {
+    let settings: BTreeMap<String, Setting> = native
+        .settings
+        .iter()
+        .map(|setting| {
+            let value = match &setting.value {
+                tpf3mp_proto::NativeValue::Bool(value) => Setting::Bool(*value),
+                tpf3mp_proto::NativeValue::Int(value) => Setting::Int(*value),
+                tpf3mp_proto::NativeValue::Text(value) => Setting::Text(value.as_str().to_owned()),
+            };
+            (setting.key.as_str().to_owned(), value)
+        })
+        .collect();
+    let digest = settings_digest(&settings);
+    let expected = &digest[..10];
+    native
+        .version
+        .as_str()
+        .rsplit_once('+')
+        .is_some_and(|(_, suffix)| {
+            native_term_version_is_full(native.version.as_str()) && suffix.starts_with(expected)
+        })
+}
+
+fn native_settings_are_persistable(declared: &Declared) -> bool {
+    let Some((room, _)) = &declared.room else {
+        return declared.manifest.native.is_empty();
+    };
+    room.native.len() == declared.manifest.native.len()
+        && room.native.iter().all(native_settings_match_version)
 }
 
 /// A digest of what members are told of the room's mods.
@@ -224,6 +276,7 @@ pub(crate) enum RoomCommand {
         invite: Invite,
         password: Option<Text<64>>,
         resume: Option<Resume>,
+        scan_plan: tpf3mp_proto::ScanPlan,
         reply: Reply<RoomView>,
     },
     Leave {
@@ -305,6 +358,13 @@ pub(crate) enum RoomCommand {
         player: PlayerId,
         link: u64,
         step: u64,
+        world_epoch: u64,
+    },
+    Loaded {
+        player: PlayerId,
+        link: u64,
+        world_epoch: u64,
+        step: u64,
     },
     /// Where a member's game is with the room's world while it comes in.
     Loading {
@@ -319,12 +379,14 @@ pub(crate) enum RoomCommand {
     Checkpoint {
         player: PlayerId,
         link: u64,
+        world_epoch: u64,
         step: u64,
         lanes: Vec<LaneDigest>,
     },
     Saved {
         player: PlayerId,
         link: u64,
+        world_epoch: u64,
         event: u64,
         lanes: Vec<LaneDigest>,
         world: Option<SavedWorld>,
@@ -616,9 +678,13 @@ struct Member {
     /// The snapshot this member's connection may fetch.
     offered: Option<SnapshotId>,
     /// The world this member's game last loaded, as far as the room knows:
-    /// set when one goes out to it, kept when the player reconnects and
+    /// set once its load is acknowledged, kept when the player reconnects and
     /// resumes (its game keeps playing that world), unknown after a restart.
     loaded: Option<SnapshotId>,
+    /// Epoch the current stream reports; zero until a stream is opened.
+    world_epoch: u64,
+    /// Frontier of an ordered world, until explicitly acknowledged.
+    load_step: Option<u64>,
     /// When the room last rebased this member.
     rebased: Option<Instant>,
     /// The first event of this member's turn stream: it can report only
@@ -803,6 +869,7 @@ pub(crate) struct Room {
     log: Option<RoomLog>,
     /// A compaction of the log in progress.
     compaction: Option<Compaction>,
+    snapshot_writes: Arc<std::sync::Mutex<PointerWrites>>,
     /// The log's size at which it is compacted next.
     compact_at: u64,
     /// See [`RoomEnv::compact_log_at`].
@@ -864,6 +931,10 @@ pub(crate) enum RecoverError {
     Version(u16),
     #[error("the start record's room settings are out of range")]
     Settings,
+    #[error("the start record's native settings are missing or do not match its manifest")]
+    NativeSettings,
+    #[error("the log's native room terms lack a full package identity")]
+    NativeIdentity,
     #[error("the room is played by rules \"{0}\", which this server no longer offers")]
     UnknownRules(String),
     #[error("the log's file name does not match its room")]
@@ -904,6 +975,18 @@ pub(crate) struct Summary {
     /// room out of every list. A room restored after a restart is private
     /// until created again: its log keeps no listing and no invite.
     pub(crate) listing: Option<RoomListing>,
+    /// Who is in the room, for the operator's admin endpoint (`/rooms`);
+    /// never in the room list.
+    pub(crate) members: Vec<SummaryMember>,
+}
+
+/// A member as the admin endpoint shows it: who, under which name, and
+/// whether connected now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SummaryMember {
+    pub(crate) player: PlayerId,
+    pub(crate) name: Text<32>,
+    pub(crate) connected: bool,
 }
 
 /// A room's [`Summary`], shared with the directory.
@@ -944,6 +1027,7 @@ impl Room {
             timeouts: spec.env.timeouts,
             log: None,
             compaction: None,
+            snapshot_writes: Arc::default(),
             compact_at: spec.env.compact_log_at,
             compact_log_at: spec.env.compact_log_at,
             unattended_since: None,
@@ -968,6 +1052,7 @@ impl Room {
                 phase: RoomPhase::Lobby,
                 competitive: false,
                 listing: spec.listing,
+                members: Vec::new(),
             })),
         };
         room.members.push(Member::new(owner));
@@ -999,6 +1084,19 @@ impl Room {
         if !start.settings.is_valid() {
             return Err(RecoverError::Settings);
         }
+        if start.manifest.is_none() && !start.native_mods.is_empty() {
+            return Err(RecoverError::NativeSettings);
+        }
+        if start.manifest.as_ref().is_some_and(|stored| {
+            stored
+                .clone()
+                .manifest()
+                .native
+                .iter()
+                .any(|term| !native_term_version_is_full(term.version.as_str()))
+        }) {
+            return Err(RecoverError::NativeIdentity);
+        }
         // A room keeps its rules for good; the server must still have them.
         let mut ruleset = match menu.find(Some(start.rules.as_str())) {
             Some(choice) => (choice.factory)(),
@@ -1008,6 +1106,15 @@ impl Room {
         if path.file_stem() != Some(std::ffi::OsStr::new(&expected)) {
             return Err(RecoverError::Misnamed);
         }
+        let restored_content = start
+            .manifest
+            .clone()
+            .map(|stored| {
+                let manifest = stored.manifest();
+                Declared::restored_with_native(manifest, start.native_mods.clone())
+                    .map_err(|_| RecoverError::NativeSettings)
+            })
+            .transpose()?;
         let mut game = Game::new(start.settings, start.history);
         // Players the owner removed.
         let mut banned = BTreeSet::new();
@@ -1119,10 +1226,7 @@ impl Room {
             None => start.members.first().and_then(|member| member.content),
         };
         // The manifest only counts if it is the game's.
-        let game_content = start
-            .manifest
-            .clone()
-            .map(Declared::restored)
+        let game_content = restored_content
             .filter(|declared| Some(declared.fingerprint) == content)
             .map(Arc::new);
         let members: Vec<Member> = game
@@ -1151,6 +1255,8 @@ impl Room {
                 needs: Needs::Nothing,
                 offered: None,
                 loaded: None,
+                world_epoch: 0,
+                load_step: None,
                 rebased: None,
                 stream_from: 0,
             })
@@ -1216,6 +1322,7 @@ impl Room {
             timeouts: env.timeouts,
             log: Some(log),
             compaction: None,
+            snapshot_writes: Arc::default(),
             compact_at,
             compact_log_at: env.compact_log_at,
             // Nobody is connected after a restart; the abandon timeout runs
@@ -1243,6 +1350,7 @@ impl Room {
                 phase: RoomPhase::Running,
                 competitive: false,
                 listing: None,
+                members: Vec::new(),
             })),
         };
         room.refresh_summary();
@@ -1276,6 +1384,15 @@ impl Room {
             Phase::Lobby => RoomPhase::Lobby,
             Phase::Running(_) => RoomPhase::Running,
         };
+        summary.members = self
+            .members
+            .iter()
+            .map(|member| SummaryMember {
+                player: member.player,
+                name: member.name.clone(),
+                connected: member.link.is_some(),
+            })
+            .collect();
     }
 
     /// The owner of a public room updates what the list shows of it.
@@ -1392,9 +1509,10 @@ impl Room {
                 invite,
                 password,
                 resume,
+                scan_plan,
                 reply,
             } => {
-                let result = self.join(member, &invite, password.as_ref(), resume);
+                let result = self.join(member, &invite, password.as_ref(), resume, scan_plan);
                 let joined = result.is_ok();
                 let _ = reply.send(result);
                 if joined {
@@ -1496,22 +1614,42 @@ impl Room {
                 payload,
                 secret,
             } => self.intent(player, client_seq, payload, secret.as_ref()),
-            RoomCommand::Progress { player, link, step } => self.progress(player, link, step),
+            RoomCommand::Progress {
+                player,
+                link,
+                step,
+                world_epoch,
+            } => self.progress(player, link, world_epoch, step),
+            RoomCommand::Loaded {
+                player,
+                link,
+                world_epoch,
+                step,
+            } => self.loaded(player, link, world_epoch, step),
             RoomCommand::Loading { player, stage } => self.loading(player, stage, Instant::now()),
             RoomCommand::Preview { player, preview } => self.preview(player, preview),
             RoomCommand::Checkpoint {
                 player,
                 link,
+                world_epoch,
                 step,
                 lanes,
-            } => self.checkpoint(player, link, step, lanes, Instant::now()),
+            } => self.checkpoint(player, link, world_epoch, step, lanes, Instant::now()),
             RoomCommand::Saved {
                 player,
                 link,
+                world_epoch,
                 event,
                 lanes,
                 world,
-            } => self.saved(player, link, event, lanes, world, Instant::now()),
+            } => self.saved(
+                player,
+                link,
+                (world_epoch, event),
+                lanes,
+                world,
+                Instant::now(),
+            ),
             RoomCommand::Fetch {
                 player,
                 link,
@@ -1594,6 +1732,7 @@ impl Room {
         invite: &Invite,
         password: Option<&Text<64>>,
         resume: Option<Resume>,
+        scan_plan: tpf3mp_proto::ScanPlan,
     ) -> Result<RoomView, RequestError> {
         let now = Instant::now();
         let content = new.content.as_ref().map(|declared| declared.fingerprint);
@@ -1608,6 +1747,9 @@ impl Room {
                 return Err(RequestError::BadInvite);
             }
             _ => return Err(RequestError::BadInvite),
+        }
+        if !scan_plan.is_valid() || scan_plan != self.settings.scan_plan {
+            return Err(RequestError::ScanPlanMismatch);
         }
         if let Some(index) = self.members.iter().position(|m| m.player == new.player) {
             // The same player again, e.g. after reconnecting: the new
@@ -1632,6 +1774,13 @@ impl Room {
                     Rejoin::World
                 }
                 Phase::Running(game) => {
+                    if resume.is_some_and(|resume| {
+                        resume.world_epoch == 0
+                            || (self.members[index].world_epoch != 0
+                                && resume.world_epoch != self.members[index].world_epoch)
+                    }) {
+                        return Err(RequestError::ResumeUnavailable);
+                    }
                     Rejoin::Stream(game.resume_feed(self.id, self.settings, &self.rules, resume)?)
                 }
             };
@@ -1645,7 +1794,6 @@ impl Room {
             member.name = new.name;
             member.platform = new.platform;
             member.streaming = false;
-            member.offered = None;
             // A new connection has not been told how its content differs.
             member.told_diff = None;
             member.told_room = None;
@@ -1660,6 +1808,7 @@ impl Room {
                     member.needs = Needs::Nothing;
                     if let TurnFeed::Open { start, .. } = &feed {
                         member.stream_from = start.next_event;
+                        member.world_epoch = start.world_epoch;
                     }
                     member.streaming = new.link.turns.try_send(feed).is_ok();
                 }
@@ -2040,6 +2189,16 @@ impl Room {
         {
             return Err(RequestError::ContentMismatch);
         }
+        if self.members[0]
+            .declared
+            .as_ref()
+            .is_some_and(|declared| !native_settings_are_persistable(declared))
+        {
+            // A native manifest without a matching RoomDeclaration, or with
+            // settings that disagree with its term, cannot be told faithfully
+            // to members after recovery.
+            return Err(RequestError::InvalidContent);
+        }
         if matches!(self.start_world, Some(StartWorld::Asked { .. })) {
             return Err(RequestError::StartWorldPending);
         }
@@ -2087,6 +2246,8 @@ impl Room {
                 continue;
             }
             member.needs = Needs::Nothing;
+            member.world_epoch = open.world_epoch;
+            member.load_step = Some(open.sealed_through);
             if let Some(link) = &member.link {
                 member.streaming = link
                     .turns
@@ -2149,7 +2310,7 @@ impl Room {
             manifest: self
                 .game_content
                 .as_ref()
-                .map(|declared| declared.manifest.clone()),
+                .map(|declared| persist::StoredManifest::from(&declared.manifest)),
             owner: self.owner,
             max_players: self.max_players,
             settings: self.settings,
@@ -2166,6 +2327,11 @@ impl Room {
                 })
                 .collect(),
             base,
+            native_mods: self
+                .game_content
+                .as_ref()
+                .and_then(|declared| declared.room.as_ref())
+                .map_or_else(Vec::new, |(room, _)| room.native.clone()),
         }
     }
 
@@ -2326,7 +2492,23 @@ impl Room {
         }
     }
 
-    fn progress(&mut self, player: PlayerId, link: u64, step: u64) {
+    fn loaded(&mut self, player: PlayerId, link: u64, world_epoch: u64, step: u64) {
+        let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|m| m.player == player && m.link.as_ref().is_some_and(|l| l.id == link))
+        else {
+            return;
+        };
+        if member.world_epoch != world_epoch || member.load_step != Some(step) {
+            return;
+        }
+        member.load_step = None;
+        member.loaded = member.offered;
+        self.progress(player, link, world_epoch, step);
+    }
+
+    fn progress(&mut self, player: PlayerId, link: u64, world_epoch: u64, step: u64) {
         let Phase::Running(game) = &self.phase else {
             return;
         };
@@ -2339,6 +2521,9 @@ impl Room {
         else {
             return;
         };
+        if !member.accepts_report(world_epoch) {
+            return;
+        }
         if step > sealed {
             // Executing an unsealed step breaks the protocol's central rule.
             warn!(room = %self.id, %player, step, sealed, "progress beyond the frontier");
@@ -2404,6 +2589,7 @@ impl Room {
         &mut self,
         player: PlayerId,
         link: u64,
+        world_epoch: u64,
         step: u64,
         mut lanes: Vec<LaneDigest>,
         now: Instant,
@@ -2419,6 +2605,9 @@ impl Room {
         else {
             return;
         };
+        if !self.members[order].accepts_report(world_epoch) {
+            return;
+        }
         if step == 0 || !step.is_multiple_of(interval) || step > game.sealed_through {
             debug!(room = %self.id, %player, step, "ignoring a checkpoint that is not due");
             return;
@@ -2543,7 +2732,7 @@ impl Room {
         &mut self,
         player: PlayerId,
         link: u64,
-        event: u64,
+        (world_epoch, event): (u64, u64),
         mut lanes: Vec<LaneDigest>,
         world: Option<SavedWorld>,
         now: Instant,
@@ -2557,7 +2746,7 @@ impl Room {
         };
         // Only a member whose stream carried the save can have made it.
         let member = &self.members[order];
-        if !member.streaming || member.stream_from > event {
+        if !member.accepts_report(world_epoch) || member.stream_from > event {
             debug!(room = %self.id, %player, event, "ignoring a report of a save this member never saw");
             return;
         }
@@ -2813,16 +3002,25 @@ impl Room {
             .into_iter()
             .collect();
         if let Some(snapshots) = &self.snapshots {
+            let writes = Arc::clone(&self.snapshot_writes);
+            writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .request(pointer, released);
             let snapshots = Arc::clone(snapshots);
             let dir = self.data_dir.clone();
             let room = self.id;
             tokio::task::spawn_blocking(move || {
-                if let Some(dir) = dir
-                    && let Err(error) = pointer.write(&dir, &room)
-                {
-                    warn!(%room, %error, "cannot record the room's snapshot; a restart will forget it");
+                let result = writes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .commit(pointer, dir.as_deref(), &room);
+                match result {
+                    Ok(released) => snapshots.release(&released),
+                    Err(error) => {
+                        warn!(%room, %error, "cannot record the room's snapshot; preserving the previous restart world")
+                    }
                 }
-                snapshots.release(&released);
             });
         }
         self.offer_worlds(Instant::now());
@@ -2872,8 +3070,25 @@ impl Room {
         if !feeds.is_empty() {
             let served: Vec<usize> = feeds.iter().map(|(index, _)| *index).collect();
             let current = game.saves.current.as_ref().map(Agreed::id);
+            let frontier = game
+                .saves
+                .current
+                .as_ref()
+                .map(|agreed| agreed.point.sealed_through);
             for (index, member) in self.members.iter_mut().enumerate() {
                 if served.contains(&index) {
+                    continue;
+                }
+                // Another member can join while this link is still loading
+                // the world already sent to it. Keep that offer and its epoch
+                // until Loaded; it has not loaded yet, but needs no duplicate.
+                // Explicitly requested feeds above still resend on reconnect.
+                if member.link.is_some()
+                    && member.streaming
+                    && member.offered == current
+                    && member.load_step.is_some()
+                    && member.load_step == frontier
+                {
                     continue;
                 }
                 match refeed(
@@ -2923,6 +3138,11 @@ impl Room {
                 continue;
             };
             let was_streaming = member.streaming;
+            let TurnFeed::Open { start, .. } = &feed else {
+                continue;
+            };
+            let world_epoch = start.world_epoch;
+            let load_step = start.sealed_through;
             member.streaming = link.turns.try_send(feed).is_ok();
             if !member.streaming {
                 // A member already playing whose queue is full would get
@@ -2942,7 +3162,8 @@ impl Room {
             }
             member.needs = Needs::Nothing;
             member.offered = offered;
-            member.loaded = offered;
+            member.world_epoch = world_epoch;
+            member.load_step = Some(load_step);
             // A player still loading the first world keeps holding the
             // clock; anyone else catches up.
             if member.pace != Pace::Loading {
@@ -3018,6 +3239,14 @@ impl Room {
             return;
         };
         let (mut candidates, diverged) = snapshots::decide(&round.reports);
+        if !round.reports.is_empty() && diverged.len() == round.reports.len() {
+            warn!(
+                room = %self.id,
+                event,
+                reports = round.reports.len(),
+                "no complete replica matches the save's lane verdict; promoting no snapshot and retaining the last agreed world; owner intervention may be required"
+            );
+        }
         // Players whose uploads failed go last.
         candidates
             .make_contiguous()
@@ -3120,6 +3349,11 @@ impl Room {
     /// its snapshots.
     fn discard_game(&mut self) {
         self.cancel_compaction();
+        let mut writes = self
+            .snapshot_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_releases = writes.cancel();
         if let Some(log) = self.log.take()
             && let Err(error) = log.delete()
         {
@@ -3129,8 +3363,16 @@ impl Room {
             Pointer::remove(dir, &self.id);
         }
         if let (Some(snapshots), Phase::Running(game)) = (&self.snapshots, &self.phase) {
-            release_in_background(Arc::clone(snapshots), game.saves.held());
+            release_in_background(
+                Arc::clone(snapshots),
+                game.saves
+                    .held()
+                    .into_iter()
+                    .chain(pending_releases)
+                    .collect(),
+            );
         }
+        drop(writes);
         self.drop_start_world();
     }
 
@@ -3433,6 +3675,9 @@ impl Room {
 }
 
 impl Member {
+    fn accepts_report(&self, world_epoch: u64) -> bool {
+        self.streaming && self.world_epoch == world_epoch && self.load_step.is_none()
+    }
     fn new(new: NewMember) -> Self {
         Self {
             player: new.player,
@@ -3456,6 +3701,8 @@ impl Member {
             needs: Needs::Nothing,
             offered: None,
             loaded: None,
+            world_epoch: 0,
+            load_step: None,
             rebased: None,
             stream_from: 0,
         }
@@ -3641,7 +3888,7 @@ fn next_compaction(size: u64, every: u64) -> u64 {
 fn new_history() -> u64 {
     let mut bytes = [0; 8];
     getrandom::fill(&mut bytes).expect("the operating system's random source is available");
-    u64::from_le_bytes(bytes)
+    u64::from_le_bytes(bytes).max(1)
 }
 
 impl Game {
@@ -3782,6 +4029,7 @@ impl Game {
             checkpoint_interval: settings.checkpoint_interval,
             history: self.history(),
             world,
+            world_epoch: self.history(),
         }
     }
 
@@ -3952,8 +4200,10 @@ impl Game {
         resume: Option<Resume>,
     ) -> Result<TurnFeed, RequestError> {
         let stream = self.stream_after(resume)?;
+        let mut start = self.turn_start(room, settings, rules, &stream, None);
+        start.world_epoch = resume.map_or(self.history(), |resume| resume.world_epoch);
         Ok(TurnFeed::Open {
-            start: self.turn_start(room, settings, rules, &stream, None),
+            start,
             backlog: stream.backlog,
         })
     }
@@ -3969,8 +4219,10 @@ impl Game {
     ) -> Result<(TurnFeed, u64), RequestError> {
         let stream = self.stream_from_save(&agreed.point)?;
         let next_event = stream.next_event;
+        let mut start = self.turn_start(room, settings, rules, &stream, Some(agreed.offer()));
+        start.world_epoch = new_history();
         let feed = TurnFeed::Open {
-            start: self.turn_start(room, settings, rules, &stream, Some(agreed.offer())),
+            start,
             backlog: stream.backlog,
         };
         Ok((feed, next_event))
@@ -3980,6 +4232,7 @@ impl Game {
     /// log must still say what the save says about where it stands.
     fn stream_from_save(&self, point: &SavePoint) -> Result<Stream, RequestError> {
         let stream = self.stream_after(Some(Resume {
+            world_epoch: 1,
             after_turn: point.after_turn,
             history: point.history,
         }))?;
@@ -4046,12 +4299,67 @@ impl Game {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::ruleset::{NATIVE, RulesChoice};
-    use tpf3mp_proto::FixedBytes;
+    use tpf3mp_proto::{FixedBytes, ModRef, NativeSetting, NativeValue};
 
     fn native() -> RulesName {
         RulesName::new(NATIVE).unwrap()
+    }
+
+    fn native_terms() -> (ContentManifest, Vec<NativeMod>) {
+        let settings = vec![NativeSetting {
+            key: Text::new("radius").unwrap(),
+            value: NativeValue::Int(37),
+        }];
+        let settings_map = BTreeMap::from([("radius".to_owned(), Setting::Int(37))]);
+        let version = Text::new(format!(
+            "1.2.3+{}{}",
+            &settings_digest(&settings_map)[..10],
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let term = ModRef {
+            id: Text::new("native:bigmap").unwrap(),
+            version: version.clone(),
+        };
+        let manifest = ContentManifest::new(
+            Text::new("40420").unwrap(),
+            vec![ModRef {
+                id: Text::new("tpf3mp_1").unwrap(),
+                version: Text::new("1.0.0").unwrap(),
+            }],
+        )
+        .with_native(vec![term]);
+        let native = NativeMod {
+            id: Text::new("bigmap").unwrap(),
+            version,
+            name: Text::new("Big Maps").unwrap(),
+            settings,
+        };
+        (manifest, vec![native])
+    }
+
+    fn assert_native_terms(room: &Room, expected: &[NativeMod]) {
+        let declared = room
+            .game_content
+            .as_deref()
+            .expect("the original manifest matches the game content");
+        let (told, _) = declared.told().expect("native room terms are retained");
+        assert_eq!(told.native, expected);
+        assert_eq!(told.manifest(), declared.manifest);
+    }
+
+    fn write_record(path: &Path, payload: &[u8], records: &[Vec<u8>]) {
+        let mut bytes = Vec::new();
+        for payload in std::iter::once(payload).chain(records.iter().map(Vec::as_slice)) {
+            bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+            bytes.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+            bytes.extend_from_slice(payload);
+        }
+        std::fs::write(path, bytes).unwrap();
     }
 
     /// After a restart, a running game's room tells its mods again from the
@@ -4067,7 +4375,7 @@ mod tests {
             Text::new("40408").unwrap(),
             vec![listed("signals"), listed("trees"), listed("tpf3mp_1")],
         );
-        let restored = Declared::restored(manifest.clone());
+        let restored = Declared::restored_with_native(manifest.clone(), Vec::new()).unwrap();
         assert_eq!(restored.fingerprint, manifest.fingerprint());
         let (room, _) = restored.told().expect("the room's mods told again");
         let ids: Vec<&str> = room.mods.iter().map(|m| m.id.as_str()).collect();
@@ -4075,7 +4383,156 @@ mod tests {
         assert_eq!(room.manifest(), manifest);
         // Without TPF3-MP last it is no room's list: none told, as before.
         let other = ContentManifest::new(Text::new("40408").unwrap(), vec![listed("signals")]);
-        assert!(Declared::restored(other).told().is_none());
+        assert!(
+            Declared::restored_with_native(other, Vec::new())
+                .unwrap()
+                .told()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn restored_native_room_terms_keep_exact_settings_and_reject_missing_settings() {
+        let (manifest, native) = native_terms();
+        let restored = Declared::restored_with_native(manifest.clone(), native.clone()).unwrap();
+        assert_eq!(restored.fingerprint, manifest.fingerprint());
+        let (told, _) = restored.told().expect("new members are told native terms");
+        assert_eq!(told.native, native);
+        assert_eq!(told.manifest(), manifest);
+
+        let (manifest, _) = native_terms();
+        assert!(Declared::restored_with_native(manifest, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_native_game_needs_room_settings_before_it_can_start_and_be_recovered() {
+        let ordinary = ContentManifest::new(
+            Text::new("40420").unwrap(),
+            vec![ModRef {
+                id: Text::new("tpf3mp_1").unwrap(),
+                version: Text::new("1.0.0").unwrap(),
+            }],
+        );
+        assert!(native_settings_are_persistable(&Declared::new(ordinary)));
+
+        let (manifest, native) = native_terms();
+        assert!(!native_settings_are_persistable(&Declared::new(
+            manifest.clone()
+        )));
+
+        let declaration = RoomDeclaration {
+            manifest,
+            room: tpf3mp_proto::RoomConfig {
+                info: vec![tpf3mp_proto::ModInfo {
+                    name: Text::new("TPF3-MP").unwrap(),
+                    source: Text::new("").unwrap(),
+                    modio: None,
+                }],
+                params: Vec::new(),
+                native,
+            },
+        };
+        declaration.validate().unwrap();
+        assert!(native_settings_are_persistable(&Declared::with_room(
+            declaration
+        )));
+    }
+
+    #[test]
+    fn a_native_game_with_a_stale_settings_digest_cannot_open_a_log() {
+        let dir =
+            std::env::temp_dir().join(format!("tpf3mp-start-native-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = RoomId(FixedBytes([0x86; 16]));
+        let owner = player(1);
+        let (manifest, mut native_mods) = native_terms();
+        native_mods[0].settings[0].value = NativeValue::Int(38);
+        let declaration = RoomDeclaration {
+            manifest,
+            room: tpf3mp_proto::RoomConfig {
+                info: vec![tpf3mp_proto::ModInfo {
+                    name: Text::new("Big Maps").unwrap(),
+                    source: Text::new("").unwrap(),
+                    modio: None,
+                }],
+                params: Vec::new(),
+                native: native_mods,
+            },
+        };
+        declaration.validate().unwrap();
+        let declared = Arc::new(Declared::with_room(declaration));
+        let mut member = test_member();
+        member.player = owner;
+        member.ready = true;
+        member.content = Some(declared.fingerprint);
+        member.declared = Some(declared);
+        let mut room = Room {
+            id,
+            name: Text::new("digest guard").unwrap(),
+            rules: native(),
+            owner,
+            max_players: 4,
+            settings: RoomSettings::DEFAULT,
+            secrets: RoomSecrets {
+                key: hmac::Key::new(hmac::HMAC_SHA256, &[0; 32]),
+                invite_tag: vec![0; 32],
+                password_tag: None,
+            },
+            members: vec![member],
+            phase: Phase::Lobby,
+            ruleset: Box::new(Recorder::default()),
+            tick: Duration::from_millis(100),
+            metrics: Arc::new(Metrics::default()),
+            data_dir: Some(dir.clone()),
+            timeouts: Timeouts {
+                stall: Duration::from_secs(20),
+                load: Duration::from_secs(300),
+                abandoned: Duration::from_secs(600),
+            },
+            log: None,
+            compaction: None,
+            snapshot_writes: Arc::default(),
+            compact_at: u64::MAX,
+            compact_log_at: u64::MAX,
+            unattended_since: None,
+            password_guard: PasswordGuard::new(),
+            secret_budget: SecretBudget::new(),
+            banned: BTreeSet::new(),
+            _share: None,
+            content: None,
+            game_content: None,
+            snapshots: None,
+            start_world: None,
+            closed: false,
+            summary: Arc::new(std::sync::Mutex::new(Summary {
+                name: Text::new("digest guard").unwrap(),
+                rules: native(),
+                owner,
+                players: 1,
+                connected: 0,
+                max_players: 4,
+                has_password: false,
+                phase: RoomPhase::Lobby,
+                competitive: false,
+                listing: None,
+                members: Vec::new(),
+            })),
+            competitive: false,
+        };
+        let path = RoomLog::path_for(&dir, &id);
+
+        let refused = matches!(room.start(owner), Err(RequestError::InvalidContent));
+        let no_log_file = !path.exists();
+        let no_open_log = room.log.is_none();
+        let still_in_lobby = matches!(room.phase, Phase::Lobby);
+        drop(room);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(refused, "stale native settings must refuse game start");
+        assert!(no_log_file, "refused start must not create a room log");
+        assert!(no_open_log, "refused start must not open a room log");
+        assert!(still_in_lobby, "refused start leaves the room in its lobby");
     }
 
     /// The native rules, recording what they apply.
@@ -4099,6 +4556,7 @@ mod tests {
         }
         let feed = |after_turn: Option<u64>| {
             let resume = after_turn.map(|after_turn| Resume {
+                world_epoch: 1,
                 after_turn,
                 history: 1,
             });
@@ -4145,6 +4603,7 @@ mod tests {
                 Some(Resume {
                     after_turn,
                     history,
+                    world_epoch: 1,
                 }),
             )
         };
@@ -4269,6 +4728,120 @@ mod tests {
         Room::recover(path, key, menu, env)
     }
 
+    fn recovery_start(id: RoomId, version: u16) -> StartRecord {
+        StartRecord {
+            version,
+            history: 1,
+            id,
+            name: Text::new("recovery fixture").unwrap(),
+            rules: native(),
+            manifest: None,
+            owner: player(1),
+            max_players: 4,
+            settings: RoomSettings::DEFAULT,
+            invite_tag: vec![0; 32],
+            password_tag: None,
+            members: Vec::new(),
+            base: None,
+            native_mods: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn old_formats_are_rejected_before_decoding_or_changing_any_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        for version in [8_u16, 9, 10] {
+            let id = RoomId(FixedBytes([version as u8; 16]));
+            // Opaque, deliberately incompatible remainder: a format prefix is
+            // enough to refuse both upstream and ReedME's ambiguous format 9.
+            let payload = postcard::to_stdvec(&(version, "an incompatible layout")).unwrap();
+            let path = RoomLog::path_for(dir.path(), &id);
+            write_record(&path, &payload, &[]);
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                recover_by(&path, dir.path(), &recorder_menu()),
+                Err(RecoverError::Version(found)) if found == version
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn current_format_missing_inconsistent_or_tampered_native_settings_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("tpf3mp-v9-native-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (manifest, valid_native) = native_terms();
+        for (ordinal, native_mods) in [
+            Vec::new(),
+            vec![NativeMod {
+                version: Text::new(format!("1.2.4+{}{}", "0".repeat(10), "a".repeat(64))).unwrap(),
+                ..valid_native[0].clone()
+            }],
+            vec![NativeMod {
+                settings: vec![NativeSetting {
+                    key: Text::new("radius").unwrap(),
+                    value: NativeValue::Int(38),
+                }],
+                ..valid_native[0].clone()
+            }],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = RoomId(FixedBytes([0x83 + ordinal as u8; 16]));
+            let mut start = recovery_start(id, persist::FORMAT_VERSION);
+            start.manifest = Some(persist::StoredManifest::from(&manifest));
+            start.native_mods = native_mods;
+            let payload = postcard::to_stdvec(&start).unwrap();
+            let path = RoomLog::path_for(&dir, &id);
+            write_record(&path, &payload, &[]);
+            let before = std::fs::read(&path).unwrap();
+
+            assert!(matches!(
+                recover_by(&path, &dir, &recorder_menu()),
+                Err(RecoverError::NativeSettings)
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn current_format_short_native_terms_decode_but_recovery_fails_closed() {
+        let dir =
+            std::env::temp_dir().join(format!("tpf3mp-v9-native-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = RoomId(FixedBytes([0x8a; 16]));
+        let (manifest, mut native_mods) = native_terms();
+        let mut legacy_manifest = manifest.clone();
+        let legacy_version = Text::new(format!(
+            "1.2.3+{}",
+            &settings_digest(&BTreeMap::from([("radius".to_owned(), Setting::Int(37))]))[..10]
+        ))
+        .unwrap();
+        legacy_manifest.native[0].version = legacy_version.clone();
+        native_mods[0].version = legacy_version;
+
+        let mut start = recovery_start(id, persist::FORMAT_VERSION);
+        start.manifest = Some(persist::StoredManifest::from(&legacy_manifest));
+        start.native_mods = native_mods;
+        let payload = postcard::to_stdvec(&start).unwrap();
+        let decoded: StartRecord = postcard::from_bytes(&payload).unwrap();
+        assert_eq!(decoded.manifest.unwrap().manifest(), legacy_manifest);
+        let path = RoomLog::path_for(&dir, &id);
+        write_record(&path, &payload, &[]);
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(
+            recover_by(&path, &dir, &recorder_menu()),
+            Err(RecoverError::NativeIdentity)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_log_of_an_older_format_is_named_as_such() {
         let dir = std::env::temp_dir().join(format!("tpf3mp-old-log-{}", std::process::id()));
@@ -4315,6 +4888,7 @@ mod tests {
             password_tag: None,
             members: Vec::new(),
             base: None,
+            native_mods: Vec::new(),
         };
         let mut log = RoomLog::create(&dir, &start).unwrap();
         for frame in &frames {
@@ -4354,6 +4928,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let id = RoomId(FixedBytes([5; 16]));
         let settings = RoomSettings::DEFAULT;
+        let (manifest, native_mods) = native_terms();
+        let content = manifest.fingerprint();
 
         // Twenty turns with a command each, then one where a third player
         // joins, then two empty ones.
@@ -4377,24 +4953,35 @@ mod tests {
             id,
             name: Text::new("compacted").unwrap(),
             rules: native(),
-            manifest: None,
+            manifest: Some(persist::StoredManifest::from(&manifest)),
             owner: player(1),
             max_players: 8,
             settings,
             invite_tag: vec![0; 32],
             password_tag: None,
-            members: Vec::new(),
+            members: vec![StartMember {
+                player: player(1),
+                name: Text::new("p1").unwrap(),
+                platform: Platform::current(),
+                content: Some(content),
+            }],
             base: None,
+            native_mods: native_mods.clone(),
         };
-        let mut log = RoomLog::create(&dir, &start).unwrap();
-        for frame in &frames {
-            log.append(frame).unwrap();
-        }
-        drop(log);
         let path = RoomLog::path_for(&dir, &id);
+        let logged_frames: Vec<Vec<u8>> = frames.iter().map(|frame| frame.to_vec()).collect();
+        std::fs::create_dir_all(&dir).unwrap();
+        write_record(&path, &postcard::to_stdvec(&start).unwrap(), &logged_frames);
+        // Recovery appends a history marker. A second recovery proves the
+        // format-11 start and appended epoch-bearing marker remain readable.
+        let restored = recover_room(&path, &dir);
+        assert_eq!(restored.settings.scan_plan, tpf3mp_proto::ScanPlan::DEFAULT);
+        drop(restored);
 
-        // A restored room compacts, keeping its last three turns.
+        // A current-format room compacts, keeping its last three turns.
         let mut first = recover_room(&path, &dir);
+        assert_native_terms(&first, &native_mods);
+        assert_eq!(first.start_record(2, None).native_mods, native_mods);
         let before = std::fs::metadata(&path).unwrap().len();
         let game = running(&mut first);
         game.resume_window = 3;
@@ -4450,6 +5037,7 @@ mod tests {
         // A second restart reads the compacted log: the base, the kept
         // turns for resuming only, and the turn after, replayed.
         let mut second = recover_room(&path, &dir);
+        assert_native_terms(&second, &native_mods);
         assert_eq!(
             second.ruleset.save().unwrap(),
             rules,
@@ -4478,6 +5066,7 @@ mod tests {
         let history = histories.last().unwrap().0;
         let stream = game
             .stream_after(Some(Resume {
+                world_epoch: 1,
                 after_turn: 22,
                 history,
             }))
@@ -4489,6 +5078,7 @@ mod tests {
         assert_eq!(stream.backlog[2], frames_after[0]);
         assert!(
             game.stream_after(Some(Resume {
+                world_epoch: 1,
                 after_turn: 19,
                 history,
             }))
@@ -4583,6 +5173,7 @@ mod tests {
             password_tag: None,
             members: Vec::new(),
             base: Some(base),
+            native_mods: Vec::new(),
         };
         let mut log = RoomLog::create(&dir, &start).unwrap();
         let turn = TurnMessage::Turn(Turn {
@@ -4659,6 +5250,7 @@ mod tests {
             password_tag: None,
             members: Vec::new(),
             base: None,
+            native_mods: Vec::new(),
         };
         let mut log = RoomLog::create(&dir, &start).unwrap();
         for frame in &frames {
@@ -4688,6 +5280,209 @@ mod tests {
         assert_eq!(refeed(Some(x), Some(y), false, false), Refeed::Owes);
         assert_eq!(refeed(Some(x), Some(y), true, false), Refeed::Owes);
         assert_eq!(refeed(None, Some(y), false, false), Refeed::Owes);
+    }
+
+    #[tokio::test]
+    async fn a_pending_world_offer_survives_other_joins_until_its_matching_load_ack() {
+        use tpf3mp_net::{ServerIdentity, ServerTrust, client_config, server_config};
+
+        // Real connections satisfy MemberLink; the room itself is driven
+        // synchronously, so every queue assertion observes all preceding work.
+        let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+        let trust = ServerTrust::Pinned(identity.leaf().clone());
+        let server = quinn::Endpoint::server(
+            server_config(identity).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config(trust).unwrap());
+        let mut peers = Vec::new();
+        let mut links = Vec::new();
+        for _ in 0..3 {
+            let connecting = client
+                .connect(server.local_addr().unwrap(), "localhost")
+                .unwrap();
+            let (accepted, connected) = tokio::join!(
+                async { server.accept().await.unwrap().await.unwrap() },
+                connecting,
+            );
+            links.push(accepted);
+            peers.push(connected.unwrap());
+        }
+        let (control, _control) = mpsc::channel(32);
+        let (advisory, _advisory) = mpsc::channel(32);
+        let link = |id, connection| {
+            let (turns, incoming) = mpsc::channel(32);
+            (
+                MemberLink {
+                    id,
+                    connection,
+                    turns,
+                    control: control.clone(),
+                    advisory: advisory.clone(),
+                },
+                incoming,
+            )
+        };
+        let (first_link, mut first_queue) = link(1, links.remove(0));
+        let (second_link, mut second_queue) = link(2, links.remove(0));
+        let (replacement_link, mut replacement_queue) = link(3, links.remove(0));
+        let take = |queue: &mut mpsc::Receiver<TurnFeed>| {
+            let TurnFeed::Open { start, .. } = queue.try_recv().expect("one world offered") else {
+                panic!("an offered world opens its stream");
+            };
+            assert!(
+                queue.try_recv().is_err(),
+                "exactly one offer, without timing assumptions"
+            );
+            start
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut game = Game::new(RoomSettings::DEFAULT, 1);
+        let mut rules = Recorder::default();
+        game.append(joined(1), &mut rules);
+        game.append(joined(2), &mut rules);
+        let frames: Vec<Vec<u8>> = game.seal(10).unwrap().iter().map(|f| f.to_vec()).collect();
+        let start = recovery_start(RoomId(FixedBytes([0x91; 16])), persist::FORMAT_VERSION);
+        let path = RoomLog::path_for(temp.path(), &start.id);
+        write_record(&path, &postcard::to_stdvec(&start).unwrap(), &frames);
+        let mut room = recover_room(&path, temp.path());
+        let snapshots = Arc::new(
+            Snapshots::open(&snapshots::SnapshotConfig::new(
+                temp.path().join("snapshots"),
+            ))
+            .unwrap(),
+        );
+        let manifest = Arc::new(
+            snapshots
+                .store
+                .ingest(&b"first world"[..], tpf3mp_snapshot::ChunkParams::DEFAULT)
+                .unwrap(),
+        );
+        let first_world = bulk::snapshot_id(&manifest.id());
+        let point = SavePoint {
+            event: 0,
+            after_turn: 0,
+            history: 1,
+            sealed_through: 0,
+        };
+        running(&mut room).saves.current = Some(Agreed { manifest, point });
+        room.snapshots = Some(snapshots.clone());
+        assert!(
+            room.members
+                .iter()
+                .all(|member| member.offered.is_none() && member.load_step.is_none())
+        );
+        room.members[0].link = Some(first_link);
+        room.members[0].needs = Needs::World;
+        room.members[1].link = Some(second_link);
+        room.members[1].streaming = true;
+        room.members[1].loaded = Some(first_world);
+        room.offer_worlds(Instant::now());
+        let first_offer = take(&mut first_queue);
+        assert_eq!(first_offer.world.as_ref().unwrap().snapshot, first_world);
+        assert!(second_queue.try_recv().is_err());
+
+        // A second join needs this same world before the first game's ACK.
+        room.members[1].loaded = None;
+        room.members[1].needs = Needs::World;
+        room.offer_worlds(Instant::now());
+        let second_offer = take(&mut second_queue);
+        assert!(
+            first_queue.try_recv().is_err(),
+            "an in-flight offer must not be restarted by another join"
+        );
+        assert_eq!(room.members[0].world_epoch, first_offer.world_epoch);
+        assert_eq!(room.members[0].load_step, Some(0));
+        assert_eq!(room.members[0].loaded, None, "offered is not acknowledged");
+        assert!(!room.members[0].accepts_report(first_offer.world_epoch));
+        room.loaded(player(1), 1, first_offer.world_epoch.wrapping_add(1), 0);
+        room.loaded(player(1), 1, first_offer.world_epoch, 1);
+        room.loaded(player(1), 99, first_offer.world_epoch, 0);
+        assert_eq!(room.members[0].load_step, Some(0));
+        assert_eq!(room.members[0].loaded, None);
+        room.loaded(player(1), 1, first_offer.world_epoch, 0);
+        assert_eq!(room.members[0].loaded, Some(first_world));
+        assert!(room.members[0].accepts_report(first_offer.world_epoch));
+
+        // A changed world supersedes the second game's still-pending offer.
+        let manifest = Arc::new(
+            snapshots
+                .store
+                .ingest(
+                    &b"replacement world"[..],
+                    tpf3mp_snapshot::ChunkParams::DEFAULT,
+                )
+                .unwrap(),
+        );
+        let next_world = bulk::snapshot_id(&manifest.id());
+        running(&mut room).saves.current = Some(Agreed { manifest, point });
+        room.members[0].needs = Needs::World;
+        room.offer_worlds(Instant::now());
+        let superseding_first = take(&mut first_queue);
+        let superseding_second = take(&mut second_queue);
+        assert_eq!(
+            superseding_second.world.as_ref().unwrap().snapshot,
+            next_world
+        );
+        assert_ne!(superseding_second.world_epoch, second_offer.world_epoch);
+        room.loaded(player(2), 2, second_offer.world_epoch, 0);
+        assert_eq!(room.members[1].loaded, None, "superseded ACK is stale");
+        assert_eq!(room.members[1].load_step, Some(0));
+        assert_eq!(room.members[0].loaded, Some(first_world));
+
+        // A fresh link without a resume must be sent the world, even while
+        // the same player's old link had an unacknowledged offer for it.
+        let invite = Invite("ABC234".parse().unwrap());
+        room.secrets.invite_tag =
+            hmac::sign(&room.secrets.key, &RoomSecrets::invite_input(&invite))
+                .as_ref()
+                .to_vec();
+        room.join(
+            NewMember {
+                player: player(1),
+                name: Text::new("replacement").unwrap(),
+                platform: Platform::current(),
+                link: replacement_link,
+                content: None,
+                banner: None,
+            },
+            &invite,
+            None,
+            None,
+            room.settings.scan_plan,
+        )
+        .unwrap();
+        let resent = take(&mut replacement_queue);
+        assert_eq!(resent.world.as_ref().unwrap().snapshot, next_world);
+        assert_ne!(resent.world_epoch, superseding_first.world_epoch);
+        assert!(
+            second_queue.try_recv().is_err(),
+            "the other link keeps its pending offer"
+        );
+        room.loaded(player(1), 1, superseding_first.world_epoch, 0);
+        room.loaded(player(1), 3, superseding_first.world_epoch, 0);
+        assert_eq!(room.members[0].load_step, Some(0));
+        room.loaded(player(1), 3, resent.world_epoch, 0);
+        assert_eq!(room.members[0].loaded, Some(next_world));
+
+        // Equal snapshot bytes do not make a different replay frontier the
+        // same offer: the pending second link must be rebased to that point.
+        running(&mut room).saves.current.as_mut().unwrap().point = SavePoint {
+            event: 2,
+            after_turn: 1,
+            history: 1,
+            sealed_through: 10,
+        };
+        room.members[0].needs = Needs::World;
+        room.offer_worlds(Instant::now());
+        let _ = take(&mut replacement_queue);
+        let advanced = take(&mut second_queue);
+        assert_eq!(advanced.world.as_ref().unwrap().snapshot, next_world);
+        assert_eq!(advanced.sealed_through, 10);
+        assert_ne!(advanced.world_epoch, superseding_second.world_epoch);
     }
 
     #[test]
@@ -4887,6 +5682,8 @@ mod tests {
             needs: Needs::Nothing,
             offered: None,
             loaded: None,
+            world_epoch: 0,
+            load_step: None,
             rebased: None,
             stream_from: 0,
         }

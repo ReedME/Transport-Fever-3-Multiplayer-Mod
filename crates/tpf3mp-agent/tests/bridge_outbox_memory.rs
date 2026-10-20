@@ -135,6 +135,7 @@ async fn a_hostile_server_cannot_fill_the_bridge_outbox() {
         write_preamble(&mut turns, PROTOCOL_VERSION).await.unwrap();
         // A new game (no world to fetch), with the frontier held at 0.
         let start = TurnMessage::Start(TurnStart {
+            world_epoch: 1,
             room: RoomId(FixedBytes([0; 16])),
             rules: tpf3mp_proto::Text::new("native").unwrap(),
             next_turn: 1,

@@ -1,0 +1,30 @@
+[package]
+name = "tpf3mp-bigmap-plugin"
+description = "Big Maps as a native mod's plugin: bigger Transport Fever 3 worlds"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# The plugin the hook loads, and a library for the tests and the packager.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json.workspace = true
+tpf3mp-plugin-abi.workspace = true
+# The hook declarations' types, and the package's checks (the packager).
+tpf3mp-nativemods.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+# The hook's own code finds and arranges the package's hooks in the
+# real game's executable (tests/game_40420.rs).
+tpf3mp-hook = { path = "../tpf3mp-hook" }
+tpf3mp-hookcore.workspace = true
+# A real Lua for the menu chunk's tests (Lua 5.1, as the workspace builds it).
+mlua.workspace = true

@@ -118,6 +118,7 @@ async fn every_bad_invite_fails_the_same_way() {
         let error = bob
             .client
             .join_room(JoinRoom {
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 invite,
                 password: password.map(|p| Text::new(p).unwrap()),
                 resume: None,
@@ -129,6 +130,7 @@ async fn every_bad_invite_fails_the_same_way() {
     // The right invite and password still work.
     bob.client
         .join_room(JoinRoom {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             invite,
             password: Some(Text::new("hunter2").unwrap()),
             resume: None,
@@ -196,6 +198,7 @@ async fn invite_resolution_checks_passwords_without_telling_why_a_code_failed() 
     assert_eq!(
         dave.client
             .join_room(JoinRoom {
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 invite,
                 password: Some(Text::new("right-password").unwrap()),
                 resume: None,
@@ -679,6 +682,7 @@ async fn an_overlong_mod_list_is_refused() {
             })
             .collect(),
         unlisted: None,
+        native: Vec::new(),
     };
     assert_eq!(
         ann.client.declare_content(manifest).await,

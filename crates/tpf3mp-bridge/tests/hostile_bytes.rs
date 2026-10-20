@@ -43,6 +43,8 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
     let to_hook = [
         ToHook::Hello { version: 2 },
         ToHook::Begin {
+            room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             rules: Text::new("native").unwrap(),
             steps_per_second: 10,
             checkpoint_interval: 50,
@@ -81,6 +83,7 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
             reason: Text::new("the room closed").unwrap(),
         },
         ToHook::Load {
+            world_epoch: 1,
             file: Some(Text::new("/home/player/.local/share/TPF3-MP/received/x.sav").unwrap()),
             next_step: 401,
         },
@@ -218,7 +221,10 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
             version: 2,
             build: Text::new("tpf3 1.0.0 (build 1234)").unwrap(),
         },
-        ToAgent::Loaded { next_step: 401 },
+        ToAgent::Loaded {
+            world_epoch: 1,
+            next_step: 401,
+        },
         ToAgent::Command {
             payload: Payload::new(vec![7; 64]).unwrap(),
             secret: Some(tpf3mp_proto::Secret {
@@ -226,8 +232,12 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
                 password: Text::new("pw").unwrap(),
             }),
         },
-        ToAgent::Ran { step: 402 },
+        ToAgent::Ran {
+            world_epoch: 1,
+            step: 402,
+        },
         ToAgent::Checkpoint {
+            world_epoch: 1,
             step: 500,
             lanes: lanes(),
         },
@@ -235,6 +245,7 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
             message: Text::new("loaded the world in 2.3 s").unwrap(),
         },
         ToAgent::Saved {
+            world_epoch: 1,
             event: 12,
             lanes: lanes(),
             file: Some(Text::new("saves/12.sav").unwrap()),

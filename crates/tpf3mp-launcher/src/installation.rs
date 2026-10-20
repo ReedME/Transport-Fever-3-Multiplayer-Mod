@@ -1,4 +1,4 @@
-//! Windows first-run setup in the launcher, using the readable mod installer.
+//! Windows setup using the readable installer, or verified Rust copying in Proton.
 //! Downloads use the updater's signed manifest, never an executable from a peer.
 
 use std::{
@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use eframe::egui;
 
-use crate::{icon, installed, theme, update};
+use crate::{icon, installed, mod_install, theme, update};
 
 const MANAGED: &str = "tpf3mp-managed.json";
 
@@ -69,6 +69,7 @@ pub fn before_launch(repair: bool, uninstall: bool) -> Result<bool> {
     }
     let exe = std::env::current_exe()?;
     let downloaded = standalone(&exe);
+    portable_wine_package(mod_install::wine(), downloaded, false)?;
     let root = if downloaded {
         managed_root()?
     } else {
@@ -78,6 +79,7 @@ pub fn before_launch(repair: bool, uninstall: bool) -> Result<bool> {
     };
     let data = data_dir()?;
     let managed = downloaded || root.join(MANAGED).is_file();
+    portable_wine_package(mod_install::wine(), downloaded, managed)?;
     if downloaded
         && exe != root.join("TPF3-MP.exe")
         && root.join(MANAGED).is_file()
@@ -113,7 +115,10 @@ pub fn before_launch(repair: bool, uninstall: bool) -> Result<bool> {
     } else {
         Mode::Sync
     };
-    if mode == Mode::Sync && installed::installed_mod(&data).as_deref() == Some(update::VERSION) {
+    if mode == Mode::Sync
+        && recorded_mods(&data)
+            .is_some_and(|mods| mod_install::verify(&root, &data, &mods, update::VERSION).is_ok())
+    {
         return Ok(false);
     }
     if !downloaded && !packaged {
@@ -141,6 +146,15 @@ pub fn before_launch(repair: bool, uninstall: bool) -> Result<bool> {
     )
     .map_err(|error| anyhow::anyhow!("opening setup: {error}"))?;
     Ok(true)
+}
+
+fn portable_wine_package(wine: bool, downloaded: bool, managed: bool) -> Result<()> {
+    if wine && (downloaded || managed) {
+        bail!(
+            "Under Proton or Wine, use the Windows ZIP package: extract it and run TPF3-MP.exe in the game's Proton prefix. The standalone EXE's Windows shortcuts and managed removal require real PowerShell and are unavailable here. No setup changes were made."
+        );
+    }
+    Ok(())
 }
 
 fn package_version(root: &Path) -> Option<String> {
@@ -198,12 +212,10 @@ pub fn mod_folders(roots: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn recorded_mods(data: &Path) -> Option<PathBuf> {
-    let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(data.join("installed.json")).ok()?).ok()?;
-    let path = PathBuf::from(json["mod"].as_str()?);
-    (path.is_absolute() && path.file_name().is_some_and(|name| name == "tpf3mp_1"))
-        .then(|| path.parent().map(Path::to_owned))
-        .flatten()
+    mod_install::recorded_target(data)
+        .ok()?
+        .parent()
+        .map(Path::to_owned)
 }
 
 /// The mods folder as typed or pasted: Explorer's "Copy as path" adds quotes.
@@ -265,10 +277,8 @@ fn run_script(mut command: Command) -> Result<()> {
     Ok(())
 }
 
-pub fn check_game_closed(root: &Path) -> Result<()> {
-    let mut command = powershell(&root.join("tools/install.ps1"));
-    command.arg("-CheckOnly");
-    run_script(command)
+pub fn check_game_closed(_root: &Path) -> Result<()> {
+    mod_install::game_closed()
 }
 
 /// Restore the old package's mod if an update rolls its binaries back.
@@ -280,9 +290,22 @@ pub fn restore_mod(root: &Path) -> Result<()> {
     let Some(mods) = recorded_mods(&data_dir()?) else {
         return Ok(());
     };
-    let mut command = powershell(&root.join("tools/install.ps1"));
-    command.arg("-ModsDir").arg(mods);
-    run_script(command)
+    check_game_closed(root)?;
+    install_mod(root, &data_dir()?, &mods)
+}
+
+fn install_mod(root: &Path, data: &Path, mods: &Path) -> Result<()> {
+    let version =
+        package_version(root).context("the package has no valid Windows version marker")?;
+    if mod_install::wine() {
+        mod_install::install(root, data, mods, &version)
+    } else {
+        mod_install::checked_script_install(root, data, mods, &version, || {
+            let mut command = powershell(&root.join("tools/install.ps1"));
+            command.arg("-ModsDir").arg(mods);
+            run_script(command)
+        })
+    }
 }
 
 fn perform(
@@ -291,12 +314,22 @@ fn perform(
     desktop: bool,
     mut progress: impl FnMut(String, Option<f32>),
 ) -> Result<()> {
+    portable_wine_package(mod_install::wine(), false, plan.managed)?;
+    check_game_closed(&plan.root)?;
     if plan.mode == Mode::Uninstall {
         progress("Removing the multiplayer mod…".into(), None);
         if plan.data.join("installed.json").is_file() {
-            let mut command = powershell(&plan.root.join("tools/install.ps1"));
-            command.arg("-Uninstall");
-            run_script(command)?;
+            let target = mod_install::recorded_target(&plan.data)?;
+            if mod_install::wine() {
+                mod_install::uninstall(&plan.data)?;
+            } else {
+                let mut command = powershell(&plan.root.join("tools/install.ps1"));
+                command.arg("-Uninstall");
+                run_script(command)?;
+            }
+            if target.exists() || plan.data.join("installed.json").exists() {
+                bail!("The installer did not remove the recorded mod; uninstall is incomplete.");
+            }
         } else {
             check_game_closed(&plan.root)?;
         }
@@ -339,9 +372,7 @@ fn perform(
         })?;
     }
     progress("Installing the multiplayer mod…".into(), None);
-    let mut command = powershell(&plan.root.join("tools/install.ps1"));
-    command.arg("-ModsDir").arg(mods);
-    run_script(command)?;
+    install_mod(&plan.root, &plan.data, mods)?;
     if plan.managed {
         progress("Adding your launcher shortcut…".into(), None);
         let mut command = powershell(&plan.root.join("tools/manage.ps1"));
@@ -350,6 +381,9 @@ fn perform(
             command.arg("-DesktopShortcut");
         }
         run_script(command)?;
+        if !plan.root.join(MANAGED).is_file() {
+            bail!("The shortcut installer did not create its managed-installation record.");
+        }
     }
     Ok(())
 }
@@ -537,6 +571,14 @@ mod tests {
     }
 
     #[test]
+    fn wine_requires_the_portable_package_before_any_setup() {
+        assert!(portable_wine_package(true, true, false).is_err());
+        assert!(portable_wine_package(true, false, true).is_err());
+        assert!(portable_wine_package(true, false, false).is_ok());
+        assert!(portable_wine_package(false, true, true).is_ok());
+    }
+
+    #[test]
     fn several_steam_accounts_need_a_choice_and_custom_folders_are_remembered() {
         let temp = tempfile::tempdir().unwrap();
         for id in ["123", "456", "not-an-account"] {
@@ -559,7 +601,11 @@ mod tests {
         let custom = temp.path().join("custom/staging_area/tpf3mp_1");
         std::fs::write(
             temp.path().join("installed.json"),
-            serde_json::to_vec(&serde_json::json!({"version":"0.1.0", "mod":custom})).unwrap(),
+            // Existing Windows records may have a UTF-8 BOM.
+            format!(
+                "\u{feff}{}",
+                serde_json::json!({"version":"0.1.0", "mod":custom})
+            ),
         )
         .unwrap();
         assert_eq!(

@@ -43,6 +43,9 @@ pub struct TurnStart {
     /// rebased after diverging. `None` continues the world the client has,
     /// or, at the start of a game, the world every player loads.
     pub world: Option<WorldOffer>,
+    /// Identifies reports produced by this world; unchanged on exact resume,
+    /// replaced whenever a new load is ordered (even at the same frontier).
+    pub world_epoch: u64,
 }
 
 /// One sealed turn. See the invariants in `docs/PROTOCOL.md`.

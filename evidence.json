@@ -1,0 +1,130 @@
+{
+  "assessment_date": "2026-10-11",
+  "timezone": "Australia/Sydney",
+  "scope": "Competitive multiplayer with separate companies; Windows game and Windows multiplayer launcher running through Proton.",
+  "verdict": "Credible conditional feasibility; reuse TPF3-MP and first validate unchanged baseline through Proton.",
+  "runtime_validation": {
+    "performed": false,
+    "proton_launch": "untested",
+    "two_peer_multiplayer": "untested",
+    "competitive_economy": "untested",
+    "installed_or_modified_game": false,
+    "changed_steam_configuration": false
+  },
+  "local_installation": {
+    "root": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3",
+    "steam_app_id": 3493540,
+    "steam_build_id": "25754343",
+    "internal_game_build": null,
+    "internal_game_build_status": "Not verified; Steam build ID is a different identifier.",
+    "observed_executable": "TransportFever3, Linux ELF 64-bit x86-64",
+    "windows_executable_found": false,
+    "proton_context_status": "User targets Proton; inspected install is native Linux and compatdata/3493540 is empty. Actual Windows install and runtime still need locating."
+  },
+  "local_files": [
+    {
+      "path": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3/api/tealdef/api/cmd.d.tl",
+      "sha256": "7bb6eb57b3915d7f0d9bad615f28e8a920613c7b8f98cd864f0c28916672c766",
+      "bytes": 50751
+    },
+    {
+      "path": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3/api/tealdef/api/engine.d.tl",
+      "sha256": "7e524d16108fc5f0663397d4001d46ab1386ec3e340af7d4e5a7edbe47fa237a",
+      "bytes": 53279
+    },
+    {
+      "path": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3/api/tealdef/api/engine/util.d.tl",
+      "sha256": "b5ba8c2467c6247866fe4b3088ef7adf2388e1b71528db9082c12b71558973f4",
+      "bytes": 51616
+    },
+    {
+      "path": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3/api/tealdef/api/type.d.tl",
+      "sha256": "02d45a7864c7b6973324b87630fe209d9fd460148d9c9d8e0af364d90da2ea48",
+      "bytes": 179922
+    },
+    {
+      "path": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3/api/tealdef/app.d.tl",
+      "sha256": "dc6cfb79170131d944e36b182bf0dd6df779225f817256bb4710005b3b629a56",
+      "bytes": 10741
+    },
+    {
+      "path": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3/base/tealdef/scripts/gamescript.d.tl",
+      "sha256": "67d326b893b3eb5187c26338d1dc40d5b46c3d9212463767aa03c18201fdc463",
+      "bytes": 2445
+    }
+  ],
+  "local_archive_entries": [
+    {
+      "archive": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3/base/content/mission.zip",
+      "entry": "mission/tasks/transfer_ownership/transfer_ownership_util.tl",
+      "sha256": "ecf9865ecd6080d6a2e1ad812d1ed6216f0711c85b9cb714e5fd6eebb5c3c061",
+      "line_ranges": [
+        [
+          4,
+          48
+        ]
+      ],
+      "finding": "Creates another engine player and transfers native assets."
+    },
+    {
+      "archive": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3/base/content/game_mechanics.zip",
+      "entry": "game_mechanics/company/company.script.tl",
+      "sha256": "9a61bb0380d4dedb54ccd49b0f7594b41e90c0863dbec8dbd0a33c9ff3b95fdb",
+      "line_ranges": [
+        [
+          274,
+          285
+        ]
+      ],
+      "finding": "Company update iterates current player only; all-player iteration commented out."
+    },
+    {
+      "archive": "/home/reedme/.local/share/Steam/steamapps/common/Transport Fever 3/base/content/game_mechanics.zip",
+      "entry": "game_mechanics/finance/loan.script.tl",
+      "sha256": "c44110a844e7f00d8b05fcab55a394ef6304b6e9c895dc8b950fc96ad402a9b7",
+      "line_ranges": [
+        [
+          37,
+          52
+        ],
+        [
+          101,
+          103
+        ],
+        [
+          119,
+          136
+        ],
+        [
+          171,
+          175
+        ]
+      ],
+      "finding": "Loan table and bookings use singular current player."
+    }
+  ],
+  "upstream_projects": [
+    {
+      "name": "TPF3-MP",
+      "repo": "https://github.com/Juliansgith/Transport-Fever-3-Multiplayer-Mod",
+      "inspected_main_commit": "538733611cc5e4c8ea30d48513d5b0df761db05a",
+      "latest_release_observed": "v1.3.0",
+      "release_url": "https://github.com/Juliansgith/Transport-Fever-3-Multiplayer-Mod/releases/tag/v1.3.0",
+      "release_game_target": "Windows Steam game build 40420",
+      "license": "MIT",
+      "test_status": "Author-reported real Windows two-game test; not reproduced here.",
+      "proton_status": "Deliberate Steam discovery and Wine UDP fallback in v1.3.0; real gameplay in this Proton environment untested."
+    },
+    {
+      "name": "MPFever",
+      "repo": "https://github.com/dkdknight/MPFever",
+      "inspected_main_commit": "3f0abe0bd1f4051060c688019914786c3511368d",
+      "main_version_observed": "0.3.4-experimental",
+      "latest_release_observed": "0.2.10",
+      "release_url": "https://github.com/dkdknight/MPFever/releases/tag/0.2.10",
+      "license": "MIT",
+      "test_status": "Author-reported short company-mode checks; not reproduced here.",
+      "proton_status": "Untested; .NET Framework 4.8/WinForms, Steam discovery and winhttp DLL loading need validation."
+    }
+  ]
+}

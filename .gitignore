@@ -25,3 +25,6 @@
 # an installed mod (docs/LOBBY.md, "Portraits"): the game's art, never
 # committed, should a mod folder point here.
 /mod/tpf3mp_1/content/gui/tpf3mp/portraits/
+
+# Python verification helper bytecode.
+__pycache__/

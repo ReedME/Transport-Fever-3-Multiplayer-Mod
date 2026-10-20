@@ -80,6 +80,11 @@ pub fn stopped() -> u64 {
 /// The mod's game script begins or ends applying the room's actions.
 pub fn set_replaying(replaying: bool) {
     REPLAYING.store(replaying, Ordering::Release);
+    crate::toolchain::replaying(replaying);
+    // A crossing armed for a build of the room's never outlives its actions.
+    if !replaying {
+        crate::crossings::disarm();
+    }
 }
 
 /// Whether `payload` is a `WorldBuildProposal`'s the player made.
@@ -171,14 +176,22 @@ unsafe extern "C" fn add_detour(
         if unsafe { player_build(payload as *const u8) } {
             stop_tool = crate::stoptool::before_add(return_address, callback);
             let click = CLICKS.fetch_add(1, Ordering::AcqRel);
+            // The street or track tool's click, kept to continue from once
+            // the room built it ([`crate::toolchain`]); any other drops it.
+            // Read before Add, which takes the callback.
+            crate::toolchain::before_add(return_address, callback, click);
             if crate::modules::is_module_editor(return_address) {
                 // Read before the game takes it: the command is the
                 // caller's until Add returns.
                 crate::modules::record(&crate::modules::Process, click, payload);
             } else if crate::terrain::is_terrain_tool(return_address) {
                 crate::terrain::record(&crate::modules::Process, click, payload);
+            } else if crate::crossings::is_crossing_window(return_address) {
+                crate::crossings::record(&crate::modules::Process, click, payload);
             } else {
                 crate::junctions::record(&crate::modules::Process, click, payload);
+                // The street and track tools' toolbar crossing type.
+                crate::crossings::record_tool(&crate::modules::Process, click, payload);
             }
         }
     }
@@ -216,9 +229,22 @@ unsafe extern "C" fn apply_detour(context: usize, payload: usize, r8: usize, r9:
         crate::log::line(&format!("terraform: the room's carrier was refused: {why}"));
         return 0;
     }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if REPLAYING.load(Ordering::Acquire)
+        && let Err(why) = crate::crossings::inject_game(payload)
+    {
+        crate::log::line(&format!("crossing: the room's carrier was refused: {why}"));
+        return 0;
+    }
     // SAFETY: the trampoline of the apply, called as the dispatcher called it.
     let original: ApplyFn = unsafe { std::mem::transmute::<usize, ApplyFn>(original) };
-    unsafe { original(context, payload, r8, r9) }
+    let built = unsafe { original(context, payload, r8, r9) };
+    // What the room's build made, for the street and track tools to
+    // continue from ([`crate::toolchain`]).
+    if built != 0 && REPLAYING.load(Ordering::Acquire) {
+        crate::toolchain::collect(payload);
+    }
+    built
 }
 
 /// Detours the add and the apply, at the addresses the profile resolved.
@@ -234,6 +260,7 @@ pub unsafe fn install(
     module_call: Option<usize>,
     terrain_call: Option<usize>,
     stop_call: Option<usize>,
+    crossing_call: Option<(usize, bool)>,
     detour: unsafe fn(*mut u8, *const u8) -> Result<usize, String>,
 ) -> Result<(), String> {
     if let Some(call) = module_call {
@@ -244,6 +271,9 @@ pub unsafe fn install(
     }
     if let Some(call) = stop_call {
         crate::stoptool::set_call(call);
+    }
+    if let Some((call, layout)) = crossing_call {
+        crate::crossings::set_call(call, layout);
     }
     // SAFETY: the caller's; the entry thunk has the add's ABI and jumps to
     // add_detour, which has it too.

@@ -21,11 +21,15 @@ use eframe::egui::{
     ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType,
     pos2, vec2,
 };
-use tpf3mp_agent::launcher::{Action, Connection, State, server_address};
+use tpf3mp_agent::{
+    launcher::{Action, Connection, ModHave, State, server_address},
+    native_mods::NativeRow,
+};
 
 use crate::{
     backend::Backend,
     notes::{Block, Notes, ReleaseNotes},
+    previews::Previews,
     probe::{Probe, Reach},
     theme::{self, Assets, Fill, Pill, Quiet},
     update::{UpdateState, Updater},
@@ -154,6 +158,14 @@ pub struct LauncherApp<B> {
     /// The look is set on the first frame.
     styled: bool,
     settings: bool,
+    /// The open mods dialog, if any: the mod manager or the mod browser.
+    mods: Option<ModsPage>,
+    /// What the player typed in the mod browser's search.
+    mod_search: String,
+    /// The native mod picked in the mods dialog's table, by id.
+    selected_mod: Option<String>,
+    /// Native mods' preview images, fetched as they are shown.
+    previews: Previews,
     /// The server setting's field, as the player types it, and the server
     /// it was last filled from.
     server_setting: String,
@@ -193,6 +205,10 @@ impl<B: Backend> LauncherApp<B> {
             looked_for_update: false,
             styled: false,
             settings: false,
+            mods: None,
+            mod_search: String::new(),
+            selected_mod: None,
+            previews: Previews::default(),
             server_setting: String::new(),
             server_setting_for: None,
             toast: None,
@@ -206,6 +222,12 @@ impl<B: Backend> LauncherApp<B> {
     #[must_use]
     pub fn with_place(mut self, place: Place) -> Self {
         self.place = place;
+        self
+    }
+
+    /// Shows `image` as the preview at `url` without fetching it.
+    pub fn with_preview(mut self, url: &str, image: egui::ColorImage) -> Self {
+        self.previews.insert(url, image);
         self
     }
 
@@ -290,7 +312,11 @@ impl<B: Backend> LauncherApp<B> {
         self.sidebar(ui, &geometry, &state, &view, &assets);
         self.files(ui, &geometry, &state, &assets);
         self.footer(ui, &geometry, &state);
-        if self.settings || self.confirm.is_some() {
+        if self.settings
+            || self.mods.is_some()
+            || self.confirm.is_some()
+            || state.native_consent.is_some()
+        {
             // Behind a dialog the page is blurred, as the page's
             // `::backdrop` does: the city blurred, over it all.
             let painter =
@@ -298,7 +324,9 @@ impl<B: Backend> LauncherApp<B> {
             theme::blur_behind(&painter, geometry.window, &assets);
         }
         self.settings_dialog(&ctx, &state, &view);
+        self.mods_dialog(&ctx, &state);
         self.confirm_dialog(&ctx);
+        self.plugin_consent_dialog(&ctx, &state);
         self.draw_toast(&ctx, geometry.window);
         ctx.request_repaint_after(REFRESH);
     }
@@ -339,6 +367,14 @@ impl<B: Backend> LauncherApp<B> {
                 };
                 if theme::quiet_button(ui, true, Some("settings"), "Settings", settings).clicked() {
                     self.settings = true;
+                }
+                if theme::quiet_button(ui, true, Some("archive"), "Mod manager", settings).clicked()
+                {
+                    self.mods = Some(ModsPage::Manager);
+                }
+                if theme::quiet_button(ui, true, Some("search"), "Mod browser", settings).clicked()
+                {
+                    self.mods = Some(ModsPage::Browser);
                 }
                 if let Some(badge) = &view.updates.badge
                     && update_badge(ui, badge).clicked()
@@ -451,6 +487,10 @@ impl<B: Backend> LauncherApp<B> {
                 if !view.differences.is_empty() {
                     ui.add_space(14.0);
                     differences(ui, &view.differences);
+                }
+                if !state.room_native.is_empty() || state.native_busy.is_some() {
+                    ui.add_space(14.0);
+                    self.room_native(ui, state);
                 }
                 ui.add_space(22.0);
                 match self.place {
@@ -1196,6 +1236,81 @@ impl<B: Backend> LauncherApp<B> {
         }
     }
 
+    /// The mods dialogs, from the buttons beside Settings: the mod manager
+    /// (the native mods installed) and the mod browser (those the server
+    /// offers, and the proposed ones), with tabs between them. Each is a
+    /// table of mods beside the details of the one picked.
+    fn mods_dialog(&mut self, ctx: &egui::Context, state: &State) {
+        let Some(page) = self.mods else {
+            return;
+        };
+        let height = ctx.content_rect().height() - 48.0;
+        let modal = Modal::new(Id::new("mods"))
+            .frame(dialog_frame())
+            .backdrop_color(theme::rgba(4, 16, 20, 0.66))
+            .show(ctx, |ui| {
+                ui.set_width(TABLE_WIDTH + PANES_GAP + DETAIL_WIDTH);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let mut close = false;
+                ui.horizontal(|ui| {
+                    let title = match page {
+                        ModsPage::Manager => "Mod manager",
+                        ModsPage::Browser => "Mod browser",
+                    };
+                    ui.label(
+                        theme::text(title, theme::semibold(26.0), theme::TEXT)
+                            .extra_letter_spacing(-0.6),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        close |= theme::icon_button(ui, "close", "Close mods").clicked();
+                    });
+                });
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let installed = installed_rows(state).len();
+                    let tabs = [
+                        (
+                            ModsPage::Manager,
+                            "archive",
+                            format!("Installed ({installed})"),
+                        ),
+                        (ModsPage::Browser, "search", "Browse".to_owned()),
+                    ];
+                    for (tab, icon, words) in tabs {
+                        let look = if tab == page {
+                            Quiet {
+                                color: theme::TEXT,
+                                fill: theme::white(0.08),
+                                border: theme::white(0.45),
+                                ..Quiet::new()
+                            }
+                        } else {
+                            Quiet::new().color(theme::MUTED)
+                        };
+                        if theme::quiet_button(ui, true, Some(icon), &words, look).clicked() {
+                            self.mods = Some(tab);
+                        }
+                    }
+                });
+                ui.add_space(16.0);
+                let body = (height - 240.0).max(220.0);
+                match page {
+                    ModsPage::Manager => self.mod_manager(ui, state, body),
+                    ModsPage::Browser => self.mod_browser(ui, state, body),
+                }
+                ui.add_space(16.0);
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    close |= theme::quiet_button(ui, true, None, "Done", Quiet::new().width(100.0))
+                        .clicked();
+                });
+                close
+            });
+        if modal.inner || modal.should_close() {
+            self.mods = None;
+        }
+    }
+
     fn settings_body(&mut self, ui: &mut Ui, state: &State, view: &View) {
         if cfg!(windows) && crate::update::Install::of_running().is_ok() {
             group(ui, |ui| {
@@ -1547,6 +1662,127 @@ impl<B: Backend> LauncherApp<B> {
         }
     }
 
+    /// Requires a deliberate choice before native plugin code can be fetched
+    /// or enabled. The agent binds this answer to the exact displayed request.
+    fn plugin_consent_dialog(&mut self, ctx: &egui::Context, state: &State) {
+        let Some(prompt) = state.native_consent.clone() else {
+            return;
+        };
+        let modal = Modal::new(Id::new("native-plugin-consent"))
+            .frame(dialog_frame())
+            .backdrop_color(theme::rgba(4, 16, 20, 0.72))
+            .show(ctx, |ui| {
+                ui.set_width(520.0);
+                ui.label(theme::text(
+                    "Review native plugin code",
+                    theme::semibold(22.0),
+                    theme::TEXT,
+                ));
+                ui.add_space(10.0);
+                ui.label(theme::text(
+                    "These packages run executable code inside Transport Fever 3 with your account's rights on this PC. Approval is required before this action can fetch, install, enable, or roll back native plugin code.",
+                    theme::body(13.0),
+                    theme::DIFFERS_TEXT,
+                ));
+                ui.add_space(6.0);
+                ui.label(theme::text(
+                    format!("Requested action: {}", prompt.action),
+                    theme::semibold(13.0),
+                    theme::TEXT,
+                ));
+                ui.add_space(14.0);
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        for package in &prompt.packages {
+                            ui.separator();
+                            ui.label(theme::text(
+                                format!("{} {}", package.name, package.version),
+                                theme::semibold(15.0),
+                                theme::TEXT,
+                            ));
+                            ui.label(theme::text(
+                                format!("Package: {}", package.id),
+                                theme::body(12.0),
+                                theme::MUTED,
+                            ));
+                            let source = if package.source == "project" {
+                                "TPF3-MP project index".to_owned()
+                            } else {
+                                format!("Authenticated server {}", package.source)
+                            };
+                            ui.label(theme::text(
+                                format!("Validated source: {source}"),
+                                theme::body(12.0),
+                                theme::TEXT,
+                            ));
+                            let authors = if package.authors.is_empty() {
+                                "Not listed".to_owned()
+                            } else {
+                                package.authors.join(", ")
+                            };
+                            ui.label(theme::text(
+                                format!("Author(s): {authors}"),
+                                theme::body(12.0),
+                                theme::TEXT,
+                            ));
+                            ui.label(theme::text(
+                                "Full package identity SHA-256:",
+                                theme::body(12.0),
+                                theme::MUTED,
+                            ));
+                            // Break the digest into groups so its complete
+                            // value can wrap inside the dialog at narrow
+                            // window sizes.
+                            let digest = package
+                                .digest
+                                .as_bytes()
+                                .chunks(8)
+                                .map(|part| String::from_utf8_lossy(part).into_owned())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            ui.monospace(digest);
+                            if package.approved {
+                                ui.label(theme::text(
+                                    "Already approved for this exact source and package identity.",
+                                    theme::body(11.0),
+                                    theme::MUTED,
+                                ));
+                            }
+                        }
+                    });
+                ui.add_space(16.0);
+                let mut answer = None;
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if theme::primary_small(
+                        ui,
+                        true,
+                        None,
+                        "Approve and continue",
+                        true,
+                    )
+                    .clicked()
+                    {
+                        answer = Some(true);
+                    }
+                    if theme::quiet_button(ui, true, None, "Decline", Quiet::new()).clicked() {
+                        answer = Some(false);
+                    }
+                });
+                answer
+            });
+        let answer = modal
+            .inner
+            .or_else(|| modal.should_close().then_some(false));
+        if let Some(approved) = answer {
+            self.backend.act(Action::NativeConsentDecision {
+                request_id: prompt.request_id,
+                approved,
+            });
+        }
+    }
+
     /// Closing the window during a game asks first.
     fn guard_quit(&mut self, ctx: &egui::Context, state: &State) {
         let close = ctx.input(|input| input.viewport().close_requested());
@@ -1800,6 +2036,857 @@ fn rules_chip(ui: &mut Ui, rules: &str) -> egui::Response {
     );
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &words));
     response
+}
+
+impl<B: Backend> LauncherApp<B> {
+    /// The room's native mods in its lobby, whether this game runs each,
+    /// and what the launcher is doing to get them.
+    fn room_native(&mut self, ui: &mut Ui, state: &State) {
+        ui.label(theme::text(
+            "The room's native mods",
+            theme::semibold(12.0),
+            theme::TEXT,
+        ));
+        ui.add_space(6.0);
+        for row in &state.room_native {
+            let (mark, color) = match row.have {
+                ModHave::Yes => ("ready", theme::TEXT),
+                ModHave::OtherVersion => ("other version or settings", theme::DIFFERS_TEXT),
+                ModHave::No => ("missing", theme::DIFFERS_TEXT),
+            };
+            ui.label(theme::text(
+                format!("{} {} · {mark}", row.name, row.version),
+                theme::body(12.0),
+                color,
+            ));
+            ui.add_space(3.0);
+        }
+        match &state.native_busy {
+            Some(busy) => {
+                ui.add_space(4.0);
+                ui.label(theme::text(busy, theme::body(12.0), theme::MUTED));
+            }
+            None if state.room_native.iter().any(|row| row.have != ModHave::Yes) => {
+                ui.add_space(6.0);
+                if theme::quiet_button(
+                    ui,
+                    state.native.available,
+                    Some("download"),
+                    "Get the room's native mods",
+                    Quiet::new(),
+                )
+                .clicked()
+                {
+                    self.backend.act(Action::NativeMatchRoom);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// What the launcher is doing with native mods, or what went wrong.
+    fn mods_status(ui: &mut Ui, state: &State) {
+        if let Some(busy) = &state.native_busy {
+            ui.label(theme::text(busy, theme::body(12.0), theme::TEXT));
+            ui.add_space(10.0);
+        }
+        if let Some(problem) = &state.native.problem {
+            ui.label(theme::text(problem, theme::body(12.0), theme::DIFFERS_TEXT));
+            ui.add_space(10.0);
+        }
+    }
+
+    /// The mod manager: the native mods installed, in the order the game
+    /// loads them, `height` high.
+    fn mod_manager(&mut self, ui: &mut Ui, state: &State, height: f32) {
+        let installed = installed_rows(state);
+        Self::mods_status(ui, state);
+        if installed.is_empty() {
+            mod_card(ui, |ui| {
+                ui.label(theme::text(
+                    "No native mods installed yet",
+                    theme::semibold(14.0),
+                    theme::TEXT,
+                ));
+                ui.add_space(6.0);
+                ui.label(theme::text(
+                    "Native mods change the game itself, such as Big Maps. Find one in the mod \
+                     browser, or join a room that uses some: the launcher gets them for you and \
+                     starts the game again with them.",
+                    theme::body(12.0),
+                    theme::MUTED,
+                ));
+                ui.add_space(12.0);
+                if theme::quiet_button(
+                    ui,
+                    true,
+                    Some("search"),
+                    "Open the mod browser",
+                    Quiet::new(),
+                )
+                .clicked()
+                {
+                    self.mods = Some(ModsPage::Browser);
+                }
+            });
+            return;
+        }
+        let on = installed.iter().filter(|row| row.enabled).count();
+        let updates = installed.iter().filter(|row| has_update(row)).count();
+        let mut summary = format!("{} installed · {on} on", installed.len());
+        match updates {
+            0 => {}
+            1 => summary.push_str(" · 1 update"),
+            n => summary.push_str(&format!(" · {n} updates")),
+        }
+        summary.push_str(" · changes take effect the next time the launcher starts the game");
+        ui.label(theme::text(summary, theme::body(12.0), theme::MUTED));
+        ui.add_space(12.0);
+        self.mods_table(ui, state, &installed, ModsPage::Manager, height - 30.0);
+    }
+
+    /// The mod browser: the native mods the server offers for this game,
+    /// to search, and when the player asks, the proposed ones; `height`
+    /// high.
+    fn mod_browser(&mut self, ui: &mut Ui, state: &State, height: f32) {
+        let native = &state.native;
+        let idle = state.native_busy.is_none();
+        let controls = vec2(TABLE_WIDTH + PANES_GAP + DETAIL_WIDTH, 62.0);
+        ui.allocate_ui_with_layout(controls, Layout::left_to_right(Align::Max), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.vertical(|ui| {
+                ui.set_width(TABLE_WIDTH - 8.0);
+                labelled_field(
+                    ui,
+                    "Search",
+                    None,
+                    theme::text_field(
+                        &mut self.mod_search,
+                        "A mod's name, author or description",
+                        false,
+                    ),
+                );
+            });
+            if theme::quiet_button(ui, idle, Some("refresh"), "Check the index", Quiet::new())
+                .clicked()
+            {
+                self.backend.act(Action::NativeRefresh);
+            }
+            if native.server.is_some() {
+                let words = if native.proposed_shown {
+                    "Hide proposed"
+                } else {
+                    "Show proposed"
+                };
+                if theme::quiet_button(ui, idle, None, words, Quiet::new()).clicked() {
+                    self.backend.act(Action::NativeShowProposed {
+                        on: !native.proposed_shown,
+                    });
+                }
+            }
+        });
+        ui.add_space(8.0);
+        let mut line = match &native.server {
+            Some(server) => format!("The mods {server} offers for this game."),
+            None => "The mods offered for this game.".to_owned(),
+        };
+        if native.proposed_shown {
+            line.push_str(
+                " Proposed mods are open pull requests to the server's list of mods: nobody has \
+                 reviewed them yet. Install one only if you trust its authors.",
+            );
+        }
+        ui.label(theme::text(
+            line,
+            theme::body(11.0),
+            if native.proposed_shown {
+                theme::DIFFERS_TEXT
+            } else {
+                theme::MUTED
+            },
+        ));
+        ui.add_space(12.0);
+        Self::mods_status(ui, state);
+        if native.packages.is_empty() {
+            ui.label(theme::text(
+                if !native.available {
+                    "Your server offers no native mods yet."
+                } else if native.serial.is_some() {
+                    "The index lists no native mod for this game yet."
+                } else {
+                    "Check the index to see the native mods for this game."
+                },
+                theme::body(12.0),
+                theme::MUTED,
+            ));
+            return;
+        }
+        let search = self.mod_search.trim().to_lowercase();
+        let shown: Vec<&NativeRow> = native
+            .packages
+            .iter()
+            .filter(|row| row.listed)
+            .filter(|row| {
+                search.is_empty()
+                    || [&row.name, &row.description, &row.id]
+                        .into_iter()
+                        .chain(&row.authors)
+                        .any(|text| text.to_lowercase().contains(&search))
+            })
+            .collect();
+        if shown.is_empty() {
+            ui.label(theme::text(
+                format!("No mod matches \u{201c}{}\u{201d}.", self.mod_search.trim()),
+                theme::body(12.0),
+                theme::MUTED,
+            ));
+            return;
+        }
+        self.mods_table(ui, state, &shown, ModsPage::Browser, height - 80.0);
+    }
+
+    /// `rows` as a table, `height` high, beside the details of the one
+    /// picked (the first, until the player picks another).
+    fn mods_table(
+        &mut self,
+        ui: &mut Ui,
+        state: &State,
+        rows: &[&NativeRow],
+        page: ModsPage,
+        height: f32,
+    ) {
+        let picked = self
+            .selected_mod
+            .clone()
+            .filter(|id| rows.iter().any(|row| &row.id == id))
+            .or_else(|| rows.first().map(|row| row.id.clone()));
+        self.selected_mod.clone_from(&picked);
+        let height = height.max(180.0);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = PANES_GAP;
+            ui.vertical(|ui| {
+                ui.set_width(TABLE_WIDTH);
+                table_header(ui, page);
+                ScrollArea::vertical()
+                    .id_salt(("mods-table", page))
+                    .max_height(height - HEADER_HEIGHT)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for row in rows {
+                            let chosen = picked.as_deref() == Some(row.id.as_str());
+                            if self.table_row(ui, row, page, chosen).clicked() {
+                                self.selected_mod = Some(row.id.clone());
+                            }
+                        }
+                    });
+            });
+            ui.vertical(|ui| {
+                ui.set_width(DETAIL_WIDTH);
+                ScrollArea::vertical()
+                    .id_salt(("mods-detail", page))
+                    .max_height(height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        if let Some(row) = rows
+                            .iter()
+                            .find(|row| picked.as_deref() == Some(row.id.as_str()))
+                        {
+                            self.mod_details(ui, state, row, page);
+                        }
+                    });
+            });
+        });
+    }
+
+    /// One mod's line in the table: its preview, name and authors, and the
+    /// page's columns. Clicked, it is picked.
+    fn table_row(
+        &mut self,
+        ui: &mut Ui,
+        row: &NativeRow,
+        page: ModsPage,
+        chosen: bool,
+    ) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(TABLE_WIDTH, ROW_HEIGHT), Sense::click());
+        response.widget_info(|| {
+            WidgetInfo::selected(WidgetType::SelectableLabel, true, chosen, &row.name)
+        });
+        if !ui.is_rect_visible(rect) {
+            return response;
+        }
+        let painter = ui.painter_at(rect);
+        let fill = if chosen {
+            theme::white(0.075)
+        } else if response.hovered() {
+            theme::white(0.035)
+        } else {
+            Color32::TRANSPARENT
+        };
+        painter.rect_filled(rect.shrink2(vec2(0.0, 2.0)), 6.0, fill);
+        if chosen {
+            painter.rect_stroke(
+                rect.shrink2(vec2(0.5, 2.5)),
+                6.0,
+                Stroke::new(1.0, theme::white(0.16)),
+                StrokeKind::Inside,
+            );
+        }
+        let thumb = Rect::from_center_size(
+            pos2(rect.min.x + 8.0 + THUMB.x / 2.0, rect.center().y),
+            THUMB,
+        );
+        self.preview(ui.ctx(), &painter, thumb, row);
+        let mut x = thumb.max.x + 12.0;
+        let name_width =
+            TABLE_WIDTH - (x - rect.min.x) - columns(page).iter().map(|c| c.1).sum::<f32>();
+        let name = one_line(
+            ui,
+            &row.name,
+            theme::semibold(13.0),
+            theme::TEXT,
+            name_width - 10.0,
+        );
+        let (under, under_color) = if row.proposed.is_some() {
+            ("Proposed · not reviewed".to_owned(), theme::DIFFERS_TEXT)
+        } else if page == ModsPage::Browser && row.installed.is_none() && row.unsupported.is_some()
+        {
+            ("Can't be installed here".to_owned(), theme::DIFFERS_TEXT)
+        } else if row.code {
+            (
+                format!("{} · runs code", by(&row.authors).unwrap_or_default()),
+                theme::DIFFERS_TEXT,
+            )
+        } else {
+            let mut under = by(&row.authors).unwrap_or_default();
+            if page == ModsPage::Browser && row.installed.is_some() {
+                if !under.is_empty() {
+                    under.push_str(" · ");
+                }
+                under.push_str(if has_update(row) {
+                    "update"
+                } else {
+                    "installed"
+                });
+            }
+            (under, theme::MUTED)
+        };
+        let under = one_line(
+            ui,
+            &under,
+            theme::body(11.0),
+            under_color,
+            name_width - 10.0,
+        );
+        let top = rect.center().y - (name.size().y + 2.0 + under.size().y) / 2.0;
+        painter.galley(pos2(x, top), name.clone(), theme::TEXT);
+        painter.galley(pos2(x, top + name.size().y + 2.0), under, under_color);
+        x += name_width;
+        for ((value, color), (_, width)) in cells(row, page).into_iter().zip(columns(page)) {
+            let galley = one_line(ui, &value, theme::body(12.0), color, width - 8.0);
+            painter.galley(
+                pos2(x, rect.center().y - galley.size().y / 2.0),
+                galley,
+                color,
+            );
+            x += width;
+        }
+        painter.hline(
+            rect.x_range(),
+            rect.max.y - 0.5,
+            Stroke::new(1.0, theme::white(0.06)),
+        );
+        response
+    }
+
+    /// The picked mod: its preview, large, what it is, and what can be
+    /// done with it.
+    fn mod_details(&mut self, ui: &mut Ui, state: &State, row: &NativeRow, page: ModsPage) {
+        let idle = state.native_busy.is_none();
+        let (image, _) =
+            ui.allocate_exact_size(vec2(DETAIL_WIDTH, DETAIL_WIDTH / 2.0), Sense::hover());
+        let painter = ui.painter().clone();
+        self.preview(ui.ctx(), &painter, image, row);
+        ui.add_space(12.0);
+        ui.label(theme::text(&row.name, theme::semibold(18.0), theme::TEXT));
+        if let Some(authors) = by(&row.authors) {
+            ui.add_space(2.0);
+            ui.label(theme::text(authors, theme::body(12.0), theme::MUTED));
+        }
+        let mut pills: Vec<(String, Pill)> = Vec::new();
+        if row.installed.is_some() {
+            pills.push(if row.enabled {
+                ("On".into(), Pill::Ready)
+            } else {
+                ("Off".into(), Pill::Unknown)
+            });
+        }
+        if has_update(row)
+            && let Some(available) = &row.available
+        {
+            pills.push((format!("{available} available"), Pill::Update));
+        }
+        if row.proposed.is_some() {
+            pills.push(("Proposed".into(), Pill::Update));
+        }
+        if row.code {
+            pills.push(("Runs code".into(), Pill::Update));
+        }
+        if !row.listed {
+            pills.push(("No longer offered".into(), Pill::Unknown));
+        }
+        if !pills.is_empty() {
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                for (words, pill) in &pills {
+                    theme::pill(ui, words, *pill);
+                }
+            });
+        }
+        if !row.description.is_empty() {
+            ui.add_space(10.0);
+            ui.label(theme::text(
+                &row.description,
+                theme::body(12.5),
+                theme::TEXT,
+            ));
+        }
+        if row.code {
+            ui.add_space(8.0);
+            ui.label(theme::text(
+                "Runs its own code in the game, with your account's rights on this PC. Install \
+                 it only from a server you trust.",
+                theme::body(12.0),
+                theme::DIFFERS_TEXT,
+            ));
+        }
+        if let Some(why) = row.unsupported.as_ref().filter(|_| row.installed.is_none()) {
+            ui.add_space(8.0);
+            ui.label(theme::text(
+                format!("Can't be installed: {why}."),
+                theme::body(12.0),
+                theme::DIFFERS_TEXT,
+            ));
+        }
+        if let Some(clash) = &row.clash {
+            ui.add_space(8.0);
+            ui.label(theme::text(
+                format!("Can't be switched on: {clash}. Switch that mod off first."),
+                theme::body(12.0),
+                theme::DIFFERS_TEXT,
+            ));
+        }
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            let id = row.id.clone();
+            match page {
+                ModsPage::Manager => {
+                    if has_update(row)
+                        && theme::quiet_button(ui, idle, Some("download"), "Update", Quiet::new())
+                            .clicked()
+                    {
+                        self.backend.act(Action::NativeInstall { id: id.clone() });
+                    }
+                    let words = if row.enabled {
+                        "Switch off"
+                    } else {
+                        "Switch on"
+                    };
+                    let allowed = idle && (row.enabled || row.clash.is_none());
+                    if theme::quiet_button(ui, allowed, None, words, Quiet::new()).clicked() {
+                        self.backend.act(Action::NativeEnable {
+                            id: id.clone(),
+                            on: !row.enabled,
+                        });
+                    }
+                    if let Some(previous) = &row.previous
+                        && theme::quiet_button(
+                            ui,
+                            idle,
+                            None,
+                            &format!("Roll back to {previous}"),
+                            Quiet::new(),
+                        )
+                        .clicked()
+                    {
+                        self.backend.act(Action::NativeRollback { id: id.clone() });
+                    }
+                    let uninstall = Quiet::new().color(theme::rgba(242, 168, 160, 1.0));
+                    if theme::quiet_button(ui, idle, None, "Uninstall", uninstall).clicked() {
+                        self.backend.act(Action::NativeUninstall { id });
+                    }
+                }
+                ModsPage::Browser => {
+                    let words = match (&row.installed, &row.available) {
+                        (None, Some(_)) => Some("Install"),
+                        (Some(_), Some(_)) if has_update(row) => Some("Update"),
+                        _ => None,
+                    };
+                    let installable = idle && row.unsupported.is_none();
+                    if let Some(words) = words
+                        && theme::quiet_button(
+                            ui,
+                            installable,
+                            Some("download"),
+                            words,
+                            Quiet::new(),
+                        )
+                        .clicked()
+                    {
+                        self.backend.act(if row.proposed.is_some() {
+                            Action::NativeInstallProposed { id }
+                        } else {
+                            Action::NativeInstall { id }
+                        });
+                    } else if row.installed.is_some()
+                        && theme::quiet_button(ui, true, Some("archive"), "Manage", Quiet::new())
+                            .clicked()
+                    {
+                        self.mods = Some(ModsPage::Manager);
+                    }
+                }
+            }
+        });
+        if let Some(proposal) = &row.proposed {
+            ui.add_space(8.0);
+            ui.hyperlink_to(
+                theme::text(
+                    format!(
+                        "Proposed in pull request #{}: not reviewed",
+                        proposal.number
+                    ),
+                    theme::body(12.0),
+                    theme::DIFFERS_TEXT,
+                ),
+                &proposal.url,
+            );
+        }
+        if let Some(homepage) = &row.homepage {
+            ui.add_space(8.0);
+            ui.hyperlink_to(
+                theme::text("Project page \u{2197}", theme::body(12.0), theme::ACCENT),
+                homepage,
+            );
+        }
+        ui.add_space(12.0);
+        let facts = facts(row, page);
+        let last = facts.len().saturating_sub(1);
+        for (at, (name, value)) in facts.iter().enumerate() {
+            theme::row(ui, name, value, false, at == last);
+        }
+    }
+
+    /// `row`'s preview in `rect`, cropped to fill it; its initials while
+    /// it loads, or when it has none.
+    fn preview(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: Rect,
+        row: &NativeRow,
+    ) {
+        let texture = row
+            .preview
+            .as_deref()
+            .and_then(|url| self.previews.get(ctx, url));
+        match texture {
+            Some(texture) => {
+                let [w, h] = texture.size();
+                let (wanted, has) = (rect.width() / rect.height(), w as f32 / h.max(1) as f32);
+                let uv = if has > wanted {
+                    let cut = (1.0 - wanted / has) / 2.0;
+                    Rect::from_min_max(pos2(cut, 0.0), pos2(1.0 - cut, 1.0))
+                } else {
+                    let cut = (1.0 - has / wanted) / 2.0;
+                    Rect::from_min_max(pos2(0.0, cut), pos2(1.0, 1.0 - cut))
+                };
+                painter.image(texture.id(), rect, uv, Color32::WHITE);
+            }
+            None => {
+                let hue = row.id.bytes().fold(7u32, |hash, b| {
+                    hash.wrapping_mul(31).wrapping_add(u32::from(b))
+                });
+                let fill = egui::ecolor::Hsva::new((hue % 360) as f32 / 360.0, 0.28, 0.32, 1.0);
+                painter.rect_filled(rect, 4.0, Color32::from(fill));
+                let initials: String = row
+                    .name
+                    .split_whitespace()
+                    .filter_map(|word| word.chars().next())
+                    .take(2)
+                    .collect::<String>()
+                    .to_uppercase();
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    initials,
+                    theme::semibold((rect.height() * 0.38).clamp(11.0, 44.0)),
+                    theme::white(0.85),
+                );
+            }
+        }
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, theme::white(0.1)),
+            StrokeKind::Inside,
+        );
+    }
+}
+
+/// Which mods dialog is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ModsPage {
+    /// The native mods installed.
+    Manager,
+    /// The native mods the server offers.
+    Browser,
+}
+
+/// The mods dialog's table, its details beside it, and the gap between.
+const TABLE_WIDTH: f32 = 540.0;
+const DETAIL_WIDTH: f32 = 300.0;
+const PANES_GAP: f32 = 20.0;
+const ROW_HEIGHT: f32 = 54.0;
+const HEADER_HEIGHT: f32 = 26.0;
+/// A preview in the table, 16:9.
+const THUMB: Vec2 = vec2(64.0, 36.0);
+
+/// The native mods installed, in the order the game loads those enabled.
+fn installed_rows(state: &State) -> Vec<&NativeRow> {
+    state
+        .native
+        .packages
+        .iter()
+        .filter(|row| row.installed.is_some() && row.proposed.is_none())
+        .collect()
+}
+
+/// Whether the index has a newer version of an installed mod.
+fn has_update(row: &NativeRow) -> bool {
+    row.installed.is_some()
+        && row
+            .available
+            .as_ref()
+            .is_some_and(|available| row.installed.as_ref() != Some(available))
+}
+
+/// The table's columns after the mod's own, and their widths.
+fn columns(page: ModsPage) -> [(&'static str, f32); 4] {
+    match page {
+        ModsPage::Manager => [
+            ("Version", 72.0),
+            ("Size", 70.0),
+            ("Load order", 76.0),
+            ("Status", 86.0),
+        ],
+        ModsPage::Browser => [
+            ("Version", 72.0),
+            ("Size", 70.0),
+            ("Downloads", 80.0),
+            ("Updated", 82.0),
+        ],
+    }
+}
+
+/// `row`'s values in the page's columns, each with its colour.
+fn cells(row: &NativeRow, page: ModsPage) -> [(String, Color32); 4] {
+    let dash = || ("\u{2014}".to_owned(), theme::MUTED);
+    let size = |bytes: Option<u64>| bytes.map_or_else(dash, |b| (size_text(b), theme::TEXT));
+    match page {
+        ModsPage::Manager => [
+            (row.installed.clone().unwrap_or_default(), theme::TEXT),
+            size(row.installed_size),
+            row.load_order
+                .map_or_else(dash, |at| (format!("#{at}"), theme::TEXT)),
+            if has_update(row) {
+                (
+                    if row.enabled {
+                        "On · update"
+                    } else {
+                        "Off · update"
+                    }
+                    .to_owned(),
+                    theme::ACCENT,
+                )
+            } else if row.enabled {
+                ("On".to_owned(), theme::OK)
+            } else if row.clash.is_some() {
+                ("Off · clashes".to_owned(), theme::DIFFERS_TEXT)
+            } else {
+                ("Off".to_owned(), theme::MUTED)
+            },
+        ],
+        ModsPage::Browser => [
+            (
+                row.available
+                    .clone()
+                    .or_else(|| row.installed.clone())
+                    .unwrap_or_default(),
+                theme::TEXT,
+            ),
+            size(row.available_size.or(row.installed_size)),
+            row.downloads
+                .map_or_else(dash, |n| (count_text(n), theme::TEXT)),
+            row.updated
+                .as_deref()
+                .map_or_else(dash, |day| (day_text(day), theme::TEXT)),
+        ],
+    }
+}
+
+/// What the details say of `row`, name and value.
+fn facts(row: &NativeRow, page: ModsPage) -> Vec<(&'static str, String)> {
+    let mut facts = Vec::new();
+    match page {
+        ModsPage::Manager => {
+            if let Some(installed) = &row.installed {
+                facts.push(("Version", installed.clone()));
+            }
+            if let Some(size) = row.installed_size {
+                facts.push(("Size", size_text(size)));
+            }
+            facts.push((
+                "Load order",
+                row.load_order
+                    .map_or_else(|| "Not loaded: off".to_owned(), |at| format!("#{at}")),
+            ));
+        }
+        ModsPage::Browser => {
+            if let Some(version) = row.available.as_ref().or(row.installed.as_ref()) {
+                facts.push(("Version", version.clone()));
+            }
+            if let Some(size) = row.available_size.or(row.installed_size) {
+                facts.push(("Download", size_text(size)));
+            }
+        }
+    }
+    if let Some(downloads) = row.downloads {
+        facts.push(("Downloads", count_text(downloads)));
+    }
+    if let Some(day) = &row.updated {
+        facts.push(("Updated", day_text(day)));
+    }
+    facts.push((
+        "In a room",
+        if row.simulation {
+            "Every player runs it".to_owned()
+        } else {
+            "Only for you".to_owned()
+        },
+    ));
+    facts
+}
+
+/// "by Ann and Bob".
+fn by(authors: &[String]) -> Option<String> {
+    match authors {
+        [] => None,
+        [one] => Some(format!("by {one}")),
+        [rest @ .., last] => Some(format!("by {} and {last}", rest.join(", "))),
+    }
+}
+
+/// `bytes` as players read sizes: 812 KB, 4.2 MB.
+fn size_text(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < KB * KB {
+        format!("{:.0} KB", b / KB)
+    } else if b < KB * KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else {
+        format!("{:.1} GB", b / (KB * KB * KB))
+    }
+}
+
+/// A count as players read it: 950, 1.3k, 2.4M.
+fn count_text(count: u64) -> String {
+    match count {
+        0..1_000 => count.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", count as f64 / 1e3),
+        _ => format!("{:.1}M", count as f64 / 1e6),
+    }
+}
+
+/// `YYYY-MM-DD` as `30 Sep 2026`.
+fn day_text(day: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut parts = day.split('-');
+    match (
+        parts.next(),
+        parts.next().and_then(|m| m.parse::<usize>().ok()),
+        parts.next(),
+    ) {
+        (Some(year), Some(month @ 1..=12), Some(d)) => {
+            format!("{} {} {year}", d.trim_start_matches('0'), MONTHS[month - 1])
+        }
+        _ => day.to_owned(),
+    }
+}
+
+/// `text` on one line, cut with an ellipsis to `width`.
+fn one_line(
+    ui: &Ui,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat::simple(font, color),
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(10.0));
+    ui.painter().layout_job(job)
+}
+
+/// The table's column names.
+fn table_header(ui: &mut Ui, page: ModsPage) {
+    let (rect, _) = ui.allocate_exact_size(vec2(TABLE_WIDTH, HEADER_HEIGHT), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let label = |x: f32, words: &str| {
+        painter.text(
+            pos2(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            words.to_uppercase(),
+            theme::body(9.5),
+            theme::MUTED,
+        );
+    };
+    let mut x = rect.min.x + 8.0 + THUMB.x + 12.0;
+    label(x, "Mod");
+    x = rect.max.x - columns(page).iter().map(|c| c.1).sum::<f32>();
+    for (name, width) in columns(page) {
+        label(x, name);
+        x += width;
+    }
+    painter.hline(
+        rect.x_range(),
+        rect.max.y - 0.5,
+        Stroke::new(1.0, theme::white(0.094)),
+    );
+}
+
+/// One card in the mods dialog: a faint frame.
+fn mod_card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    Frame::new()
+        .fill(theme::rgba(34, 43, 46, 0.35))
+        .stroke(Stroke::new(1.0, theme::white(0.094)))
+        .corner_radius(8)
+        .inner_margin(Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            add(ui);
+        });
 }
 
 /// How this player's game differs from the room's.

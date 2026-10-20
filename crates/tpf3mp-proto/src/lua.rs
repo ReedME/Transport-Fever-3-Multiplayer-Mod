@@ -1096,6 +1096,9 @@ mod tests {
                 .unwrap(),
                 BoundedVec::new(vec![Link {
                     precedence: None,
+                    position0: None,
+                    position1: None,
+                    kept: BoundedVec::default(),
 
                     from: 0,
                     to: 1,
@@ -1112,6 +1115,7 @@ mod tests {
                 BoundedVec::<EdgeRef, 256>::empty(),
             )
             .unwrap(),
+            crossing_type: None,
         });
         assert_eq!(action, expected);
         let back = action_to_lua(&action).unwrap();
@@ -1293,7 +1297,7 @@ mod tests {
              `Bulldoze`, `BuildConstruction`, `BuyVehicle`, `SellVehicle`, `CreateLine`, \
              `EditLine`, `AssignLine`, `PlaceStop`, `Terraform`, `CompanyOp`, `Loan`, `VehicleOp`, \
              `ReplaceVehicle`, `Prospect`, `NotificationSeen`, `ApplyRank`, `EditJunctions`, \
-             `Subsidy`, `Rename`, `Perk`, `Preserve`, `CalendarSpeed`, `PlaceSignals`"
+             `Subsidy`, `Rename`, `Perk`, `Preserve`, `CalendarSpeed`, `PlaceSignals`, `Paint`, `PlantAssets`, `SetCrossingType`"
         );
     }
 

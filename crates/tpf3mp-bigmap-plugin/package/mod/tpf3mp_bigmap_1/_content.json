@@ -1,0 +1,8 @@
+{
+    "archives": null,
+    "files": [
+        "gui/menu/new_game_or_map_settings_page.tl",
+        "scripts/tpf3mp_bigmap/ladder.lua",
+        "scripts/tpf3mp_bigmap/menu.lua"
+    ]
+}
