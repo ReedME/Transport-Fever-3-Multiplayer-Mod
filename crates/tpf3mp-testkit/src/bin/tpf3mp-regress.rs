@@ -102,6 +102,7 @@ async fn main() -> Result<ExitCode> {
         anyhow::bail!("no scenario {unknown}; --list shows them");
     }
     let settings = RoomSettings {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         steps_per_second: args.sps,
         input_delay_ms: args.input_delay_ms,
         checkpoint_interval: args.checkpoint_interval,

@@ -9,6 +9,7 @@ use std::{
 };
 
 use ring::hmac;
+use serde::Serialize;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tpf3mp_proto::{
@@ -83,6 +84,72 @@ struct Registered {
     /// private room, whose invite the server keeps only as its tag. Kept in
     /// memory only: a room restored after a restart is private.
     invite: Option<Invite>,
+}
+
+/// Which rooms the admin endpoint shows (`/rooms`).
+pub(crate) enum RoomFilter {
+    All,
+    /// The room an invite opens. Never logged: an invite lets anyone in.
+    Invite(Invite),
+    /// The rooms a player (`p-…`) is in.
+    Player(String),
+    /// The rooms with a member whose name holds this, in lower case.
+    Name(String),
+}
+
+/// A room as the operator's admin endpoint shows it: never its invite.
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminRoom {
+    pub(crate) room: String,
+    pub(crate) name: String,
+    pub(crate) rules: String,
+    pub(crate) phase: &'static str,
+    /// Whether the room list shows it.
+    pub(crate) public: bool,
+    pub(crate) password: bool,
+    pub(crate) competitive: bool,
+    pub(crate) players: u8,
+    pub(crate) connected: u8,
+    pub(crate) max_players: u8,
+    pub(crate) owner: String,
+    pub(crate) members: Vec<AdminMember>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminMember {
+    pub(crate) player: String,
+    pub(crate) name: String,
+    pub(crate) connected: bool,
+}
+
+impl AdminRoom {
+    fn new(id: RoomId, summary: &crate::room::Summary) -> Self {
+        Self {
+            room: id.to_string(),
+            name: summary.name.as_str().to_owned(),
+            rules: summary.rules.as_str().to_owned(),
+            phase: match summary.phase {
+                RoomPhase::Lobby => "lobby",
+                RoomPhase::Running => "running",
+            },
+            public: summary.listing.is_some(),
+            password: summary.has_password,
+            competitive: summary.competitive,
+            players: summary.players,
+            connected: summary.connected,
+            max_players: summary.max_players,
+            owner: summary.owner.to_string(),
+            members: summary
+                .members
+                .iter()
+                .map(|member| AdminMember {
+                    player: member.player.to_string(),
+                    name: member.name.as_str().to_owned(),
+                    connected: member.connected,
+                })
+                .collect(),
+        }
+    }
 }
 
 pub(crate) struct DirectoryConfig {
@@ -401,6 +468,43 @@ impl Directory {
         }
     }
 
+    /// The rooms open now that `filter` keeps, for the operator's admin
+    /// endpoint, by room ID.
+    pub(crate) fn admin_view(&self, filter: &RoomFilter) -> Vec<AdminRoom> {
+        let tag = match filter {
+            RoomFilter::Invite(invite) => Some(self.invite_tag(invite)),
+            _ => None,
+        };
+        let rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
+        let ids: Vec<RoomId> = match &tag {
+            Some(tag) => rooms.by_invite.get(tag).copied().into_iter().collect(),
+            None => rooms.by_id.keys().copied().collect(),
+        };
+        let mut shown: Vec<AdminRoom> =
+            ids.into_iter()
+                .filter_map(|id| {
+                    let registered = rooms.by_id.get(&id)?;
+                    let summary = registered
+                        .summary
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let kept = match filter {
+                        RoomFilter::All | RoomFilter::Invite(_) => true,
+                        RoomFilter::Player(player) => summary
+                            .members
+                            .iter()
+                            .any(|member| member.player.to_string() == *player),
+                        RoomFilter::Name(name) => summary.members.iter().any(|member| {
+                            member.name.as_str().to_lowercase().contains(name.as_str())
+                        }),
+                    };
+                    kept.then(|| AdminRoom::new(id, &summary))
+                })
+                .collect();
+        shown.sort_by(|a, b| a.room.cmp(&b.room));
+        shown
+    }
+
     /// Page `page` of the public rooms, [`ROOMS_PER_PAGE`] a page: those in
     /// their lobby first, then the fuller, then by name. A private room is
     /// never in it, nor one nobody is connected to: its game waits out its
@@ -536,15 +640,16 @@ mod tests {
                 content: None,
             }],
             base: None,
+            native_mods: Vec::new(),
         }
     }
 
     /// A valid room sorts before the incompatible room. Without preflight,
     /// recovery rewrites and registers it before quarantining the old log.
-    fn logged_rooms(data: &Path, store: &ChunkStore) -> PathBuf {
+    fn logged_rooms(data: &Path, store: &ChunkStore, version: u16) -> PathBuf {
         let valid = start(0, persist::FORMAT_VERSION);
         drop(RoomLog::create(data, &valid).unwrap());
-        let old = start(1, 8);
+        let old = start(1, version);
         drop(RoomLog::create(data, &old).unwrap());
         // Cleanup of an interrupted, current-format compaction must not run.
         let partial = RoomLog::path_for(data, &valid.id).with_extension("log.compacting");
@@ -602,132 +707,138 @@ mod tests {
 
     #[tokio::test]
     async fn incompatible_startup_preserves_every_log_pointer_and_snapshot_byte() {
-        for extension in ["log", "broken", "log.compacting"] {
-            let temp = tempfile::tempdir().unwrap();
-            let data = temp.path().join("data");
-            let snapshots = temp.path().join("snapshots");
-            let store = ChunkStore::open(&snapshots, StoreConfig::new(1 << 20)).unwrap();
-            let original = logged_rooms(&data, &store);
-            let legacy = original.with_extension(extension);
-            if legacy != original {
-                fs::rename(&original, &legacy).unwrap();
+        for version in [8_u16, 9, 10] {
+            for extension in ["log", "broken", "log.compacting"] {
+                let temp = tempfile::tempdir().unwrap();
+                let data = temp.path().join("data");
+                let snapshots = temp.path().join("snapshots");
+                let store = ChunkStore::open(&snapshots, StoreConfig::new(1 << 20)).unwrap();
+                let original = logged_rooms(&data, &store, version);
+                let legacy = original.with_extension(extension);
+                if legacy != original {
+                    fs::rename(&original, &legacy).unwrap();
+                }
+                // ChunkStore::open clears tmp: preservation proves bind refuses
+                // before reopening the store, as well as before recovery/GC.
+                fs::write(snapshots.join("tmp/unfinished"), b"keep pending disk work").unwrap();
+                drop(store);
+                let before_data = file_bytes(&data);
+                let before_snapshots = file_bytes(&snapshots);
+                let diagnostics = temp.path().join("diagnostics");
+                let mut config = config(&data, &snapshots);
+                config.diagnostics = Some(DiagnosticsConfig::new(
+                    diagnostics.clone(),
+                    Duration::ZERO,
+                    0,
+                ));
+                let error = match Server::bind(config) {
+                    Err(error) => error,
+                    Ok(_) => panic!("incompatible room data must refuse startup"),
+                };
+                assert!(
+                    matches!(error, ServerError::Recovery(RecoveryError::UnsupportedFormat { path, found, supported: persist::FORMAT_VERSION }) if path == legacy && found == version)
+                );
+                assert_eq!(
+                    file_bytes(&data),
+                    before_data,
+                    "all rooms and partials are unchanged"
+                );
+                assert_eq!(
+                    file_bytes(&snapshots),
+                    before_snapshots,
+                    "roots, chunks and unfinished work are unchanged"
+                );
+                assert!(
+                    !diagnostics.exists(),
+                    "preflight precedes diagnostics startup"
+                );
             }
-            // ChunkStore::open clears tmp: preservation proves bind refuses
-            // before reopening the store, as well as before recovery/GC.
-            fs::write(snapshots.join("tmp/unfinished"), b"keep pending disk work").unwrap();
-            drop(store);
-            let before_data = file_bytes(&data);
-            let before_snapshots = file_bytes(&snapshots);
-            let diagnostics = temp.path().join("diagnostics");
-            let mut config = config(&data, &snapshots);
-            config.diagnostics = Some(DiagnosticsConfig::new(
-                diagnostics.clone(),
-                Duration::ZERO,
-                0,
-            ));
-            let error = match Server::bind(config) {
-                Err(error) => error,
-                Ok(_) => panic!("incompatible room data must refuse startup"),
-            };
-            assert!(
-                matches!(error, ServerError::Recovery(RecoveryError::UnsupportedFormat { path, found: 8, supported: persist::FORMAT_VERSION }) if path == legacy)
-            );
-            assert_eq!(
-                file_bytes(&data),
-                before_data,
-                "all rooms and partials are unchanged"
-            );
-            assert_eq!(
-                file_bytes(&snapshots),
-                before_snapshots,
-                "roots, chunks and unfinished work are unchanged"
-            );
-            assert!(
-                !diagnostics.exists(),
-                "preflight precedes diagnostics startup"
-            );
         }
     }
 
     #[tokio::test]
     async fn direct_recovery_refuses_before_rewriting_registering_or_collecting() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("data");
-        let snapshot_dir = temp.path().join("snapshots");
-        let snapshots = Arc::new(Snapshots::open(&SnapshotConfig::new(&snapshot_dir)).unwrap());
-        let legacy = logged_rooms(&data, &snapshots.store);
-        let before_data = file_bytes(&data);
-        let before_snapshots = file_bytes(&snapshot_dir);
-        let directory = Arc::new(Directory::new(DirectoryConfig {
-            secret: [1; 32],
-            max_rooms: 100,
-            rules: RulesMenu::native(),
-            env: RoomEnv {
-                tick: Duration::from_millis(100),
-                metrics: Arc::new(Metrics::default()),
-                data_dir: Some(data.clone()),
-                timeouts: Timeouts {
-                    stall: Duration::from_secs(10),
-                    load: Duration::from_secs(10),
-                    abandoned: Duration::from_secs(600),
+        for version in [8_u16, 9, 10] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            let snapshot_dir = temp.path().join("snapshots");
+            let snapshots = Arc::new(Snapshots::open(&SnapshotConfig::new(&snapshot_dir)).unwrap());
+            let legacy = logged_rooms(&data, &snapshots.store, version);
+            let before_data = file_bytes(&data);
+            let before_snapshots = file_bytes(&snapshot_dir);
+            let directory = Arc::new(Directory::new(DirectoryConfig {
+                secret: [1; 32],
+                max_rooms: 100,
+                rules: RulesMenu::native(),
+                env: RoomEnv {
+                    tick: Duration::from_millis(100),
+                    metrics: Arc::new(Metrics::default()),
+                    data_dir: Some(data.clone()),
+                    timeouts: Timeouts {
+                        stall: Duration::from_secs(10),
+                        load: Duration::from_secs(10),
+                        abandoned: Duration::from_secs(600),
+                    },
+                    snapshots: Some(snapshots),
+                    compact_log_at: 1 << 20,
                 },
-                snapshots: Some(snapshots),
-                compact_log_at: 1 << 20,
-            },
-        }));
-        let error = directory.recover().unwrap_err();
-        assert!(
-            matches!(error, RecoveryError::UnsupportedFormat { path, found: 8, supported: persist::FORMAT_VERSION } if path == legacy)
-        );
-        assert_eq!(directory.len(), 0, "no earlier valid room was registered");
-        assert_eq!(file_bytes(&data), before_data);
-        assert_eq!(file_bytes(&snapshot_dir), before_snapshots);
+            }));
+            let error = directory.recover().unwrap_err();
+            assert!(
+                matches!(error, RecoveryError::UnsupportedFormat { path, found, supported: persist::FORMAT_VERSION } if path == legacy && found == version)
+            );
+            assert_eq!(directory.len(), 0, "no earlier valid room was registered");
+            assert_eq!(file_bytes(&data), before_data);
+            assert_eq!(file_bytes(&snapshot_dir), before_snapshots);
+        }
     }
 
     #[tokio::test]
     async fn unidentified_first_records_preserve_the_same_data_as_unsupported_formats() {
-        for extension in ["log", "broken", "log.compacting"] {
-            for damage in ["crc", "truncated", "unreadable-version"] {
-                let temp = tempfile::tempdir().unwrap();
-                let data = temp.path().join("data");
-                let snapshots = temp.path().join("snapshots");
-                let store = ChunkStore::open(&snapshots, StoreConfig::new(1 << 20)).unwrap();
-                let original = logged_rooms(&data, &store);
-                let legacy = original.with_extension(extension);
-                let mut bytes = fs::read(&original).unwrap();
-                match damage {
-                    "crc" => bytes[8] ^= 1,
-                    "truncated" => bytes.truncate(4),
-                    "unreadable-version" => {
-                        let payload = [0xff_u8; 10];
-                        bytes.clear();
-                        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
-                        bytes.extend_from_slice(&payload);
+        for version in [8_u16, 9, 10] {
+            for extension in ["log", "broken", "log.compacting"] {
+                for damage in ["crc", "truncated", "unreadable-version"] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let data = temp.path().join("data");
+                    let snapshots = temp.path().join("snapshots");
+                    let store = ChunkStore::open(&snapshots, StoreConfig::new(1 << 20)).unwrap();
+                    let original = logged_rooms(&data, &store, version);
+                    let legacy = original.with_extension(extension);
+                    let mut bytes = fs::read(&original).unwrap();
+                    match damage {
+                        "crc" => bytes[8] ^= 1,
+                        "truncated" => bytes.truncate(4),
+                        "unreadable-version" => {
+                            let payload = [0xff_u8; 10];
+                            bytes.clear();
+                            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                            bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+                            bytes.extend_from_slice(&payload);
+                        }
+                        _ => unreachable!(),
                     }
-                    _ => unreachable!(),
+                    fs::write(&original, bytes).unwrap();
+                    if legacy != original {
+                        fs::rename(&original, &legacy).unwrap();
+                    }
+                    fs::write(snapshots.join("tmp/unfinished"), b"keep pending disk work").unwrap();
+                    drop(store);
+                    let before_data = file_bytes(&data);
+                    let before_snapshots = file_bytes(&snapshots);
+                    let error = match Server::bind(config(&data, &snapshots)) {
+                        Err(error) => error,
+                        Ok(_) => panic!("an unidentified header cannot be declared current format"),
+                    };
+                    assert!(
+                        matches!(error, ServerError::Recovery(RecoveryError::UnknownFormat { path, source: LogError::Damaged(0) }) if path == legacy)
+                    );
+                    assert_eq!(file_bytes(&data), before_data, "{extension} with {damage}");
+                    assert_eq!(
+                        file_bytes(&snapshots),
+                        before_snapshots,
+                        "{extension} with {damage}"
+                    );
                 }
-                fs::write(&original, bytes).unwrap();
-                if legacy != original {
-                    fs::rename(&original, &legacy).unwrap();
-                }
-                fs::write(snapshots.join("tmp/unfinished"), b"keep pending disk work").unwrap();
-                drop(store);
-                let before_data = file_bytes(&data);
-                let before_snapshots = file_bytes(&snapshots);
-                let error = match Server::bind(config(&data, &snapshots)) {
-                    Err(error) => error,
-                    Ok(_) => panic!("an unidentified header cannot be declared current format"),
-                };
-                assert!(
-                    matches!(error, ServerError::Recovery(RecoveryError::UnknownFormat { path, source: LogError::Damaged(0) }) if path == legacy)
-                );
-                assert_eq!(file_bytes(&data), before_data, "{extension} with {damage}");
-                assert_eq!(
-                    file_bytes(&snapshots),
-                    before_snapshots,
-                    "{extension} with {damage}"
-                );
             }
         }
     }

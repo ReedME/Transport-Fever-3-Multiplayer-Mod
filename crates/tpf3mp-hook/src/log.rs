@@ -7,3 +7,8 @@
 pub fn line(message: &str) {
     crate::install::log_line(message);
 }
+
+/// Appends a bounded batch in one write.
+pub fn lines(messages: &[String]) {
+    crate::install::log_lines(messages);
+}

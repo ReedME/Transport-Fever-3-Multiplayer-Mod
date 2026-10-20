@@ -971,6 +971,7 @@ impl<G: RoomGate> StepDriver<G> {
         let now = Instant::now();
         match notice {
             Notice::Diverged { step, lanes } => {
+                crate::log::lines(&crate::persons::freed_ids::trace::incident_lines(*step));
                 let Some(ask) =
                     self.dumps
                         .diverged(*step, lanes, next, self.checkpoint_interval, now)
@@ -1007,6 +1008,9 @@ impl<G: RoomGate> StepDriver<G> {
                 {
                     None => {}
                     Some(Ok(ask)) => {
+                        crate::log::lines(&crate::persons::freed_ids::trace::incident_lines(
+                            ask.diverged,
+                        ));
                         self.log.push(format!(
                             "{} asks for a lane dump: lanes {} at steps {} (step {} diverged there)",
                             from.as_str(),
@@ -1263,6 +1267,10 @@ impl<G: RoomGate> StepDriver<G> {
     /// The room began a game: follow it from here. `place` says where the
     /// game is, for the log.
     fn began(&mut self, begin: &Begin, place: &str) {
+        if let Err(why) = validate_scan_plan(begin.scan_plan, crate::netread::configured_plan()) {
+            self.hold(why);
+            return;
+        }
         self.log.push(format!(
             "the room began a game{place}: rules {}, {} steps a second, checkpoints every {}",
             begin.rules.as_str(),
@@ -1414,6 +1422,7 @@ impl<G: RoomGate> StepDriver<G> {
     /// The room's world is loaded and runs `next_step` next: the reseed and
     /// the order measurement number updates by the room's steps from here.
     fn world_loaded(&mut self, next_step: u64) {
+        crate::persons::freed_ids::trace::reset_world();
         self.next_step = Some(next_step);
         // The released counter starts again here, whatever world ran before;
         // so do the batches the interval times (new GameSims).
@@ -1615,6 +1624,20 @@ pub fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
     }
     std::fs::copy(from, to)?;
     std::fs::remove_file(from)
+}
+
+/// Validate before loads, rules, cadence or room steps can mutate this game.
+fn validate_scan_plan(
+    room: tpf3mp_proto::ScanPlan,
+    local: Result<tpf3mp_proto::ScanPlan, &str>,
+) -> Result<(), String> {
+    let local = local.map_err(|why| format!("invalid local world scan configuration: {why}"))?;
+    if !room.is_valid() || room != local {
+        return Err(format!(
+            "world scan plan differs from the room: local {local:?}, room {room:?}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1928,6 +1951,7 @@ pub(crate) mod tests {
     pub(crate) fn begin() -> Begin {
         Begin {
             room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             rules: RulesName::new("native").unwrap(),
             steps_per_second: 5,
             checkpoint_interval: 50,
@@ -1990,6 +2014,44 @@ pub(crate) mod tests {
             }
         });
         outcome.updates
+    }
+
+    #[test]
+    fn a_mismatched_scan_plan_holds_before_load_or_step() {
+        let mut script = Script::default();
+        let mut wrong = begin();
+        wrong.scan_plan = tpf3mp_proto::ScanPlan::from_values(Some("on"), Some("5x10")).unwrap();
+        script.begin.push_back(Some(wrong));
+        script.gates.push_back(StepGate::Load(Load {
+            file: None,
+            next_step: 1,
+            world_epoch: 1,
+        }));
+        let (mut driver, state) = driver_with(script);
+        let mut calls = Vec::new();
+        assert_eq!(call(&mut driver, &mut calls), Updates::Exactly(0));
+        assert!(matches!(driver.phase(), Phase::Holding(why) if why.contains("scan plan")));
+        assert_eq!(driver.game.me, None);
+        assert_eq!(driver.gate.gates.len(), 1, "the load was never polled");
+        assert!(state.lock().unwrap().load_requests.is_empty());
+    }
+
+    #[test]
+    fn scan_contract_validation_rejects_malformed_configuration_and_invalid_wire_values() {
+        use tpf3mp_proto::ScanPlan;
+        assert!(validate_scan_plan(ScanPlan::DEFAULT, Err("malformed")).is_err());
+        assert!(
+            validate_scan_plan(
+                ScanPlan {
+                    parts: 0,
+                    ..ScanPlan::DEFAULT
+                },
+                Ok(ScanPlan::DEFAULT)
+            )
+            .is_err()
+        );
+        let plan = ScanPlan::from_values(Some("compare"), Some("5x10")).unwrap();
+        assert!(validate_scan_plan(plan, Ok(plan)).is_ok());
     }
 
     #[test]
@@ -3591,6 +3653,7 @@ mod even_steps_over_a_real_link {
             &agent,
             &ToHook::Begin {
                 room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 rules: RulesName::new("native").unwrap(),
                 steps_per_second: 5,
                 checkpoint_interval,

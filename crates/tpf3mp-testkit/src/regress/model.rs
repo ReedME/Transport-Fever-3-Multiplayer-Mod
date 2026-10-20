@@ -26,7 +26,7 @@ use tpf3mp_proto::{
     action::{
         Action, Bulldoze, CompanyId, CompanyOp, ConstructionBuild, ConstructionRef, EdgeEnds,
         JunctionChange, JunctionConfig, LineChange, LineId, LoanOp, Network, Polyline, Pos,
-        Prospect, Renamed, ReplaceVehicle, Resolve, StationId, Structure, Terraform, Tint,
+        Prospect, Renamed, ReplaceVehicle, ResName, Resolve, StationId, Structure, Terraform, Tint,
         VehicleChange, VehicleId,
     },
 };
@@ -80,6 +80,8 @@ pub const MAX_RANK: u8 = 15;
 
 /// Tolerances of `docs/BUILDING.md`, in millimetres.
 const NODE_TOLERANCE: i64 = 1_500;
+/// How far above or below its node a vertex naming it may be.
+const HEIGHT_TOLERANCE: i64 = 500;
 const EDGE_TOLERANCE: i64 = 1_000;
 const CONSTRUCTION_TOLERANCE: i64 = 2_000;
 
@@ -662,6 +664,11 @@ impl State {
             // Signals a mod spaces along a track: the model keeps no
             // signals' places along their edges.
             Action::PlaceSignals(_) => Ok(()),
+            // Terrain paint: the model keeps no ground textures.
+            Action::Paint(_) => Ok(()),
+            // Trees and rocks: the model keeps no assets.
+            Action::PlantAssets(_) => Ok(()),
+            Action::SetCrossingType(_) => Ok(()),
             Action::CompanyOp(_) => unreachable!("handled above"),
         }
     }
@@ -1116,28 +1123,22 @@ impl State {
             }
             Bulldoze::EdgeObject { edge, at, model } => {
                 let key = self.find_edge(net(edge.network), &edge.ends)?;
-                let at = p(at);
-                let found = self
-                    .objects
-                    .iter()
-                    .filter(|((on, there), object)| {
-                        *on == key
-                            && object.model == model.as_str()
-                            && within(*there, at, EDGE_TOLERANCE)
-                    })
-                    .min_by_key(|((_, there), _)| dist2(*there, at))
-                    .map(|(k, object)| (*k, object.owner, object.station));
-                let Some((object, owner, station)) = found else {
-                    refuse!("no {model} there");
-                };
-                if owner != company {
-                    refuse!("the {model} is company-{owner}'s");
+                let object = self.edge_object(key, at, model, &[], company)?;
+                self.remove_objects(&[object])?;
+            }
+            Bulldoze::EdgeObjects { edge, objects } => {
+                let key = self.find_edge(net(edge.network), &edge.ends)?;
+                let mut found = Vec::new();
+                for object in objects.iter() {
+                    found.push(self.edge_object(
+                        key,
+                        &object.at,
+                        &object.model,
+                        &found,
+                        company,
+                    )?);
                 }
-                if let Some(station) = station {
-                    self.unserved(station)?;
-                    self.stations.remove(&station);
-                }
-                self.objects.remove(&object);
+                self.remove_objects(&found)?;
             }
         }
         Ok(())
@@ -1258,14 +1259,67 @@ impl State {
         self.charge(company, cells.saturating_mul(TERRAFORM_COST_PER_CELL))
     }
 
-    /// The node of `network` nearest `pos`, within the node tolerance.
+    /// The node of `network` nearest `pos`, within the node tolerance
+    /// horizontally and the height tolerance in height.
     fn find_node(&self, network: u8, pos: P) -> Option<P> {
         self.edges
             .keys()
             .filter(|(n, _, _)| *n == network)
             .flat_map(|(_, a, b)| [*a, *b])
-            .filter(|end| within_horizontally(*end, pos, NODE_TOLERANCE))
+            .filter(|end| {
+                within_horizontally(*end, pos, NODE_TOLERANCE)
+                    && (i64::from(end[2]) - i64::from(pos[2])).abs() <= HEIGHT_TOLERANCE
+            })
             .min_by_key(|end| (dist2(*end, pos), *end))
+    }
+
+    /// The object of `model` on edge `key` nearest `at`, within
+    /// EDGE_TOLERANCE, other than those `taken`; the company's own.
+    fn edge_object(
+        &self,
+        key: EdgeKey,
+        at: &Pos,
+        model: &ResName,
+        taken: &[(EdgeKey, P)],
+        company: u32,
+    ) -> Result<(EdgeKey, P), Refusal> {
+        let at = p(at);
+        let found = self
+            .objects
+            .iter()
+            .filter(|(k @ (on, there), object)| {
+                *on == key
+                    && !taken.contains(k)
+                    && object.model == model.as_str()
+                    && within(*there, at, EDGE_TOLERANCE)
+            })
+            .min_by_key(|((_, there), _)| dist2(*there, at))
+            .map(|(k, object)| (*k, object.owner));
+        let Some((object, owner)) = found else {
+            refuse!("no {model} there");
+        };
+        if owner != company {
+            refuse!("the {model} is company-{owner}'s");
+        }
+        Ok(object)
+    }
+
+    /// Removes edge objects with their stations, none unless every station
+    /// is unserved.
+    fn remove_objects(&mut self, objects: &[(EdgeKey, P)]) -> Result<(), Refusal> {
+        for object in objects {
+            if let Some(station) = self.objects[object].station {
+                self.unserved(station)?;
+            }
+        }
+        for object in objects {
+            if let Some(object) = self.objects.remove(object)
+                && let Some(station) = object.station
+            {
+                self.stations.remove(&station);
+            }
+        }
+        Ok(())
     }
 
     fn find_edge(&self, network: u8, ends: &EdgeEnds) -> Result<EdgeKey, Refusal> {
@@ -2398,6 +2452,7 @@ mod tests {
                 bus_lane: false,
                 tram: Tram::None,
                 polyline: lines,
+                crossing_type: None,
             })
         };
         let both = || {

@@ -132,10 +132,12 @@ fn launcher_config(
         content: toy_content(),
         mods: None,
         picker: None,
+        native: None,
         installed: None,
         link: format!("tpf3mp-regional-{}-{name}", std::process::id()),
         worlds: Worlds::open(&root.join(name), 1 << 30).unwrap(),
         room_settings: RoomSettings {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             steps_per_second: 100,
             input_delay_ms: 60,
             checkpoint_interval: 20,

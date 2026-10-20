@@ -70,6 +70,10 @@ function data()
 	local pending = {}
 	-- The notice of the last refusal, until the plugin shows it.
 	local notice = nil
+	-- The last refusal the game script's GUI half told under
+	-- "tpf3mp.notice" (a native click it stopped: the level crossing
+	-- window's), or false before the first read, which only notes it.
+	local toldNotice = false
 	-- Refusals so far, by kind, and the last reason logged of each, for the
 	-- hook's log.
 	local refusals, reasons = {}, {}
@@ -1219,6 +1223,16 @@ function data()
 					end
 				end)
 				if not delivered then say("answering the player's commands failed: " .. tostring(why)) end
+			end
+			if link then
+				local told = link:note("tpf3mp.notice")
+				if toldNotice == false then
+					toldNotice = told or ""
+				elseif told and told ~= toldNotice then
+					toldNotice = told
+					local text = told:match("^%d+	(.+)$")
+					if text then notice = text end
+				end
 			end
 			if notice then
 				shown:set(notice)

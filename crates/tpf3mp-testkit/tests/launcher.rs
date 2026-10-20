@@ -148,10 +148,12 @@ fn launcher_config(
         content: toy_content(),
         mods: None,
         picker: None,
+        native: None,
         installed: None,
         link: format!("tpf3mp-launcher-{}-{name}", std::process::id()),
         worlds: Worlds::open(&root.join(name), 1 << 30).unwrap(),
         room_settings: RoomSettings {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             steps_per_second: 100,
             input_delay_ms: 60,
             checkpoint_interval: 20,
@@ -182,14 +184,15 @@ async fn two_players_play_a_room_from_their_launchers() {
     let ann_config = launcher_config(root.path(), "ann", &trust, Arc::clone(&ann_identity));
     let bob_config = launcher_config(root.path(), "bob", &trust, Arc::clone(&bob_identity));
     let hooks = [
-        (ann_config.link.clone(), ann_identity.player(), 42),
+        (ann_config.link.clone(), "ann", ann_identity.player(), 42),
         // Bob's own world differs; he plays the owner's.
-        (bob_config.link.clone(), bob_identity.player(), 7),
+        (bob_config.link.clone(), "bob", bob_identity.player(), 7),
     ]
-    .map(|(link_name, player, world_seed)| {
+    .map(|(link_name, player_name, player, world_seed)| {
         fake_hook::spawn(FakeHookConfig {
             link_name,
             player,
+            player_name: player_name.into(),
             seed: world_seed,
             world_seed,
             act_every: 9,
@@ -197,6 +200,7 @@ async fn two_players_play_a_room_from_their_launchers() {
             drift_at: None,
             patience: WAIT,
             at_menu: false,
+            notices: None,
         })
     });
     let ann = Launcher::start(ann_config).await.unwrap();

@@ -121,6 +121,74 @@ function geom.parameterAt(a, ta, b, tb, x, y)
 	return u, math.sqrt(d2(u))
 end
 
+-- How near, in three dimensions, an end of the edge that takes a signal is
+-- the same end of the edge it stood on, and how alike their directions
+-- there are (the dot of their unit tangents).
+geom.CONTINUE_TOL = 0.5
+geom.CONTINUE_DOT = 0.995
+
+-- Whether the edge `to` continues the edge `from` (both { a, b, ta, tb })
+-- from one of its ends, the same way: it starts where `from` starts, or
+-- ends where it ends, in the same direction there. So the track tool keeps
+-- a signal on a track it cuts (seen on build 40420, 2026-10-17): on the
+-- piece that goes on from its old track's end, the one before the cut or
+-- the one after it, even where the tool moved a node near the cut and the
+-- signal now stands past it; the game places it on that piece. Returns
+-- true, or nil and why not. Every game computes it alike (sqrt only).
+local function aligned(t1, t2)
+	local n1 = math.sqrt(t1[1] * t1[1] + t1[2] * t1[2] + t1[3] * t1[3])
+	local n2 = math.sqrt(t2[1] * t2[1] + t2[2] * t2[2] + t2[3] * t2[3])
+	if n1 == 0 or n2 == 0 then return false end
+	return (t1[1] * t2[1] + t1[2] * t2[2] + t1[3] * t2[3]) / (n1 * n2) >= geom.CONTINUE_DOT
+end
+
+function geom.continues(from, to)
+	local function near(p, q)
+		local dx, dy, dz = p[1] - q[1], p[2] - q[2], p[3] - q[3]
+		return dx * dx + dy * dy + dz * dz <= geom.CONTINUE_TOL * geom.CONTINUE_TOL
+	end
+	if near(from.a, to.a) and aligned(from.ta, to.ta) then return true end
+	if near(from.b, to.b) and aligned(from.tb, to.tb) then return true end
+	return nil, "a signal onto an edge that does not go on from its track"
+end
+
+-- How near the edge that takes a signal must run where the signal stood,
+-- horizontally and in height.
+geom.STAND_TOL = 0.5
+
+-- Whether the edge `to` runs where a signal stood at `at` along the edge
+-- `from` (both { a, b, ta, tb }), the same way: its centreline passes
+-- within STAND_TOL of that place, horizontally and in height, and its
+-- direction there is the old edge's (CONTINUE_DOT). So the track tool
+-- puts a signal back near a node it removes (seen on build 40420,
+-- 2026-10-17): on the piece that now runs where it stood, which may be the
+-- one that took over the track beyond that node. Returns true, or nil and
+-- why not. Every game computes it alike (sqrt only, fixed steps).
+function geom.runsThrough(from, at, to)
+	local spot = geom.hermitePos(from.a, from.ta, from.b, from.tb, at)
+	local u, d = geom.parameterAt(to.a, to.ta, to.b, to.tb, spot[1], spot[2])
+	local h = geom.hermitePos(to.a, to.ta, to.b, to.tb, u)[3]
+	if d > geom.STAND_TOL or math.abs(h - spot[3]) > geom.STAND_TOL then
+		return nil, "a signal onto an edge that does not run where it stood"
+	end
+	if not aligned(geom.hermiteTangent(from.a, from.ta, from.b, from.tb, at),
+		geom.hermiteTangent(to.a, to.ta, to.b, to.tb, u)) then
+		return nil, "a signal onto an edge that runs the other way where it stood"
+	end
+	return true
+end
+
+-- Whether a signal that stood at `at` along `from` may go onto `to`: a
+-- piece that goes on from one of its old track's ends (continues), or one
+-- that runs where it stood, the same way (runsThrough). The capture and
+-- every game's replay ask the same.
+function geom.keepsSignal(from, at, to)
+	if geom.continues(from, to) then return true end
+	local ok = geom.runsThrough(from, at, to)
+	if ok then return true end
+	return nil, "a signal onto an edge that neither goes on from its track nor runs where it stood"
+end
+
 -- Nearest point of the curve to the cursor's forward viewing ray. The
 -- terrain hit lies beyond elevated track, so projecting that hit vertically
 -- onto the track can move a signal tens of metres along a bridge.

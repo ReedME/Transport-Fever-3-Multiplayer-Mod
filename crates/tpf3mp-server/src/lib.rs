@@ -8,6 +8,7 @@ mod diagnostics;
 mod directory;
 mod limit;
 mod metrics;
+mod native_index;
 mod pacing;
 mod persist;
 mod room;
@@ -45,6 +46,7 @@ pub use crate::{
         SESSION_QUOTA, SessionOf as DiagnosticsSession, Summary as DiagnosticsSummary,
     },
     directory::RecoveryError,
+    native_index::NativeRegistry,
     persist::LogError as RoomLogError,
     ruleset::{AcceptAll, NATIVE, RulesChoice, RulesMenu, Ruleset, RulesetFactory},
     snapshots::SnapshotConfig,
@@ -128,6 +130,9 @@ pub struct ServerConfig {
     /// Where players' diagnostics are kept, and for how long. `None` keeps
     /// none: clients are told so, and stop sending them.
     pub diagnostics: Option<DiagnosticsConfig>,
+    /// Where the native mods the server offers come from: a registry read
+    /// again every so often. `None` offers none.
+    pub native_registry: Option<NativeRegistry>,
 }
 
 impl ServerConfig {
@@ -165,6 +170,7 @@ impl ServerConfig {
             compact_log_at: 64 << 20,
             tunnel: None,
             diagnostics: None,
+            native_registry: None,
         }
     }
 }
@@ -191,6 +197,7 @@ impl fmt::Debug for ServerConfig {
             .field("snapshots", &self.snapshots)
             .field("compact_log_at", &self.compact_log_at)
             .field("tunnel", &self.tunnel)
+            .field("native_registry", &self.native_registry)
             .finish_non_exhaustive()
     }
 }
@@ -229,6 +236,8 @@ pub(crate) struct Shared {
     pub(crate) diagnostics: Option<Diagnostics>,
     /// The operator's notices, which every connection passes to its client.
     pub(crate) announcements: tokio::sync::broadcast::Sender<ChatText>,
+    /// The native mods the server offers, as last read.
+    pub(crate) native: Arc<native_index::NativeIndex>,
 }
 
 impl Shared {
@@ -249,6 +258,8 @@ pub struct Server {
     /// Cloned into every connection's task; counts the ones still running.
     connections: Arc<()>,
     tunnel: Option<(Listener, usize)>,
+    /// Read once the server runs.
+    native_registry: Option<NativeRegistry>,
 }
 
 impl Server {
@@ -344,6 +355,7 @@ impl Server {
             tunnels,
             diagnostics,
             announcements: tokio::sync::broadcast::channel(ANNOUNCEMENTS).0,
+            native: Arc::default(),
         });
         let capacity = config.max_sessions.saturating_add(config.max_handshakes);
         Ok(Self {
@@ -351,6 +363,7 @@ impl Server {
             shared,
             connections: Arc::new(()),
             tunnel: listener.map(|listener| (listener, capacity)),
+            native_registry: config.native_registry,
         })
     }
 
@@ -375,6 +388,10 @@ impl Server {
     /// Serves connections until `shutdown` completes, then closes every
     /// connection with `SHUTTING_DOWN` and waits for the endpoint to drain.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
+        if let Some(registry) = self.native_registry.take() {
+            tracing::info!(registry = %registry.url, "offering the native mods of a registry");
+            self.shared.native.spawn(registry);
+        }
         let tunnels = self.tunnel.take().and_then(|(listener, capacity)| {
             let env = TunnelEnv {
                 tunnels: Arc::clone(self.shared.tunnels.as_ref()?),
@@ -479,6 +496,12 @@ impl ServerStats {
 
     pub fn sessions(&self) -> usize {
         self.shared.max_sessions - self.shared.sessions.available_permits()
+    }
+
+    /// The rooms open now that `filter` keeps, with their members, for the
+    /// admin endpoint's `/rooms`.
+    pub(crate) fn room_view(&self, filter: &directory::RoomFilter) -> Vec<directory::AdminRoom> {
+        self.shared.directory.admin_view(filter)
     }
 
     /// Tells everyone connected `text`, such as a restart coming. Returns

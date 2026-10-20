@@ -1406,24 +1406,24 @@ function companies.settleSubsidies(roster, state, day, send, api)
 				r.state = "completed"
 				if not c.gone then
 					moveSubsidy(roster, c, amount, send, api)
-					said[#said + 1] = "subsidy " .. string.format("%d", r.uid) .. " completed for " .. c.name .. ": " .. amount
+					said[#said + 1] = "subsidy " .. string.format("%.0f", r.uid) .. " completed for " .. c.name .. ": " .. amount
 				elseif first and amount ~= 0 then
 					-- Its taker is gone: the reward is no one's, and the
 					-- first company gives back what the script booked it.
 					book(api, send, first.entity, -amount, "SUBSIDY")
-					said[#said + 1] = "subsidy " .. string.format("%d", r.uid) .. " completed for " .. c.name
+					said[#said + 1] = "subsidy " .. string.format("%.0f", r.uid) .. " completed for " .. c.name
 						.. ", gone: its reward of " .. amount .. " is no one's"
 				end
 			elseif where == "failed" then
 				local amount = companies.subsidyMoney(data.failure)
 				if not c.gone then
 					moveSubsidy(roster, c, -amount, send, api)
-					said[#said + 1] = "subsidy " .. string.format("%d", r.uid) .. " failed for " .. c.name .. ": -" .. amount
+					said[#said + 1] = "subsidy " .. string.format("%.0f", r.uid) .. " failed for " .. c.name .. ": -" .. amount
 				elseif first and amount ~= 0 then
 					-- Its taker is gone: no one pays its penalty, and the
 					-- first company gets back what the script charged it.
 					book(api, send, first.entity, amount, "SUBSIDY")
-					said[#said + 1] = "subsidy " .. string.format("%d", r.uid) .. " failed for " .. c.name
+					said[#said + 1] = "subsidy " .. string.format("%.0f", r.uid) .. " failed for " .. c.name
 						.. ", gone: its penalty of " .. amount .. " is no one's"
 				end
 			end

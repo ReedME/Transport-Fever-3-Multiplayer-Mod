@@ -306,6 +306,28 @@ local function record(prog, id)
 	return nil
 end
 
+-- The saved record seen when this world's game script starts. These stable
+-- company ids and numeric fields let the logs compare a live world with the
+-- save a rebase loaded, before a later score can hide a rollback.
+function progression.describe(prog, roster, say)
+	say = say or function() end
+	local live = companies.live(roster)
+	say("room ranks loaded: quarter=" .. tostring(prog.quarter) .. " companies=" .. tostring(#live))
+	local limit = math.min(#live, 16)
+	for i = 1, limit do
+		local c = live[i]
+		local r = record(prog, c.id)
+		if r then
+			say("room ranks loaded: company-" .. tostring(c.id) .. " entity=" .. tostring(r.entity)
+				.. " experience=" .. tostring(r.experience) .. " potential=" .. tostring(r.potential)
+				.. " level=" .. tostring(r.level))
+		else
+			say("room ranks loaded: company-" .. tostring(c.id) .. " record=missing")
+		end
+	end
+	if #live > limit then say("room ranks loaded: omitted=" .. tostring(#live - limit)) end
+end
+
 -- Each live company's record, begun where it has none: the save's own
 -- player from the game's own progression, which it earned before the room
 -- had companies; any other at rank 1 with nothing, as the game begins one.
@@ -417,6 +439,7 @@ function progression.tally(prog, roster, towns, game, api, say, reg, registry, n
 	for _, entry in ipairs(companiesNow) do
 		local r, id = entry.record, entry.company.id
 		local score = scores[id]
+		local before = r.experience
 		local experience = math.floor(score)
 		if experience > r.experience then r.experience = experience end
 		local ok, level = pcall(game.levelFor, r.experience)
@@ -426,15 +449,25 @@ function progression.tally(prog, roster, towns, game, api, say, reg, registry, n
 			say(when .. ": company-" .. id .. "'s rank was kept: " .. tostring(level))
 		end
 		say(when .. ": company-" .. id .. " score " .. fmt(score) .. ", experience " .. tostring(r.experience)
-			.. ", rank " .. tostring(r.potential) .. " reached, " .. tostring(r.level) .. " taken")
+			.. ", rank " .. tostring(r.potential) .. " reached, " .. tostring(r.level) .. " taken"
+			.. ", prior experience " .. tostring(before) .. ", sample quarter " .. tostring(prog.quarter))
 	end
 	return scores
 end
 
 -- A sample, for the mod's game script: measures and tallies. Returns true,
 -- or false and why; never raises.
+local function copyRows(rows)
+	local out = {}
+	for i, row in ipairs(rows) do
+		local copied = {}
+		for key, value in pairs(row) do copied[key] = value end
+		out[i] = copied
+	end
+	return out
+end
+
 function progression.sample(prog, roster, api, quarter, say, reg, registry, require_)
-	prog.quarter = quarter
 	if not progression.multi(roster) then return true end
 	local game, why = progression.game(api, require_)
 	if not game then return false, why end
@@ -444,8 +477,24 @@ function progression.sample(prog, roster, api, quarter, say, reg, registry, requ
 	pcall(function()
 		now = api.engine.getComponent(api.engine.util.getWorld(), api.type.ComponentType.GAME_TIME).gameTime
 	end)
-	local tallied, err = pcall(progression.tally, prog, roster, towns, game, api, say, reg, registry, now)
+	-- Only a completed sample consumes its quarter. A missing game module or
+	-- unreadable town statistic can recover on the next update of the same
+	-- quarter; persisting it early lost that chance and delayed earned XP.
+	local copiedRecords, records = pcall(copyRows, prog.records)
+	if not copiedRecords then return false, "saved records did not read: " .. tostring(records) end
+	local copiedPassengers, passengers = pcall(copyRows, prog.passengers)
+	if not copiedPassengers then return false, "saved passengers did not read: " .. tostring(passengers) end
+	local candidate = {
+		quarter = quarter,
+		weights = prog.weights,
+		records = records,
+		passengers = passengers,
+	}
+	local tallied, err = pcall(progression.tally, candidate, roster, towns, game, api, say, reg, registry, now)
 	if not tallied then return false, tostring(err) end
+	prog.quarter = quarter
+	prog.records = candidate.records
+	prog.passengers = candidate.passengers
 	return true
 end
 

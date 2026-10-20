@@ -89,6 +89,9 @@ impl HookLink for tpf3mp_ipc::Link {
 
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
+    /// The effective child-game configuration, when its environment differs
+    /// from the agent's inherited one. Otherwise parsed once at bridge creation.
+    pub scan_plan: Option<tpf3mp_proto::ScanPlan>,
     /// Playout margin: each step plays this long after its seal arrives.
     pub playout_margin: Duration,
     /// How long a late arrival keeps the playout buffer grown.
@@ -170,6 +173,7 @@ pub struct LobbyLink {
 impl Default for BridgeOptions {
     fn default() -> Self {
         Self {
+            scan_plan: None,
             playout_margin: Duration::from_millis(20),
             playout_memory: Duration::from_secs(10),
             poll: Duration::from_millis(2),
@@ -542,6 +546,7 @@ fn held_weight(event: &ClientEvent) -> usize {
 
 /// Couples one game's hook to one client.
 pub struct Bridge<L> {
+    scan_plan: Result<tpf3mp_proto::ScanPlan, &'static str>,
     link: L,
     options: BridgeOptions,
     follower: Option<TurnFollower>,
@@ -637,6 +642,8 @@ pub struct Bridge<L> {
     /// turn stream that would begin the game held until it has: the lists
     /// the game begins with carry the room's mods and settings.
     room_heard: bool,
+    /// The current connection has supplied and validated its room plan.
+    room_view_heard: bool,
     held_stream: Option<TurnStart>,
     /// What came after that stream until then, taken up in order after it.
     held_events: VecDeque<ClientEvent>,
@@ -658,6 +665,7 @@ impl<L: HookLink> Bridge<L> {
     /// one before goes with it.
     fn on_new_connection(&mut self) {
         self.room_heard = false;
+        self.room_view_heard = false;
         self.held_stream = None;
         self.held_events.clear();
         self.held_bytes = 0;
@@ -677,6 +685,10 @@ impl<L: HookLink> Bridge<L> {
         let now = Instant::now();
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         Self {
+            scan_plan: options
+                .scan_plan
+                .map(Ok)
+                .unwrap_or_else(tpf3mp_proto::ScanPlan::from_environment),
             hook_beat: (link.peer_heartbeat(), now),
             link,
             follower: None,
@@ -734,6 +746,7 @@ impl<L: HookLink> Bridge<L> {
             declared: None,
             told: None,
             room_heard: false,
+            room_view_heard: false,
             held_stream: None,
             held_events: VecDeque::new(),
             held_bytes: 0,
@@ -1514,7 +1527,7 @@ impl<L: HookLink> Bridge<L> {
             return Ok(None);
         }
         match event {
-            ClientEvent::TurnStream(start) if !self.begun && !self.room_heard => {
+            ClientEvent::TurnStream(start) if !self.room_heard || !self.room_view_heard => {
                 // A game joined while it runs: its stream and the room's
                 // mods come on different streams; the game begins once both
                 // are here.
@@ -1536,6 +1549,14 @@ impl<L: HookLink> Bridge<L> {
                     let saves = self.saves_dir();
                     self.outbox.push_back(ToHook::Begin {
                         room: start.room,
+                        scan_plan: self
+                            .room
+                            .as_ref()
+                            .ok_or(BridgeFault::Unexpected(
+                                "a turn stream before the room view",
+                            ))?
+                            .settings
+                            .scan_plan,
                         rules: start.rules.clone(),
                         steps_per_second: start.steps_per_second,
                         checkpoint_interval: start.checkpoint_interval,
@@ -1626,6 +1647,12 @@ impl<L: HookLink> Bridge<L> {
                 self.status(|status| push_bounded(&mut status.chat, (from, text)));
             }
             ClientEvent::RoomUpdate(room) => {
+                let local = self.scan_plan.map_err(BridgeFault::Unexpected)?;
+                if !room.settings.scan_plan.is_valid() || room.settings.scan_plan != local {
+                    return Err(BridgeFault::Unexpected(
+                        "world scan plan differs from the room",
+                    ));
+                }
                 // The game's Multiplayer window shows the room once the game
                 // began.
                 if self.begun {
@@ -1647,6 +1674,7 @@ impl<L: HookLink> Bridge<L> {
                 {
                     self.start_failed("the room gave up waiting for it", client);
                 }
+                self.room_view_heard = true;
                 self.room = Some(room.clone());
                 self.room_phase = Some(room.phase);
                 self.room_owner = Some(room.owner);
@@ -1696,20 +1724,23 @@ impl<L: HookLink> Bridge<L> {
                 self.told.clone_from(&room);
                 self.room_heard = true;
                 self.status(|status| status.room_mods = room.map(|room| *room));
-                if let Some(start) = self.held_stream.take() {
-                    if let Some(end) = self.on_event(ClientEvent::TurnStream(start), client)? {
-                        return Ok(Some(end));
-                    }
-                    self.held_bytes = 0;
-                    while let Some(event) = self.held_events.pop_front() {
-                        if let Some(end) = self.on_event(event, client)? {
-                            return Ok(Some(end));
-                        }
-                    }
-                }
             }
             ClientEvent::Kicked => return Ok(Some(BridgeEnd::Kicked)),
             ClientEvent::Closed(reason) => return Ok(Some(BridgeEnd::Closed(reason))),
+        }
+        if self.room_heard
+            && self.room_view_heard
+            && let Some(start) = self.held_stream.take()
+        {
+            if let Some(end) = self.on_event(ClientEvent::TurnStream(start), client)? {
+                return Ok(Some(end));
+            }
+            self.held_bytes = 0;
+            while let Some(event) = self.held_events.pop_front() {
+                if let Some(end) = self.on_event(event, client)? {
+                    return Ok(Some(end));
+                }
+            }
         }
         Ok(None)
     }
@@ -2647,6 +2678,9 @@ async fn rejoin_attempts<L: HookLink>(
     options: &ConnectOptions,
     deadline: Instant,
 ) -> Result<(Client, Events), GaveUp> {
+    let scan_plan = bridge
+        .scan_plan
+        .map_err(|why| GaveUp::Failed(why.to_owned()))?;
     let mut backoff = Duration::from_millis(250);
     let mut resume = bridge.resume_point();
     let declared = bridge.declared.clone();
@@ -2667,6 +2701,7 @@ async fn rejoin_attempts<L: HookLink>(
             }
             client
                 .join_room(JoinRoom {
+                    scan_plan,
                     invite: rejoin.invite,
                     password: rejoin.password.clone(),
                     resume,
@@ -2683,6 +2718,9 @@ async fn rejoin_attempts<L: HookLink>(
                     ClientError::Refused(RequestError::BadInvite | RequestError::NotInRoom) => {
                         Failed::Gone
                     }
+                    ClientError::Refused(RequestError::ScanPlanMismatch) => {
+                        Failed::Incompatible(RequestError::ScanPlanMismatch.to_string())
+                    }
                     other => Failed::Retry(other.to_string()),
                 })?;
             Ok::<_, Failed>((client, events))
@@ -2696,6 +2734,7 @@ async fn rejoin_attempts<L: HookLink>(
         match outcome {
             Ok(rejoined) => return Ok(rejoined),
             Err(Failed::Gone) => return Err(GaveUp::RoomGone),
+            Err(Failed::Incompatible(error)) => return Err(GaveUp::Failed(error)),
             // The server was updated past this client: no attempt can
             // succeed until the player updates too.
             Err(Failed::Outdated(error)) => {
@@ -2724,6 +2763,8 @@ async fn rejoin_attempts<L: HookLink>(
 
 /// Why one attempt to rejoin failed.
 enum Failed {
+    /// Restart with compatible scan configuration; retrying cannot help.
+    Incompatible(String),
     /// Worth trying again.
     Retry(String),
     /// The room no longer has the turns asked for.
@@ -2822,6 +2863,161 @@ mod tests {
 
     use super::*;
 
+    async fn idle_client() -> (Client, tokio::task::JoinHandle<()>) {
+        use tpf3mp_net::{
+            Identity, ServerIdentity, ServerTrust, read_message, read_preamble, server_config,
+            write_message, write_preamble,
+        };
+        use tpf3mp_proto::{
+            CONTROL_MAX_FRAME, ClientMessage, PROTOCOL_VERSION, ServerMessage, Welcome,
+        };
+        let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+        let trust = ServerTrust::Pinned(identity.leaf().clone());
+        let endpoint = quinn::Endpoint::server(
+            server_config(identity).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            read_preamble(&mut recv).await.unwrap();
+            write_preamble(&mut send, PROTOCOL_VERSION).await.unwrap();
+            let _: ClientMessage = read_message(&mut recv, CONTROL_MAX_FRAME).await.unwrap();
+            write_message(
+                &mut send,
+                &ServerMessage::Welcome(Welcome {
+                    server_version: Text::new("test").unwrap(),
+                    session_id: SessionId("AB2CD3".parse().unwrap()),
+                    rules: Vec::new(),
+                }),
+                CONTROL_MAX_FRAME,
+            )
+            .await
+            .unwrap();
+            std::future::pending::<()>().await;
+            drop((endpoint, connection, send, recv));
+        });
+        let (client, _) = connect(ConnectOptions::new(
+            address,
+            "localhost",
+            trust,
+            Arc::new(Identity::generate().unwrap().0),
+            Text::new("test").unwrap(),
+        ))
+        .await
+        .unwrap();
+        (client, server)
+    }
+
+    fn scan_room() -> RoomView {
+        RoomView {
+            id: start().room,
+            name: Text::new("scan room").unwrap(),
+            rules: Text::new("native").unwrap(),
+            owner: PlayerId(FixedBytes([1; 32])),
+            max_players: 4,
+            has_password: false,
+            phase: RoomPhase::Running,
+            settings: tpf3mp_proto::RoomSettings::DEFAULT,
+            members: Vec::new(),
+            competitive: false,
+            start: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_plan_reaches_begin_before_load_in_every_stream_order() {
+        let (client, server) = idle_client().await;
+        for plan in [
+            tpf3mp_proto::ScanPlan::DEFAULT,
+            tpf3mp_proto::ScanPlan::from_values(Some("on"), Some("5x10")).unwrap(),
+            tpf3mp_proto::ScanPlan::from_values(Some("compare"), Some("5x10")).unwrap(),
+        ] {
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [2, 0, 1],
+                [1, 2, 0],
+                [2, 1, 0],
+            ] {
+                let mut bridge = Bridge::new(
+                    AcceptingLink,
+                    BridgeOptions {
+                        scan_plan: Some(plan),
+                        ..BridgeOptions::default()
+                    },
+                );
+                let mut room = scan_room();
+                room.settings.scan_plan = plan;
+                let mut stream = start();
+                stream.world_epoch = 7;
+                for (index, event) in order.iter().enumerate() {
+                    let event = match event {
+                        0 => ClientEvent::TurnStream(stream.clone()),
+                        1 => ClientEvent::RoomUpdate(room.clone()),
+                        _ => ClientEvent::RoomMods(None),
+                    };
+                    bridge.on_event(event, &client).unwrap();
+                    assert_eq!(bridge.begun, index == 2);
+                    assert_eq!(bridge.follower.is_some(), index == 2);
+                }
+                let begin_at = bridge.outbox.messages.iter().position(|message| matches!(message, ToHook::Begin { room: id, scan_plan, .. } if *id == room.id && *scan_plan == plan)).unwrap();
+                let load_at = bridge
+                    .outbox
+                    .messages
+                    .iter()
+                    .position(|message| matches!(message, ToHook::Load { world_epoch: 7, .. }))
+                    .unwrap();
+                assert!(begin_at < load_at);
+                assert_eq!(bridge.world_epoch, 7);
+                bridge.on_new_connection();
+                bridge
+                    .on_event(ClientEvent::TurnStream(stream), &client)
+                    .unwrap();
+                assert!(
+                    bridge.held_stream.is_some(),
+                    "rejoin waits for fresh room agreement too"
+                );
+                bridge
+                    .on_event(ClientEvent::RoomMods(None), &client)
+                    .unwrap();
+                assert!(bridge.held_stream.is_some());
+                bridge
+                    .on_event(ClientEvent::RoomUpdate(room.clone()), &client)
+                    .unwrap();
+                assert!(bridge.held_stream.is_none());
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_incompatible_room_view_is_refused_before_begin_or_load() {
+        let (client, server) = idle_client().await;
+        let mut bridge = Bridge::new(AcceptingLink, BridgeOptions::default());
+        bridge
+            .on_event(ClientEvent::TurnStream(start()), &client)
+            .unwrap();
+        bridge
+            .on_event(ClientEvent::RoomMods(None), &client)
+            .unwrap();
+        let mut room = scan_room();
+        room.settings.scan_plan =
+            tpf3mp_proto::ScanPlan::from_values(Some("on"), Some("5x10")).unwrap();
+        assert!(
+            bridge
+                .on_event(ClientEvent::RoomUpdate(room), &client)
+                .is_err()
+        );
+        assert!(!bridge.begun);
+        assert!(bridge.follower.is_none());
+        assert!(bridge.outbox.messages.is_empty());
+        server.abort();
+    }
+
     /// A game without the picker (`--mods`) loads the room's world with the
     /// room's mods and settings as its owner declared them, its own listed
     /// personal mods after them: the content check does not cover the
@@ -2854,6 +3050,7 @@ mod tests {
             game: Text::lossy("40408"),
             mods: vec![room_mod("signals"), room_mod("tpf3mp_1")],
             params: settings.clone(),
+            native: Vec::new(),
         };
         let lists = told_lists(Some(&told), Some(&listed)).unwrap();
         assert_eq!(lists.shared, listed.shared);
@@ -3014,6 +3211,16 @@ mod tests {
         bridge
             .on_event(ClientEvent::TurnStream(stream), &client)
             .unwrap();
+        assert!(bridge.held_stream.is_some());
+        assert_eq!(bridge.reported, Some(40));
+        bridge
+            .on_event(ClientEvent::RoomMods(None), &client)
+            .unwrap();
+        assert!(bridge.held_stream.is_some());
+        bridge
+            .on_event(ClientEvent::RoomUpdate(scan_room()), &client)
+            .unwrap();
+        assert!(bridge.held_stream.is_none());
         bridge
             .report_progress(&client, Instant::now())
             .await

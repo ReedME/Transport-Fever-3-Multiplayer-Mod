@@ -224,6 +224,57 @@ pub enum Request {
         invite: Invite,
         password: Option<Text<64>>,
     },
+    /// One page of the native mods this server offers (docs/NATIVE_MODS.md,
+    /// "A server's own index"): its index, or with `proposed` the mods open
+    /// pull requests to its registry would add. Pages count from 0; a
+    /// client asks for each until it has `pages`, all of one `serial`.
+    /// `Response::NativeIndex(None)` from a server that offers none.
+    NativeIndex {
+        proposed: bool,
+        page: u16,
+    },
+}
+
+/// Bytes of the native-mods index one page carries.
+pub const NATIVE_INDEX_PAGE: usize = 48 * 1024;
+/// Most pages of one native-mods index.
+pub const MAX_NATIVE_INDEX_PAGES: u16 = 32;
+
+/// One page of a server's native-mods index, as JSON bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeIndexPage {
+    /// The index's serial: every page of one index has the same.
+    pub serial: u64,
+    pub page: u16,
+    pub pages: u16,
+    pub bytes: BoundedVec<u8, NATIVE_INDEX_PAGE>,
+}
+
+impl NativeIndexPage {
+    /// The pages of `json`, an index with `serial`; none when it needs more
+    /// than [`MAX_NATIVE_INDEX_PAGES`].
+    pub fn split(serial: u64, json: &[u8]) -> Option<Vec<Self>> {
+        let chunks: Vec<&[u8]> = if json.is_empty() {
+            vec![&[]]
+        } else {
+            json.chunks(NATIVE_INDEX_PAGE).collect()
+        };
+        let pages = u16::try_from(chunks.len())
+            .ok()
+            .filter(|n| *n <= MAX_NATIVE_INDEX_PAGES)?;
+        Some(
+            chunks
+                .into_iter()
+                .zip(0..)
+                .map(|(chunk, page)| Self {
+                    serial,
+                    page,
+                    pages,
+                    bytes: BoundedVec::new(chunk.to_vec()).unwrap_or_else(|_| BoundedVec::empty()),
+                })
+                .collect(),
+        )
+    }
 }
 
 /// A player's picture: one of [`BANNERS`] or [`PORTRAITS`], by id. Long
@@ -390,6 +441,8 @@ pub struct CreateRoom {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRoom {
+    /// Must equal the room's world-check plan before any seat is changed.
+    pub scan_plan: crate::ScanPlan,
     pub invite: Invite,
     pub password: Option<Text<64>>,
     /// For a running game: where this client continues, to receive only
@@ -424,6 +477,9 @@ pub enum Response {
     Rooms(RoomPage),
     /// The invite and optional password match an open room on this server.
     InviteMatch,
+    /// A page of the native mods this server offers, or none
+    /// ([`Request::NativeIndex`]).
+    NativeIndex(Option<NativeIndexPage>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +520,8 @@ pub enum RequestError {
     NotListed,
     /// No such banner or portrait (see [`BANNERS`], [`PORTRAITS`]).
     UnknownBanner,
+    /// Members must use the same world-check algorithm and partition plan.
+    ScanPlanMismatch,
 }
 
 impl fmt::Display for RequestError {
@@ -494,6 +552,7 @@ impl fmt::Display for RequestError {
                 "the save the room starts from is still being uploaded; start once it is there"
             }
             Self::NotListed => "the room is private, so it is in no list",
+            Self::ScanPlanMismatch => "world-check settings differ from this room; use the same native scan mode and parts/stride, then restart the launcher and game",
             Self::UnknownBanner => "there is no such banner",
         })
     }
@@ -502,6 +561,8 @@ impl fmt::Display for RequestError {
 /// Settings fixed when a room is created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomSettings {
+    /// The world-check algorithm and partition schedule agreed before play.
+    pub scan_plan: crate::ScanPlan,
     /// Simulation steps per second at 1x speed. TPF2 runs 5; TPF3 is
     /// measured on release day.
     pub steps_per_second: u16,
@@ -515,6 +576,7 @@ pub struct RoomSettings {
 
 impl RoomSettings {
     pub const DEFAULT: Self = Self {
+        scan_plan: crate::ScanPlan::DEFAULT,
         steps_per_second: 5,
         input_delay_ms: 250,
         checkpoint_interval: 50,
@@ -522,7 +584,8 @@ impl RoomSettings {
 
     /// Whether every setting is within the range the server accepts.
     pub fn is_valid(&self) -> bool {
-        (1..=240).contains(&self.steps_per_second)
+        self.scan_plan.is_valid()
+            && (1..=240).contains(&self.steps_per_second)
             && (20..=2000).contains(&self.input_delay_ms)
             && (1..=1_000_000).contains(&self.checkpoint_interval)
     }

@@ -10,6 +10,44 @@ Why: the checkpoint's Lua lane read froze every game in a room for about a
 second every 10 s on a save with 2212 edges (docs/HOOKS.md, "What the
 lanes cost").
 
+## Checked in the game (2026-10-05)
+
+`crates/tpf3mp-hook/src/netread.rs` reads the network lane with these
+layouts. In a room of two games on `MP_crash_1004`, with
+`TPF3MP_HOOK_NATIVE_LANES=compare`, its rows agreed with the mod's Lua
+at every checkpoint read: 2212 edges, then 2213 after a town grew a street,
+and 2126-2127 junctions. Two corrections:
+
+- `CompVec+8` is not the type id: that `+8` is the type map's entry
+  (`[it+8] = pools.size()+1` in `sub_94770`, `it` the entry
+  `sub_9d1e0` found at `engine+0x48`). A type's id is its pool's index at
+  `engine+0x78`; each entity's component list repeats it.
+- `CompVec+0x98` is no slot count to bound by: read in the game it held
+  values past any count, now and then. The game's own accessor
+  (`sub_2806a0`) bounds nothing; the page table's length bounds a paged
+  index.
+
+Later the same night, also checked in the game:
+
+- `Construction` (`CompVec<Construction>` vtable 0x3680510; 0x288 bytes,
+  `imul rax, 0x288` at 0x28081b in `sub_2807d0`): its Lua binding
+  (`sub_18829c0`, the call of `sub_1863020` at 0x1882ccd, name/offset
+  pairs) puts `fileName` at +0 (a `ResName`), `params` +0x40, `transf` +0x58
+  (16 float32, column-major: `UI::ModuleBuilder::SetConstruction`,
+  `sub_544f10`, reads elements 12 and 13 at +0x88/+0x8c as the translation's
+  x and y), `timeBuilt` +0x98, `frozenNodes` +0xa0, `frozenEdges` +0xb8,
+  `depots` +0xd0, `stations` +0xe8, `industries` +0x100, `townBuildings`
+  +0x118, `subconstructions` +0x130, `persistentMetadata` +0x148, `slots`
+  +0x160, `slotConfig` +0x178, `dependentSlots` +0x1b8, `tag2modelInstance`
+  +0x1f8, `entityAndIndex2labelTexts` +0x228, `tag2segments` +0x258. The
+  constructions lane read from `fileName` and `transf` agreed with the mod's
+  at every checkpoint (1857-1863 constructions).
+- A `ResName` reaches the game's Lua as `first::/second`: the edges' road
+  templates and the constructions' files read that way agreed with the
+  Lua's `tostring`.
+- The game's Lua sorts strings byte by byte: the hook's sorted, joined and
+  hashed network lane agreed with the mod's `summary` at every checkpoint.
+
 ## Corrections to docs/HOOKS.md (~5037-5050)
 
 - `GetComponentDataIndex` is `sub_a4b90`, not `0xd0920` (inside a phmap
@@ -31,14 +69,14 @@ lanes cost").
   the Try variants first: BaseEdge `sub_280e40`, BaseNode `sub_2811b0`,
   BaseNodeConfig `sub_281290`.
 - `pool = [engine+0x78][typeId]` (8-byte entries; typeId < (end-begin)/8).
-  CompVec<T> (sizeof 0xa0): +0 vtable, +8 type id+1, +0x10/+0x38 free-list
-  deques, +0x60 change counter (add and remove), +0x68/+0x70 dense
-  vector<T>, +0x80/+0x88 page table of 16-byte `{T* page, ctrl}`, +0x98
-  count of paged slots (pages of 32).
+  CompVec<T> (sizeof 0xa0): +0 vtable, +0x10/+0x38 free-list deques,
+  +0x60 change counter (add and remove), +0x68/+0x70 dense vector<T>,
+  +0x80/+0x88 page table of 16-byte `{T* page, ctrl}` (pages of 32). (Not
+  +8 type id+1 nor +0x98 a slot count: see "Checked in the game".)
 - Dense: `idx < 0x40000000`, data `[pool+0x68] + idx*sizeof(T)`, bound
   `(pool[0x70]-pool[0x68])/sizeof(T)`. Paged: `i = idx-0x40000000`, data
-  `[[pool+0x80] + (i>>5)*16] + (i&31)*sizeof(T)`, bounds `i < pool[0x98]`
-  and `(i>>5) < (pool[0x88]-pool[0x80])>>4`. Which mode each type uses is
+  `[[pool+0x80] + (i>>5)*16] + (i&31)*sizeof(T)`, bound
+  `(i>>5) < (pool[0x88]-pool[0x80])>>4`. Which mode each type uses is
   unknown: handle both.
 
 Type descriptors (name at descriptor+0x10): BaseEdge 0x3cea7c8

@@ -73,6 +73,15 @@ local verdicts, verdictsSaid = {}, 0
 local toldTools = false
 -- When the previews not drawn yet were last tried again.
 local retriedAt = nil
+-- What making and drawing the other members' previews cost here, for the
+-- log once every COST_EVERY seconds while any came (os.clock: elapsed time
+-- on Windows, CPU time on Linux and macOS):
+-- the previews made, drawn and retried, each { n =, ms =, max = }, and the
+-- parts of the longest make (tpf3mp/apply.lua, apply.lastCost).
+local COST_EVERY = 10
+local function newCost() return { make = { n = 0, ms = 0, max = 0 }, draw = { n = 0, ms = 0, max = 0 },
+	retry = { n = 0, ms = 0, max = 0 } } end
+local cost, costSince = newCost(), nil
 
 -- The game's active tools, as one string, the same whatever their order,
 -- or nil where it cannot say.
@@ -88,6 +97,28 @@ end
 local function now()
 	local ok, t = pcall(os.clock)
 	return ok and t or 0
+end
+
+local function spent(what, t0)
+	local ms = (now() - t0) * 1000
+	if ms < 0 then return 0 end
+	local c = cost[what]
+	c.n, c.ms = c.n + 1, c.ms + ms
+	if ms > c.max then c.max = ms end
+	return ms
+end
+
+local function costLine(link, t)
+	if costSince == nil or t < costSince then costSince = t end
+	if t - costSince < COST_EVERY then return end
+	local c = cost
+	if c.make.n + c.draw.n + c.retry.n > 0 then
+		local function part(name, p) return string.format("%s %d in %.1f ms (longest %.1f)", name, p.n, p.ms, p.max) end
+		link:log(string.format("build previews in the last %.1f s: ", t - costSince)
+			.. part("made", c.make) .. (c.slowest and (" [" .. c.slowest .. "]") or "") .. ", "
+			.. part("drawn", c.draw) .. ", " .. part("retried", c.retry))
+	end
+	cost, costSince = newCost(), t
 end
 
 -- The player's tool `tool` (its id) proposes `action`, as the capture made
@@ -252,14 +283,24 @@ function previews.take(link, make, draw)
 					said[from], saidCount = true, saidCount + 1
 					link:log("another member's build preview arrived: " .. tostring(kind) .. " from " .. from:sub(1, 16))
 				end
+				local t0 = now()
 				local ok, proposal, context, company = pcall(make, action, from)
+				local ms = spent("make", t0)
+				if ms >= cost.make.max then
+					local okA, applyModule = pcall(require, "tpf3mp.apply")
+					local parts = okA and type(applyModule) == "table" and applyModule.costText
+						and applyModule.costText(applyModule.lastCost) or ""
+					cost.slowest = tostring(kind) .. (parts ~= "" and (": " .. parts) or "")
+				end
 				if ok and proposal ~= nil then
 					made = made + 1
 					local kept = { proposal = proposal, context = context, company = company,
 						kind = kind, seq = made }
 					remote[from] = kept
 					if draw then
+						local d0 = now()
 						local called, drawn, why = pcall(draw, from, kept)
+						spent("draw", d0)
 						if called and drawn then
 							kept.undrawn = nil
 							judged(link, from, kind, why)
@@ -289,7 +330,9 @@ function previews.take(link, make, draw)
 			retriedAt = t
 			for from, kept in pairs(remote) do
 				if kept.undrawn then
+					local r0 = now()
 					local called, drawn, data = pcall(draw, from, kept)
+					spent("retry", r0)
 					if called and drawn then
 						kept.undrawn = nil
 						judged(link, from, kept.kind, data)
@@ -298,6 +341,7 @@ function previews.take(link, make, draw)
 			end
 		end
 	end
+	costLine(link, now())
 	return changed
 end
 
@@ -312,6 +356,7 @@ function previews.reset()
 	retriedAt = nil
 	made, unmade, drawnSaid = 0, 0, {}
 	verdicts, verdictsSaid = {}, 0
+	cost, costSince = newCost(), nil
 end
 
 return previews

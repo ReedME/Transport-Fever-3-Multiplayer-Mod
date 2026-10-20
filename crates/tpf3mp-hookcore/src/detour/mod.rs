@@ -89,7 +89,27 @@ mod sys;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
+pub use sys::ExecBuffer;
+#[cfg(target_arch = "x86_64")]
 pub use x86_64::{CallRedirect, InlineDetour, Rewrite, Splice};
+
+/// `code`, copied into fresh executable memory: a function of its own, as
+/// tests detour one.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+pub fn executable(code: &[u8]) -> Result<ExecBuffer, DetourError> {
+    let buffer = sys::alloc_near(code.as_ptr() as usize, code.len())?;
+    // SAFETY: `buffer` is a fresh writable region of `code.len()` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(code.as_ptr(), buffer.as_mut_ptr(), code.len());
+    }
+    sys::make_executable(&buffer)?;
+    // SAFETY: the buffer now holds the code just written.
+    unsafe {
+        sys::flush_icache(buffer.as_mut_ptr(), code.len());
+    }
+    Ok(buffer)
+}
 
 #[cfg(not(target_arch = "x86_64"))]
 mod unsupported;

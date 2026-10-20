@@ -13,12 +13,12 @@
 # Prints "run: <folder>" and "games: p1=<pid> p2=<pid> ..."; the rig keeps
 # running until the games quit (quit.ps1).
 #
-#   room.ps1 [-Players 2] [-Run name] [-Fixture tpf3mp_fixture3] [-NoInstall]
+#   room.ps1 [-Players 2 (1 for one game alone, e.g. measuring)] [-Run name] [-Fixture tpf3mp_fixture3] [-NoInstall]
 #
 # Refuses while any Transport Fever 3, tpf3mp-rig or tpf3mp-server runs:
 # they may be someone else's test. Existing processes are never stopped.
 param(
-  [ValidateRange(2,8)][int]$Players = 2,
+  [ValidateRange(1,8)][int]$Players = 2,
   [ValidatePattern("^[A-Za-z0-9_-]+$")][string]$Run = ("run-" + (Get-Date -Format "MMdd-HHmmss")),
   [ValidatePattern("^[A-Za-z0-9_-]+$")][string]$Fixture = "tpf3mp_fixture3",
   [string]$GameBuild = "40420",
@@ -134,6 +134,8 @@ Load-Fixture "p1" $pids[0]
 # The hook's own lines for the room's save; a bare "holding" also matches
 # the paused-tick fix's "holding tickCount" lines.
 $saved = "saved the world for the room|was not saved for the room|holding the world"
+# Alone in its room, the host saves no world for guests: it plays at once.
+if ($Players -eq 1) { $saved += "|playing the room's world" }
 $deadline = (Get-Date).AddSeconds(150)
 while ((Get-Date) -lt $deadline -and -not (Hook-Says "p1" $saved)) { Start-Sleep -Seconds 3 }
 if (-not (Hook-Says "p1" $saved)) {
@@ -147,7 +149,12 @@ for ($i = 1; $i -lt $pids.Count; $i++) {
     throw "$player did not load the shared snapshot. Test is not ready; games left running for diagnosis in $runDir"
   }
 }
-if (-not (Hook-Says "p1" "playing the room's world from its save")) {
+# A lone host plays from step 1; with guests the host loads the room's save too.
+$hostReady = if ($Players -eq 1) { "playing the room's world from step 1" } else { "playing the room's world from its save" }
+# The guests can be ready before the host has replaced its own world.
+$deadline = (Get-Date).AddSeconds($GuestWait)
+while ((Get-Date) -lt $deadline -and -not (Hook-Says "p1" $hostReady)) { Start-Sleep -Seconds 3 }
+if (-not (Hook-Says "p1" $hostReady)) {
   throw "Host has not loaded the shared snapshot; test not ready in $runDir"
 }
 Start-Sleep -Seconds 15

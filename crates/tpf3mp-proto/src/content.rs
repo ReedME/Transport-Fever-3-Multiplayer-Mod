@@ -5,6 +5,14 @@
 //! compare, and when two differ, [`ContentManifest::compare`] says how, so
 //! players learn which mods to add, remove or update instead of only that
 //! something differs.
+//!
+//! Beside its mods, a manifest names the native mods the game runs that
+//! change the simulation (docs/NATIVE_MODS.md, D29): each as a mod named
+//! [`NATIVE_PREFIX`] and the package's id, whose version is the package's
+//! version, `+`, the first ten hex digits of its settings digest, and the
+//! full SHA-256 package identity. They are compared as the mods are, so two
+//! games with different native mods, package bytes or settings never share
+//! a room.
 
 use std::{collections::HashMap, fmt};
 
@@ -16,7 +24,17 @@ use crate::{ContentFingerprint, FixedBytes, Text};
 /// The name a mod goes by, as the game lists it.
 pub type ModId = Text<96>;
 /// A mod's version, as the game or its author states it.
-pub type ModVersion = Text<32>;
+/// The extra room is for native package terms; ordinary game mods remain
+/// limited to [`MAX_MOD_VERSION`] bytes by [`ContentManifest::is_valid`].
+pub type ModVersion = Text<96>;
+/// Longest version of an ordinary game mod, as before native terms grew.
+pub const MAX_MOD_VERSION: usize = 32;
+/// Longest native package version before its digest (the native index's
+/// package-version limit).
+pub const MAX_NATIVE_PACKAGE_VERSION: usize = 20;
+/// Native term digest: ten hex digits for settings consistency, then the
+/// full 64-digit package identity SHA-256.
+pub const NATIVE_TERM_DIGEST_HEX: usize = 74;
 
 /// Most mods a manifest lists by name; [`Unlisted`] summarises the rest.
 pub const MAX_LISTED_MODS: usize = 2048;
@@ -24,6 +42,14 @@ pub const MAX_LISTED_MODS: usize = 2048;
 pub const MAX_MANIFEST_BYTES: usize = 48 * 1024;
 /// Most mods a [`ContentDiff`] names of each kind; its totals count all.
 pub const MAX_DIFF_LISTED: usize = 32;
+/// Most native mods a manifest names. More is refused, never cut short.
+pub const MAX_NATIVE_TERMS: usize = 16;
+/// What a native mod's id starts with in a manifest. No mod folder can be
+/// named so: `:` is not allowed in a Windows file name.
+pub const NATIVE_PREFIX: &str = "native:";
+/// Bytes [`ContentManifest::new`] leaves for the native mods: the most of
+/// them, each with the longest id and version, and their list's length.
+const NATIVE_RESERVE: usize = MAX_NATIVE_TERMS * (2 + 96 + 1 + 95) + 2;
 
 /// Keeps content fingerprints apart from every other SHA-256 in the
 /// project, and names their format.
@@ -73,6 +99,10 @@ pub struct ContentManifest {
     pub mods: Vec<ModRef>,
     /// The mods after `mods`, if there are more than fit.
     pub unlisted: Option<Unlisted>,
+    /// The native mods that change the simulation, each a mod named
+    /// [`NATIVE_PREFIX`] and its id, ordered by id
+    /// ([`ContentManifest::with_native`]).
+    pub native: Vec<ModRef>,
 }
 
 impl ContentManifest {
@@ -84,13 +114,15 @@ impl ContentManifest {
             game,
             mods: Vec::new(),
             unlisted: None,
+            native: Vec::new(),
         };
         let mut size = encoded_len(&manifest);
         let mut mods = mods.into_iter();
         for listed in mods.by_ref() {
             // Room for the summary of what does not fit, and for the list's
             // length growing by a byte or two.
-            let grown = size + encoded_len(&listed) + 48;
+            // And for the native mods.
+            let grown = size + encoded_len(&listed) + 48 + NATIVE_RESERVE;
             if manifest.mods.len() == MAX_LISTED_MODS || grown > MAX_MANIFEST_BYTES {
                 let rest: Vec<ModRef> = std::iter::once(listed).chain(mods).collect();
                 let mut digest = Context::new(&SHA256);
@@ -107,17 +139,50 @@ impl ContentManifest {
         manifest
     }
 
-    /// Whether the manifest is within the limits one declaration may take.
-    pub fn is_valid(&self) -> bool {
-        self.mods.len() <= MAX_LISTED_MODS && encoded_len(self) <= MAX_MANIFEST_BYTES
+    /// The same manifest with `native`, the game's native mods that change
+    /// the simulation, ordered by id.
+    pub fn with_native(mut self, mut native: Vec<ModRef>) -> Self {
+        native.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        self.native = native;
+        self
     }
 
-    /// What rooms compare: equal only for the same build and the same mods
-    /// in the same order.
+    /// Whether the manifest is within the limits one declaration may take:
+    /// at most [`MAX_NATIVE_TERMS`] native mods, each named as one, once and
+    /// in order.
+    pub fn is_valid(&self) -> bool {
+        self.mods.len() <= MAX_LISTED_MODS
+            && self
+                .mods
+                .iter()
+                .all(|listed| listed.version.as_str().len() <= MAX_MOD_VERSION)
+            && self.native.len() <= MAX_NATIVE_TERMS
+            && self.native.iter().all(|term| {
+                term.id
+                    .as_str()
+                    .strip_prefix(NATIVE_PREFIX)
+                    .is_some_and(|id| !id.is_empty())
+                    && native_term_version_is_full(term.version.as_str())
+            })
+            && self
+                .native
+                .windows(2)
+                .all(|pair| pair[0].id.as_str() < pair[1].id.as_str())
+            && encoded_len(self) <= MAX_MANIFEST_BYTES
+    }
+
+    /// What rooms compare: equal only for the same build, the same mods in
+    /// the same order and the same native mods. Without native mods it is
+    /// what it was before manifests had them, so that a room logged then
+    /// still takes its players back.
     pub fn fingerprint(&self) -> ContentFingerprint {
         let mut digest = Context::new(&SHA256);
         digest.update(FINGERPRINT_DOMAIN);
-        digest.update(&postcard::to_allocvec(self).unwrap_or_default());
+        let listed = (&self.game, &self.mods, &self.unlisted);
+        digest.update(&postcard::to_allocvec(&listed).unwrap_or_default());
+        if !self.native.is_empty() {
+            digest.update(&postcard::to_allocvec(&self.native).unwrap_or_default());
+        }
         ContentFingerprint(FixedBytes(
             digest.finish().as_ref().try_into().unwrap_or([0; 32]),
         ))
@@ -129,8 +194,9 @@ impl ContentManifest {
         if self == yours {
             return None;
         }
-        let room: HashMap<&str, &ModRef> = first_by_id(&self.mods);
-        let mine: HashMap<&str, &ModRef> = first_by_id(&yours.mods);
+        // The native mods compare as mods: their ids cannot be a mod's.
+        let room: HashMap<&str, &ModRef> = first_by_id(self.mods.iter().chain(&self.native));
+        let mine: HashMap<&str, &ModRef> = first_by_id(yours.mods.iter().chain(&yours.native));
         let mut diff = ContentDiff {
             game: (self.game != yours.game).then(|| GameBuilds {
                 room: self.game.clone(),
@@ -138,7 +204,7 @@ impl ContentManifest {
             }),
             ..ContentDiff::default()
         };
-        for listed in &self.mods {
+        for listed in self.mods.iter().chain(&self.native) {
             match mine.get(listed.id.as_str()) {
                 None => push(&mut diff.missing, &mut diff.missing_total, listed.clone()),
                 Some(own) if own.version != listed.version => push(
@@ -153,7 +219,7 @@ impl ContentManifest {
                 Some(_) => {}
             }
         }
-        for own in &yours.mods {
+        for own in yours.mods.iter().chain(&yours.native) {
             if !room.contains_key(own.id.as_str()) {
                 push(&mut diff.extra, &mut diff.extra_total, own.clone());
             }
@@ -165,13 +231,28 @@ impl ContentManifest {
     }
 }
 
+/// Whether a native term carries the full settings prefix and package
+/// identity. Old ten-digit terms still deserialize from room logs, but a
+/// protocol-22 declaration cannot use one to authorize package contents.
+pub fn native_term_version_is_full(version: &str) -> bool {
+    let Some((package_version, digest)) = version.rsplit_once('+') else {
+        return false;
+    };
+    !package_version.is_empty()
+        && package_version.len() <= MAX_NATIVE_PACKAGE_VERSION
+        && digest.len() == NATIVE_TERM_DIGEST_HEX
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn encoded_len<T: Serialize>(value: &T) -> usize {
     postcard::to_allocvec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 /// The first mod of each id: a list that names one twice still compares.
-fn first_by_id(mods: &[ModRef]) -> HashMap<&str, &ModRef> {
-    let mut by_id = HashMap::with_capacity(mods.len());
+fn first_by_id<'a>(mods: impl Iterator<Item = &'a ModRef>) -> HashMap<&'a str, &'a ModRef> {
+    let mut by_id = HashMap::new();
     for listed in mods {
         by_id.entry(listed.id.as_str()).or_insert(listed);
     }
@@ -301,6 +382,11 @@ impl fmt::Display for ContentDiff {
         if self.reordered {
             parts.push("the same mods load in another order".to_owned());
         }
+        let native = |id: &ModId| id.as_str().starts_with(NATIVE_PREFIX);
+        if self.missing.iter().any(|m| native(&m.id)) || self.changed.iter().any(|c| native(&c.id))
+        {
+            parts.push("the launcher installs the room's native mods when you join".to_owned());
+        }
         if self.unlisted {
             parts.push("the mods beyond the listed ones differ".to_owned());
         }
@@ -330,6 +416,10 @@ mod tests {
                 .map(|(id, version)| listed(id, version))
                 .collect(),
         )
+    }
+
+    fn native_version(settings: &str, identity: char) -> String {
+        format!("0.3.0+{settings}{}", identity.to_string().repeat(64))
     }
 
     #[test]
@@ -476,7 +566,124 @@ mod tests {
             game: Text::new("35924").unwrap(),
             mods,
             unlisted: None,
+            native: Vec::new(),
         };
         assert!(!manifest.is_valid());
+    }
+
+    /// A manifest without native mods has the fingerprint it had before
+    /// manifests could carry them: a running room's log keeps fingerprints.
+    #[test]
+    fn without_native_mods_the_fingerprint_is_as_before() {
+        let manifest = game("40420", &[("trains", "1.2"), (OWN_MOD, "1+00")]);
+        let mut before = Context::new(&SHA256);
+        before.update(FINGERPRINT_DOMAIN);
+        let old = (&manifest.game, &manifest.mods, &manifest.unlisted);
+        before.update(&postcard::to_allocvec(&old).unwrap());
+        let before = before.finish();
+        assert_eq!(manifest.fingerprint().0.0, before.as_ref());
+    }
+
+    #[test]
+    fn native_mods_compare_as_mods() {
+        let base = game("40420", &[("trains", "1"), (OWN_MOD, "1+00")]);
+        let big = |version: &str| {
+            base.clone()
+                .with_native(vec![listed("native:bigmap", version)])
+        };
+        let room_version = native_version("0123456789", 'a');
+        let room = big(&room_version);
+        assert!(room.is_valid());
+        assert_eq!(room.compare(&big(&room_version)), None);
+        assert_eq!(room.fingerprint(), big(&room_version).fingerprint());
+
+        // Other settings: another settings prefix and package identity.
+        let other_version = native_version("abcdef0123", 'b');
+        let other = big(&other_version);
+        assert_ne!(room.fingerprint(), other.fingerprint());
+        let diff = room.compare(&other).unwrap();
+        assert_eq!(diff.changed_total, 1);
+        assert!(diff.to_string().contains("installs the room's native mods"));
+
+        // Without it: missing; the room without it: extra.
+        let diff = room.compare(&base).unwrap();
+        assert_eq!(diff.missing, [listed("native:bigmap", &room_version)]);
+        assert!(!diff.reordered);
+        let diff = base.compare(&room).unwrap();
+        assert_eq!(diff.extra_total, 1);
+        assert!(!diff.to_string().contains("installs"));
+
+        // A native mod is never mistaken for a mod of the same name.
+        let named = game(
+            "40420",
+            &[("trains", "1"), ("bigmap", "0.3.0"), (OWN_MOD, "1+00")],
+        );
+        assert_ne!(named.fingerprint(), room.fingerprint());
+    }
+
+    #[test]
+    fn native_mods_must_be_named_as_such_ordered_and_few() {
+        let base = game("40420", &[]);
+        let mut wrong = base.clone();
+        wrong.native = vec![listed("bigmap", "1.0.0+00")];
+        assert!(!wrong.is_valid());
+        let mut unordered = base.clone();
+        let identity_a = native_version("0123456789", 'a');
+        let identity_b = native_version("0123456789", 'b');
+        unordered.native = vec![
+            listed("native:b", &identity_b),
+            listed("native:a", &identity_a),
+        ];
+        assert!(!unordered.is_valid());
+        assert!(
+            base.clone()
+                .with_native(vec![
+                    listed("native:a", &identity_a),
+                    listed("native:b", &identity_b)
+                ])
+                .is_valid()
+        );
+        let many = (0..=MAX_NATIVE_TERMS)
+            .map(|n| listed(&format!("native:m{n:03}"), "1"))
+            .collect();
+        assert!(!base.clone().with_native(many).is_valid());
+        // The longest native mods still fit beside a summarised mod list.
+        let huge: Vec<ModRef> = (0..3000)
+            .map(|n| {
+                listed(
+                    &format!("workshop_{n:010}_{}", "x".repeat(76)),
+                    &"v".repeat(32),
+                )
+            })
+            .collect();
+        let longest_version = format!("{}+{}", "v".repeat(20), "1".repeat(NATIVE_TERM_DIGEST_HEX));
+        let longest = (0..MAX_NATIVE_TERMS)
+            .map(|n| {
+                listed(
+                    &format!("native:{n:02}{}", "n".repeat(87)),
+                    &longest_version,
+                )
+            })
+            .collect();
+        let full = ContentManifest::new(Text::new("40420").unwrap(), huge).with_native(longest);
+        assert!(full.unlisted.is_some());
+        assert!(full.is_valid());
+    }
+
+    #[test]
+    fn old_short_native_terms_and_oversized_normal_versions_fail_closed() {
+        let old = game("40420", &[]).with_native(vec![listed("native:bigmap", "0.3.0+0123456789")]);
+        assert!(
+            !old.is_valid(),
+            "ten hex digits cannot identify package bytes"
+        );
+        let too_long = game(
+            "40420",
+            &[("ordinary_mod", &"v".repeat(MAX_MOD_VERSION + 1))],
+        );
+        assert!(
+            !too_long.is_valid(),
+            "normal mod versions keep their old limit"
+        );
     }
 }

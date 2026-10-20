@@ -1,8 +1,8 @@
 # TPF3-MP: Transport Fever 3 Multiplayer — ReedME fork
 
-This fork is implementing the [11 October review](investigation/REEDME_DEEP_REVIEW_2026-10-11.md)
-for competitive companies through Proton. The candidate is
-`1.3.2-reedme.1`; it has not passed real-game acceptance and has no published
+This fork retains the [11 October repairs](investigation/REEDME_REVIEW_IMPLEMENTATION_2026-10-11.md)
+and includes upstream development changes through 19 October for competitive
+companies through Proton. The candidate is `1.3.2-reedme.2`; it has not passed real-game acceptance and has no published
 player release. See [fork setup and validation](docs/REEDME_SETUP.md).
 The original project is [Juliansgith's TPF3-MP](https://github.com/Juliansgith/Transport-Fever-3-Multiplayer-Mod).
 

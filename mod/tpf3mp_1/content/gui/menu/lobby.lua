@@ -2600,14 +2600,18 @@ function lobby.content(onClose, focus, onNewGame, onPick, onModHub, commonParams
 	else
 		small(native.foot(_("Leave room"), function() confirmS:set({ kind = "leave" }) end, "error-tape", canAct))
 	end
-	-- The small ones on the left, the button at the right edge; taking
-	-- back being ready, red as leaving, just before it.
+	-- The small ones on the left, the button at the right edge. The ready
+	-- button says where the player stands, Ready or Not ready, and a click
+	-- turns it over; the owner's, once ready, is just before Start.
 	local footer = { row(smalls) }
 	footer[#footer + 1] = gui_react_util.makeHorizontalSpacer()
-	if not playing and me and me.ready and room.you_own then
-		footer[#footer + 1] = native.foot(_("Not ready"), function()
+	local function readyButton()
+		return native.foot(_("Ready"), function()
 			send({ action = "ready", ready = false }, nil)
-		end, "error-tape", canAct and not busy)
+		end, "secondary", canAct and not busy, _("You are ready. Click if you are not."))
+	end
+	if not playing and me and me.ready and room.you_own then
+		footer[#footer + 1] = readyButton()
 	end
 	if playing then
 		footer[#footer + 1] = note(_("The room's game is under way."))
@@ -2631,13 +2635,11 @@ function lobby.content(onClose, focus, onNewGame, onPick, onModHub, commonParams
 				or differs
 				or (all and _("Every player's game loads the room's world")) or _("Waiting for everyone to be ready"))
 	elseif me and me.ready then
-		footer[#footer + 1] = native.foot(_("Not ready"), function()
-			send({ action = "ready", ready = false }, nil)
-		end, "error-tape", canAct and not busy)
+		footer[#footer + 1] = readyButton()
 	else
-		footer[#footer + 1] = native.wide(_("Ready"), function()
+		footer[#footer + 1] = native.wide(_("Not ready"), function()
 			send({ action = "ready", ready = true }, _("Getting ready..."))
-		end, canAct and not busy)
+		end, canAct and not busy, _("You are not ready. Click when you are."))
 	end
 
 	return frame(_("Your room"), status, builtin.TabWidget{

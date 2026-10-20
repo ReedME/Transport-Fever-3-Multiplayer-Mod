@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use tokio::sync::{mpsc, oneshot};
 use tpf3mp_agent::{
     Client, ClientError, ConnectOptions, Events, Requests, Route, Worlds,
     bridge::{self, Bridge, BridgeEnd, BridgeFault, BridgeOptions, Rejoin},
@@ -27,7 +28,7 @@ use tpf3mp_proto::{
 
 use crate::{
     bot::{Bot, BotConfig, BotReport},
-    fake_hook::{self, FakeHookConfig, HookReport},
+    fake_hook::{self, FakeHookConfig, HookNotice, HookReport},
 };
 
 /// What every bot plays: the toy game, without mods.
@@ -162,6 +163,7 @@ async fn seat(
     for client in others {
         client
             .join_room(JoinRoom {
+                scan_plan: settings.scan_plan,
                 invite,
                 password: None,
                 resume: None,
@@ -247,6 +249,13 @@ pub struct BridgedControl {
     /// A late player also waits for this signal before connecting. Its
     /// scheduled `join_after` remains the earliest time it can arrive.
     pub before_join: BTreeMap<usize, tokio::sync::oneshot::Receiver<()>>,
+    /// Optional gate before initial connections and room setup.
+    pub start: Option<oneshot::Receiver<()>>,
+    /// Optional releases for late players, by name in scheduled order.
+    /// Without this channel, `join_after` remains the earliest arrival.
+    pub late_joins: Option<mpsc::UnboundedReceiver<String>>,
+    /// Optional named milestones, alongside seat-indexed load observers.
+    pub notices: Option<mpsc::UnboundedSender<HookNotice>>,
 }
 
 /// As [`play_bridged_room`], with explicit milestones for restart fixtures.
@@ -260,6 +269,12 @@ pub async fn play_bridged_room_controlled(
             .is_none_or(|player| player.join_after.is_none())
     }) {
         bail!("a join gate must name a late player's seat");
+    }
+    if let Some(start) = &mut control.start {
+        tokio::time::timeout(plan.deadline, start)
+            .await
+            .context("waiting for the test to release room setup")?
+            .context("the test stopped room setup")?;
     }
     let mut starting = Vec::new();
     for player in plan.players.iter().filter(|p| p.join_after.is_none()) {
@@ -277,6 +292,7 @@ pub async fn play_bridged_room_controlled(
         let invite = seat_and_start(&seated, plan.players.len(), plan.settings, None).await?;
         (invite, None)
     };
+    let notices = control.notices.clone();
 
     let mut games: Vec<Option<(Hook, BridgeTask)>> = plan.players.iter().map(|_| None).collect();
     let starters = plan
@@ -293,6 +309,7 @@ pub async fn play_bridged_room_controlled(
             connection,
             start_world,
             control.snapshot_loaded.remove(&index),
+            notices.clone(),
         )?);
     }
     if let Some(owner) = owner {
@@ -307,7 +324,20 @@ pub async fn play_bridged_room_controlled(
         .collect();
     late.sort_by_key(|(_, _, after)| *after);
     for (index, player, after) in late {
-        tokio::time::sleep_until(started + after).await;
+        if let Some(releases) = &mut control.late_joins {
+            let name = tokio::time::timeout(plan.deadline, releases.recv())
+                .await
+                .context("waiting for the test to release a late player")?
+                .ok_or_else(|| anyhow::anyhow!("the test stopped releasing late players"))?;
+            if name != player.name {
+                bail!(
+                    "the test released late player {name} before {}, in scheduled order",
+                    player.name
+                );
+            }
+        } else {
+            tokio::time::sleep_until(started + after).await;
+        }
         if let Some(gate) = control.before_join.remove(&index) {
             tokio::time::timeout(plan.deadline, gate)
                 .await
@@ -315,7 +345,8 @@ pub async fn play_bridged_room_controlled(
                 .context("a late player's join gate closed before it was opened")?;
         }
         let options = player.options(&plan)?;
-        let (client, events) = join_late(&options, &invite, plan.deadline).await?;
+        let (client, events) =
+            join_late(&options, &invite, plan.settings.scan_plan, plan.deadline).await?;
         games[index] = Some(play_through_hook(
             &plan,
             player,
@@ -323,6 +354,7 @@ pub async fn play_bridged_room_controlled(
             (options, client, events),
             None,
             control.snapshot_loaded.remove(&index),
+            notices.clone(),
         )?);
     }
 
@@ -352,6 +384,7 @@ pub async fn play_bridged_room_controlled(
 async fn join_late(
     options: &ConnectOptions,
     invite: &Invite,
+    scan_plan: tpf3mp_proto::ScanPlan,
     patience: Duration,
 ) -> Result<(Client, Events)> {
     let deadline = tokio::time::Instant::now() + patience;
@@ -364,6 +397,7 @@ async fn join_late(
             client.declare_content(toy_content()).await?;
             client
                 .join_room(JoinRoom {
+                    scan_plan,
                     invite: *invite,
                     password: None,
                     resume: None,
@@ -421,6 +455,7 @@ fn play_through_hook(
     (options, client, events): (ConnectOptions, Client, Events),
     start_world: Option<PathBuf>,
     snapshot_loaded: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
+    notices: Option<mpsc::UnboundedSender<HookNotice>>,
 ) -> Result<(Hook, BridgeTask)> {
     let rejoin = Rejoin {
         options,
@@ -441,6 +476,7 @@ fn play_through_hook(
         FakeHookConfig {
             link_name,
             player: client.player(),
+            player_name: player.name.clone(),
             seed: player.seed,
             world_seed: player.world_seed,
             act_every: player.act_every,
@@ -450,11 +486,14 @@ fn play_through_hook(
             // A room that starts from a save starts with the games at their
             // menus; late joiners arrive at a running game.
             at_menu: plan.start_world.is_some() && player.join_after.is_none(),
+            notices,
         },
         snapshot_loaded,
     );
+    let scan_plan = plan.settings.scan_plan;
     let bridge = tokio::spawn(async move {
         let options = BridgeOptions {
+            scan_plan: Some(scan_plan),
             worlds,
             start_world,
             ..BridgeOptions::default()

@@ -336,6 +336,7 @@ async fn a_room_password_cannot_be_guessed_at_line_rate() {
         let request = ClientMessage::Request {
             id: pin,
             request: Request::JoinRoom(JoinRoom {
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 invite,
                 password: Some(Text::new(format!("{pin:04}")).unwrap()),
                 resume: None,
@@ -425,6 +426,7 @@ async fn pipelined_invite_resolution_uses_the_join_rate_gate() {
 
 /// Fast pacing so a test reaches hundreds of checkpoints in seconds.
 const CHECKS: RoomSettings = RoomSettings {
+    scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
     steps_per_second: 240,
     input_delay_ms: 40,
     checkpoint_interval: 10,
@@ -685,6 +687,7 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
     let refused = bob
         .client()
         .join_room(JoinRoom {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             invite,
             password: None,
             resume: Some(bob_old.follower.as_ref().unwrap().resume_point()),
@@ -719,6 +722,7 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
     let resumed = ann
         .client()
         .join_room(JoinRoom {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             invite,
             password: None,
             resume: ann_resume,

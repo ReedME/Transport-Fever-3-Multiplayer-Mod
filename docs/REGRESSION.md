@@ -11,7 +11,10 @@ to stay under 10 minutes a platform once the real game plays it.
 Today the games play a model of the game (below), not Transport Fever 3.
 The `junctions` scenario builds a street junction, applies turns,
 crosswalks and timed light phases, refuses another company's edit and
-resets it. Junction state participates in the model's network digest.
+resets it. The `double_slip` scenario turns a double slip switch on and
+off where two tracks cross, the one junction edit a room carries before
+the junction acceptance.
+Junction state participates in the model's network digest.
 The native/Lua adapter tests and pending real-game checklist are in
 [HOOKS.md](HOOKS.md#junction-tools).
 The script, the runner and the checks do not depend on which: the real

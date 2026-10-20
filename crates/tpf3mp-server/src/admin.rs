@@ -3,8 +3,10 @@
 //! request's body (up to 280 bytes of UTF-8), and players' diagnostics:
 //! `/diagnostics` lists the sessions and runs with some,
 //! `/diagnostics/<code>` gives one session's or run's (`?source=hook` one
-//! source's), over plain HTTP. It has no authentication, so it
-//! must only listen on a private address: loopback, or a VPN interface.
+//! source's), and `/rooms` the rooms open now with their members (one
+//! room by its invite, or those of a player or a name), over plain HTTP.
+//! It has no authentication, so it must only listen on a private address:
+//! loopback, or a VPN interface.
 
 use std::{sync::Arc, time::Duration};
 
@@ -15,9 +17,9 @@ use tokio::{
 };
 use tracing::warn;
 
-use tpf3mp_proto::ChatText;
+use tpf3mp_proto::{ChatText, Invite};
 
-use crate::ServerStats;
+use crate::{ServerStats, directory::RoomFilter};
 
 /// Largest request head the endpoint reads.
 const MAX_REQUEST: usize = 8 * 1024;
@@ -98,6 +100,7 @@ async fn answer(mut stream: TcpStream, stats: &ServerStats) -> std::io::Result<(
             ("200 OK", "text/plain", "ok\n".to_owned())
         }
         line if line.starts_with(b"GET /diagnostics") => diagnostics(line, stats),
+        line if line.starts_with(b"GET /rooms") => rooms(line, stats),
         _ => ("404 Not Found", "text/plain", "not found\n".to_owned()),
     };
     let response = format!(
@@ -197,6 +200,86 @@ fn diagnostics(request_line: &[u8], stats: &ServerStats) -> (&'static str, &'sta
                 Ok(None) => not_found(),
                 Err(error) => failed(error),
             }
+        }
+    }
+}
+
+/// `/rooms`: the rooms open now, each with its members; `?invite=K7QM2X`
+/// the room that invite opens (in either case), `?player=p-…` those a
+/// player is in, `?name=ann` those with a member whose name holds it, in
+/// any case. One filter at most. Never logs the invite.
+fn rooms(request_line: &[u8], stats: &ServerStats) -> (&'static str, &'static str, String) {
+    let not_found = || {
+        (
+            "404 Not Found",
+            "text/plain",
+            "not found
+"
+            .to_owned(),
+        )
+    };
+    let line = String::from_utf8_lossy(request_line);
+    let Some(path) = line
+        .strip_suffix(" HTTP/1.1")
+        .or_else(|| line.strip_suffix(" HTTP/1.0"))
+        .and_then(|line| line.strip_prefix("GET /rooms"))
+    else {
+        return not_found();
+    };
+    let (bare, query) = path.split_once('?').unwrap_or((path, ""));
+    if !matches!(bare, "" | "/") {
+        return not_found();
+    }
+    let mut filter = RoomFilter::All;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        if !matches!(filter, RoomFilter::All) {
+            return not_found();
+        }
+        filter = match pair.split_once('=') {
+            Some(("invite", value)) => match decode(value).parse::<Invite>() {
+                Ok(invite) => RoomFilter::Invite(invite),
+                Err(error) => {
+                    return (
+                        "400 Bad Request",
+                        "text/plain",
+                        format!(
+                            "{error}
+"
+                        ),
+                    );
+                }
+            },
+            Some(("player", value)) => RoomFilter::Player(decode(value)),
+            Some(("name", value)) => RoomFilter::Name(decode(value).to_lowercase()),
+            _ => return not_found(),
+        };
+    }
+    let shown = stats.room_view(&filter);
+    if shown.is_empty() && matches!(filter, RoomFilter::Invite(_)) {
+        return (
+            "404 Not Found",
+            "text/plain",
+            "no room open now has that invite
+"
+            .to_owned(),
+        );
+    }
+    match serde_json::to_string_pretty(&shown) {
+        Ok(json) => (
+            "200 OK",
+            "application/json",
+            json + "
+",
+        ),
+        Err(error) => {
+            warn!(%error, "cannot show the rooms");
+            (
+                "500 Internal Server Error",
+                "text/plain",
+                "cannot show the rooms
+"
+                .to_owned(),
+            )
         }
     }
 }

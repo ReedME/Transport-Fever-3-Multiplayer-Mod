@@ -20,6 +20,7 @@ pub const WAIT: Duration = Duration::from_secs(10);
 
 /// Settings that move fast enough for tests.
 pub const FAST: RoomSettings = RoomSettings {
+    scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
     steps_per_second: 50,
     input_delay_ms: 40,
     checkpoint_interval: 10,
@@ -168,6 +169,7 @@ pub fn room_of(mods: &[&str]) -> tpf3mp_proto::RoomDeclaration {
         room: tpf3mp_proto::RoomConfig {
             info,
             params: Vec::new(),
+            native: Vec::new(),
         },
     }
 }
@@ -186,6 +188,7 @@ pub fn room(name: &str, settings: RoomSettings) -> CreateRoom {
 
 pub fn join(invite: &Invite) -> JoinRoom {
     JoinRoom {
+        scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
         invite: *invite,
         password: None,
         resume: None,

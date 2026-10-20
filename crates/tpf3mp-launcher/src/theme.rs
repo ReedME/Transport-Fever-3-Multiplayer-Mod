@@ -375,6 +375,10 @@ const ICONS: &[(&str, &str)] = &[
         "archive",
         r#"<path d="M4 8v12h16V8M9 12h6"/><rect x="3" y="3" width="18" height="5" rx="1"/>"#,
     ),
+    (
+        "search",
+        r#"<circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/>"#,
+    ),
     ("close", r#"<path d="m6 6 12 12M6 18 18 6"/>"#),
     ("check", r#"<path d="m5 12 5 5 9-10"/>"#),
     (

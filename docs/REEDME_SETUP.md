@@ -6,8 +6,10 @@ Use the native Linux server for this initial setup; Windows-server log
 compaction inside Wine has a known compatibility failure.
 The review baseline is upstream v1.3.1 at
 `538733611cc5e4c8ea30d48513d5b0df761db05a`; the repair candidate is
-`1.3.2-reedme.1`. The dated review remains a record of that baseline, rather
-than a statement about the repaired candidate.
+`1.3.2-reedme.2`, refreshed with upstream development commit
+`02829e36` on 2026-10-20. The dated review remains a record of its original
+baseline. See `../investigation/REEDME_UPSTREAM_REFRESH_2026-10-20.md` for
+the refresh, source checks and remaining game-test inputs.
 
 ## Repository and release ownership
 
@@ -44,13 +46,13 @@ Start the Windows launcher in the game's Proton prefix with
 `--server 127.0.0.1:29470 --pin-cert <Windows-path-to-server.der>` and
 `--game-exe <Windows-path-to-TransportFever3.exe>`. A second machine needs a
 reachable explicit address and the same pinned certificate. Keep the server's
-secret file and data directory together for same-room recovery. Protocol 20,
-bridge 29 and persisted format 9 require matching candidate binaries; protocol
-19 clients cannot join this server. Back up the complete old data directory,
+secret file and data directory together for same-room recovery. Protocol 24,
+bridge 30 and persisted format 11 require matching candidate binaries. Earlier
+clients, including our protocol-20 candidate, cannot join this server. Back up the complete old data directory,
 including snapshots and the invite key, before any upgrade. Startup refuses
 incompatible or unidentified room-log formats before identity writes, recovery
-or snapshot cleanup. Format-8 data needs its matching old server; this candidate
-needs fresh data and, if configured separately, a fresh snapshot directory.
+or snapshot cleanup. Formats 8, 9 and 10 need their matching old servers; fork format 9 and
+upstream format 9 are different layouts. This candidate needs fresh data and, if configured separately, a fresh snapshot directory.
 
 The deployment default is `ghcr.io/reedme/tpf3mp-server`. A manually published
 feature image uses `branch-codex-proton-competitive-fixes`; select it through
@@ -67,6 +69,20 @@ configuration. Loopback is a local test target, not a public release endpoint.
 Server setup is still local until an operated server/domain is supplied.
 
 ## Proton installation and game acceptance
+
+A Windows operating system is not required. Use the **Windows edition of TF3
+inside Proton on Linux**. The installed native Linux executable cannot use the
+Windows hook. As of the 2026-10-20 inspection, this machine has a Linux ELF
+only, no `TransportFever3.exe` and no initialized game Proton prefix; the old
+synthetic-test prefix is not the game's prefix.
+
+In Steam, the owner can open TF3's Properties → Compatibility, force Proton
+Experimental, let Steam install the Windows edition, and start it once through
+Steam. Keep the game on stable **40420**. Official release notes list **40422**
+as preview, and this source has no verified profile for it. Confirm the exact
+executable SHA256 below before attempting injection. The source update itself
+does not change Steam settings, installed game files or real saves.
+
 
 Use the **portable Windows ZIP**, extracting its launcher, agent, hook and mod
 together. Run its `TPF3-MP.exe` in the **same prefix and Steam environment** as
@@ -102,6 +118,30 @@ Include a paused saved loan and infinite-money setting in finance acceptance.
 Record every scheduled checkpoint, including missing samples, and inspect
 game/hook/server logs. Synthetic or profile verification cannot substitute for
 these runtime checks.
+
+The upstream `tools/game/room.ps1` harness targets Windows PowerShell and
+starts a Windows server. It is not yet a verified Proton automation path;
+Windows-server log compaction under Wine has a known failure. Start the native
+Linux test server and run the Windows portable launcher in the game's actual
+prefix for owner-operated acceptance. Keep the tools/game process ownership,
+fixture, log/probe and clean-quit rules from `GAME_TESTING.md`; synthetic rig
+runs alone do not clear its real-game checklist.
+
+## Native plugins after this refresh
+
+D31 records the owner's adoption of upstream's external-plugin model. A
+package must come from a validated project-signed index or a deliberately
+configured, authenticated server registry, and executable consent binds the
+full canonical package identity before payload fetch, install or enable.
+Publisher/source metadata, platform/ABI, exact game identity, payload hashes,
+room terms and hook declarations remain gates. The fork has no configured
+native-mod registry, trusted package index or installed plugin package; this
+update does not enable Big Maps or install an external DLL. Native-mod trust
+uses its own key/source, separate from the updater's release key.
+
+The standalone double-slip exception from upstream U-D30 remains unadopted:
+`strict_junctions` and `double_slip_only` are false in ordinary rooms. Its
+regressions opt in only in disposable acceptance copies.
 
 ## Saved loans and company passwords
 

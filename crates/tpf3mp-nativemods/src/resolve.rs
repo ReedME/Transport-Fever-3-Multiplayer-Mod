@@ -28,7 +28,10 @@ pub enum ResolveError {
     Unknown(String),
     #[error("no version of {0} runs on this build of the game")]
     NotForBuild(String),
-    #[error("{0} needs native plugins, which this TPF3-MP does not load")]
+    #[error(
+        "{0} needs a native plugin this TPF3-MP cannot load: none for this platform, or one \
+         for another plugin interface"
+    )]
     NeedsPlugins(String),
     #[error("{package} needs the hook feature {feature}, which this TPF3-MP does not have")]
     UnknownFeature { package: String, feature: String },
@@ -54,6 +57,15 @@ pub struct Context<'a> {
     pub registry: &'a [FeatureSpec],
 }
 
+/// The packages selected for a request and the complete dependency closure.
+/// `install` is dependency-first and omits already-installed packages that
+/// already match. `closure` includes those cached choices for preflight.
+#[derive(Debug, Clone)]
+pub struct Resolution<'a> {
+    pub install: Vec<&'a Package>,
+    pub closure: Vec<&'a Package>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Visit {
     Visiting,
@@ -76,6 +88,50 @@ pub fn resolve<'a>(
     wanted: &[&str],
     installed: &[&'a Package],
 ) -> Result<Vec<&'a Package>, ResolveError> {
+    Ok(resolve_plan(context, wanted, installed)?.install)
+}
+
+/// Resolves `wanted` without changing the store, returning both the
+/// dependency-first install list and every selected package in its closure.
+pub fn resolve_plan<'a>(
+    context: Context<'a>,
+    wanted: &[&str],
+    installed: &[&'a Package],
+) -> Result<Resolution<'a>, ResolveError> {
+    let wanted: Vec<(&str, Option<semver::VersionReq>)> =
+        wanted.iter().map(|id| (*id, None)).collect();
+    resolve_pinned(context, &wanted, installed)
+}
+
+/// The packages to install for `id` in exactly `version` (a room's, which
+/// a member must run alike), dependencies first, as [`resolve`].
+pub fn resolve_exact<'a>(
+    context: Context<'a>,
+    id: &str,
+    version: &str,
+    installed: &[&'a Package],
+) -> Result<Vec<&'a Package>, ResolveError> {
+    Ok(resolve_exact_plan(context, id, version, installed)?.install)
+}
+
+/// Resolves `id` in exactly `version`, without changing the store, returning
+/// the full dependency closure as well as what must be installed.
+pub fn resolve_exact_plan<'a>(
+    context: Context<'a>,
+    id: &str,
+    version: &str,
+    installed: &[&'a Package],
+) -> Result<Resolution<'a>, ResolveError> {
+    let exact = semver::VersionReq::parse(&format!("={version}"))
+        .map_err(|_| ResolveError::Unknown(format!("{id} {version}")))?;
+    resolve_pinned(context, &[(id, Some(exact))], installed)
+}
+
+fn resolve_pinned<'a>(
+    context: Context<'a>,
+    wanted: &[(&str, Option<semver::VersionReq>)],
+    installed: &[&'a Package],
+) -> Result<Resolution<'a>, ResolveError> {
     let mut walk = Walk {
         context,
         installed: installed.iter().map(|p| (p.id.as_str(), *p)).collect(),
@@ -84,8 +140,8 @@ pub fn resolve<'a>(
         order: Vec::new(),
         path: Vec::new(),
     };
-    for id in wanted {
-        walk.visit(id, None, true)?;
+    for (id, requirement) in wanted {
+        walk.visit(id, requirement.as_ref(), true)?;
     }
     // Everything that will be installed afterwards: the chosen packages,
     // and the installed ones nothing replaces.
@@ -100,7 +156,10 @@ pub fn resolve<'a>(
             }
         }
     }
-    Ok(walk.order)
+    Ok(Resolution {
+        install: walk.order,
+        closure: walk.chosen.into_values().collect(),
+    })
 }
 
 impl<'a> Walk<'a> {
@@ -143,7 +202,13 @@ impl<'a> Walk<'a> {
             .flatten()
             .filter(|p| p.runs_on(build) && accepts(p));
         let package = match kept {
-            Some(package) => package,
+            Some(installed) => index
+                .package(id, &installed.version)
+                .filter(|package| package.runs_on(build) && accepts(package))
+                // When the signed index still offers this exact version,
+                // use its current manifest even if the installed version
+                // number already satisfies the dependency.
+                .unwrap_or(installed),
             None => {
                 let versions = index.versions(id);
                 if versions.is_empty() {
@@ -161,7 +226,12 @@ impl<'a> Walk<'a> {
             }
         };
         if !package.plugins.is_empty() {
-            return Err(ResolveError::NeedsPlugins(id.to_owned()));
+            let here = crate::index::current_platform()
+                .map(|platform| package.plugins_for(platform))
+                .unwrap_or_default();
+            if here.is_empty() || here.iter().any(|p| p.abi != crate::index::PLUGIN_ABI) {
+                return Err(ResolveError::NeedsPlugins(id.to_owned()));
+            }
         }
         if let Some(feature) = package
             .features
@@ -184,10 +254,14 @@ impl<'a> Walk<'a> {
         self.path.pop();
         self.state.insert(id.to_owned(), Visit::Done);
         self.chosen.insert(id.to_owned(), package);
+        // An exact room install must revisit an already-installed version
+        // when the signed index changed its package manifest without a
+        // version bump. `Store::install_one` verifies the on-disk files
+        // against this package and replaces a stale same-version copy.
         if self
             .installed
             .get(id)
-            .is_none_or(|i| i.version != package.version)
+            .is_none_or(|installed| *installed != package)
         {
             self.order.push(package);
         }
@@ -205,6 +279,26 @@ mod tests {
             tests::{BUILD, OTHER_BUILD, big_maps, index, package},
         },
     };
+
+    #[test]
+    fn a_room_gets_its_exact_version_not_the_newest() {
+        let mut newer = big_maps();
+        newer.version = "0.4.0".into();
+        let index = index(vec![big_maps(), newer]);
+        let context = Context {
+            index: &index,
+            build: BUILD,
+            registry: BIG_MAPS,
+        };
+        let newest = resolve(context, &["bigmap"], &[]).unwrap();
+        assert_eq!(newest[0].version, "0.4.0");
+        let exact = resolve_exact(context, "bigmap", "0.3.0", &[]).unwrap();
+        assert_eq!(exact[0].version, "0.3.0");
+        assert!(matches!(
+            resolve_exact(context, "bigmap", "9.9.9", &[]),
+            Err(ResolveError::NoMatch { .. })
+        ));
+    }
 
     fn needs(mut package: Package, id: &str, version: &str) -> Package {
         package.depends.push(Dependency {
@@ -275,19 +369,48 @@ mod tests {
             ids(&resolve(context(&index), &["bigmap"], &[]).unwrap()),
             ["bigmap 0.3.0"]
         );
-        let mut plugged = package("p", "1.0.0", &[]);
-        plugged.plugins.push(Plugin {
-            path: "p.dll".into(),
-            url: "https://test/p.dll".into(),
+        // A plugin for this platform and interface installs; one for
+        // another platform, or another interface, does not.
+        let plugin = |platform: &str, abi: u32| Plugin {
+            path: format!("p-{platform}.bin"),
+            url: "https://test/p.bin".into(),
             size: 1,
             sha256: "0".repeat(64),
-            abi: 1,
-        });
-        let index = super::super::index::tests::index(vec![plugged]);
+            abi,
+            platform: platform.into(),
+        };
+        let with = |plugins: Vec<Plugin>| {
+            let mut plugged = package("p", "1.0.0", &[]);
+            plugged.plugins = plugins;
+            super::super::index::tests::index(vec![plugged])
+        };
+        let here = crate::index::current_platform();
+        let elsewhere = crate::index::PLATFORMS
+            .iter()
+            .find(|p| Some(**p) != here)
+            .unwrap();
+        let index = with(vec![plugin(elsewhere, crate::index::PLUGIN_ABI)]);
         assert_eq!(
             resolve(context(&index), &["p"], &[]),
             Err(ResolveError::NeedsPlugins("p".into()))
         );
+        let linux = with(vec![plugin("linux-x86_64", crate::index::PLUGIN_ABI)]);
+        assert_eq!(
+            resolve(context(&linux), &["p"], &[]),
+            Err(ResolveError::NeedsPlugins("p".into()))
+        );
+        if let Some(here) = here {
+            let index = with(vec![plugin(here, crate::index::PLUGIN_ABI)]);
+            assert_eq!(
+                ids(&resolve(context(&index), &["p"], &[]).unwrap()),
+                ["p 1.0.0"]
+            );
+            let index = with(vec![plugin(here, crate::index::PLUGIN_ABI + 1)]);
+            assert_eq!(
+                resolve(context(&index), &["p"], &[]),
+                Err(ResolveError::NeedsPlugins("p".into()))
+            );
+        }
     }
 
     #[test]
@@ -374,5 +497,51 @@ mod tests {
         // Wanted itself, it goes to the newest.
         let order = resolve(context(&index), &["b"], &[installed_b]).unwrap();
         assert_eq!(ids(&order), ["b 1.5.0"]);
+    }
+
+    #[test]
+    fn the_preflight_plan_includes_cached_dependencies_and_updated_signed_manifests() {
+        let installed_b = package("b", "1.0.0", &[("old.lua", b"old")]);
+        let updated_b = package("b", "1.0.0", &[("new.lua", b"new")]);
+        let signed_index = index(vec![
+            needs(package("a", "1.0.0", &[]), "b", "^1"),
+            updated_b,
+        ]);
+        let plan = resolve_plan(context(&signed_index), &["a"], &[&installed_b]).unwrap();
+        assert_eq!(ids(&plan.install), ["b 1.0.0", "a 1.0.0"]);
+        assert_eq!(
+            plan.closure
+                .iter()
+                .map(|package| package.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+
+        let installed_only_index = index(vec![needs(package("a", "1.0.0", &[]), "b", "^1")]);
+        let plan = resolve_plan(context(&installed_only_index), &["a"], &[&installed_b]).unwrap();
+        assert_eq!(ids(&plan.install), ["a 1.0.0"]);
+        assert_eq!(
+            plan.closure
+                .iter()
+                .map(|package| package.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let exact = resolve_exact_plan(
+            context(&installed_only_index),
+            "a",
+            "1.0.0",
+            &[&installed_b],
+        )
+        .unwrap();
+        assert_eq!(ids(&exact.install), ["a 1.0.0"]);
+        assert_eq!(
+            exact
+                .closure
+                .iter()
+                .map(|package| package.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
     }
 }

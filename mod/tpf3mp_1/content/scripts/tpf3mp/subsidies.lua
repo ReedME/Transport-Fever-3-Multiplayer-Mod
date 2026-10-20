@@ -226,9 +226,12 @@ local LISTS = {
 }
 
 -- A number as text: whole numbers as integers, else at full precision.
+-- Never `%d`: the game's Lua 5.2 formats it through a 32-bit C `long` on
+-- Windows and raises on anything past 2^31, which offer numbers reach.
 local function num(v)
 	if type(v) ~= "number" then return "-" end
-	if v == math.floor(v) and v > -1e15 and v < 1e15 then return string.format("%d", v) end
+	if v == 0 then return "0" end
+	if v == math.floor(v) and v > -1e15 and v < 1e15 then return string.format("%.0f", v) end
 	return string.format("%.17g", v)
 end
 

@@ -41,6 +41,7 @@ fn main() -> Result<()> {
         // Without the player's identity the game only builds track, which
         // any player may.
         player: PlayerId(FixedBytes([0; 32])),
+        player_name: "fakegame".into(),
         seed: args.seed,
         world_seed: args.world_seed,
         act_every: args.act_every,
@@ -48,6 +49,7 @@ fn main() -> Result<()> {
         drift_at: None,
         patience: Duration::from_secs(3600),
         at_menu: false,
+        notices: None,
     })
     .join()
     .map_err(|_| anyhow::anyhow!("the game panicked"))?

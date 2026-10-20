@@ -75,6 +75,7 @@ fn room(phase: RoomPhase, owner: PlayerId) -> RoomView {
         has_password: false,
         phase,
         settings: RoomSettings {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             steps_per_second: 5,
             input_delay_ms: 100,
             checkpoint_interval: 50,

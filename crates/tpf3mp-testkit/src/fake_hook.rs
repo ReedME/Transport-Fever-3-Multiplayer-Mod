@@ -8,10 +8,18 @@
 use std::{path::Path, thread::JoinHandle, time::Duration};
 
 use thiserror::Error;
+use tokio::sync::mpsc::UnboundedSender;
 use tpf3mp_bridge::{Game, Load, Notice, Session, SessionError, StepGate};
 use tpf3mp_proto::{Event, LaneDigest, PlayerId};
 
 use crate::{bot::choose, rng::SplitMix64, toy::ToyWorld};
+
+/// A milestone from a fake game, for scenarios that must coordinate with
+/// what the game actually received rather than how long setup took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookNotice {
+    WorldLoaded { player: String, next_step: u64 },
+}
 
 #[derive(Debug, Clone)]
 pub struct FakeHookConfig {
@@ -19,6 +27,8 @@ pub struct FakeHookConfig {
     pub link_name: String,
     /// The player this game belongs to.
     pub player: PlayerId,
+    /// The player's readable name, used in optional test milestones.
+    pub player_name: String,
     /// Seed of this player's own choices.
     pub seed: u64,
     /// Seed of the shared world; the same for every game in a room.
@@ -36,10 +46,14 @@ pub struct FakeHookConfig {
     /// (`ToAgent::MenuUp`), as a game started before its room does: the
     /// agent marks the player ready there.
     pub at_menu: bool,
+    /// Reports received worlds to a test coordinating server restarts.
+    pub notices: Option<UnboundedSender<HookNotice>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HookReport {
+    /// The room's agreed scan plan received before its first world load.
+    pub scan_plan: tpf3mp_proto::ScanPlan,
     pub ran: u64,
     /// The world's lanes after the last step run.
     pub lanes: Vec<LaneDigest>,
@@ -50,6 +64,9 @@ pub struct HookReport {
     pub money: Option<i64>,
     /// Worlds loaded from a save the room sent: a late join or a rebase.
     pub received: usize,
+    /// Producing-world epoch and next step for each received save actually
+    /// loaded, in order, for diagnosing duplicate or missing world handoffs.
+    pub received_loads: Vec<(u64, u64)>,
     /// The step the last of those saves stood at (its load's next step):
     /// games that last loaded the same save report the same.
     pub last_load: Option<u64>,
@@ -126,14 +143,17 @@ fn run(
     snapshot_loaded: Option<&tokio::sync::mpsc::UnboundedSender<u64>>,
 ) -> Result<HookReport, HookError> {
     let mut session = Session::attach(&config.link_name, "fake hook", config.patience)?;
-    if config.at_menu {
-        while session.try_begin()?.is_none() {
+    let begin = if config.at_menu {
+        loop {
+            if let Some(begin) = session.try_begin()? {
+                break begin;
+            }
             session.menu_up(1)?;
             std::thread::sleep(Duration::from_millis(5));
         }
     } else {
-        session.wait_for_begin()?;
-    }
+        session.wait_for_begin()?
+    };
     let mut game = ToyGame {
         world: ToyWorld::new(config.world_seed),
         applied: 0,
@@ -145,6 +165,7 @@ fn run(
     let mut ran = 0;
     let mut commands = 0;
     let mut received = 0;
+    let mut received_loads = Vec::new();
     let mut last_load = None;
     let mut ended = false;
     while ran < config.target_step {
@@ -157,10 +178,17 @@ fn run(
                 }
                 game.world = load_world(config, &load)?;
                 session.loaded(load.next_step)?;
-                if load.file.is_some()
-                    && let Some(observer) = snapshot_loaded
-                {
-                    let _ = observer.send(load.next_step);
+                if load.file.is_some() {
+                    received_loads.push((load.world_epoch, load.next_step));
+                    if let Some(observer) = snapshot_loaded {
+                        let _ = observer.send(load.next_step);
+                    }
+                    if let Some(notices) = &config.notices {
+                        let _ = notices.send(HookNotice::WorldLoaded {
+                            player: config.player_name.clone(),
+                            next_step: load.next_step,
+                        });
+                    }
                 }
                 ran = load.next_step - 1;
                 continue;
@@ -186,6 +214,7 @@ fn run(
         }
     }
     Ok(HookReport {
+        scan_plan: begin.scan_plan,
         ran,
         lanes: game.world.lanes(),
         applied: game.applied,
@@ -194,6 +223,7 @@ fn run(
         diverged: game.diverged,
         money: game.world.ledger.money(&config.player),
         received,
+        received_loads,
         last_load,
         saves: game.saves,
         ended,

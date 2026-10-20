@@ -298,8 +298,13 @@ fn main_action(state: &State, update: &UpdateState) -> Main {
     if room.you_own && everyone {
         return main("Start the game", "play", Does::Act(Action::Start));
     }
+    // The ready button says where the player stands; a click turns it over.
     if you(state).is_some_and(|me| !me.ready) {
-        return main("Ready", "check", Does::Act(Action::Ready { ready: true }));
+        return main(
+            "Not ready",
+            "close",
+            Does::Act(Action::Ready { ready: true }),
+        );
     }
     let waiting = if room.you_own {
         "Waiting for everyone to be ready"
@@ -345,17 +350,19 @@ fn secondary(state: &State) -> Vec<Secondary> {
     };
     let mut buttons = Vec::new();
     let me = you(state);
+    // The ready button says where the player stands, Ready or Not ready;
+    // a click turns it over.
     if room.phase == Phase::Lobby && me.is_some_and(|me| me.ready) {
         buttons.push(Secondary {
-            label: "Not ready",
-            icon: "close",
+            label: "Ready",
+            icon: "check",
             then: Then::Act(Action::Ready { ready: false }),
             danger: false,
         });
     } else if room.phase == Phase::Lobby && me.is_some() && state.game.attached.is_none() {
         buttons.push(Secondary {
-            label: "Ready",
-            icon: "check",
+            label: "Not ready",
+            icon: "close",
             then: Then::Act(Action::Ready { ready: true }),
             danger: false,
         });
@@ -913,7 +920,8 @@ mod tests {
         assert_eq!(view.main.label, "Start Transport Fever 3");
         assert_eq!(view.main.does, Does::Act(Action::LaunchGame));
         let labels: Vec<_> = view.secondary.iter().map(|b| b.label).collect();
-        assert_eq!(labels, ["Ready", "Copy invite", "Leave room"]);
+        // The ready button says where Ann stands.
+        assert_eq!(labels, ["Not ready", "Copy invite", "Leave room"]);
         assert_eq!(
             view.rows[1],
             Row {
@@ -944,7 +952,8 @@ mod tests {
         };
         let view = present(&state, Reach::Online, None);
         assert_eq!(view.main.does, Does::Act(Action::Start));
-        assert_eq!(view.secondary[0].label, "Not ready");
+        // Ann is ready, and her button says so.
+        assert_eq!(view.secondary[0].label, "Ready");
     }
 
     #[test]
@@ -973,7 +982,11 @@ mod tests {
         let view = present(&state, Reach::Online, None);
         let (text, _) = view.status.unwrap();
         assert!(text.contains("You are ready"), "{text}");
-        assert_eq!(view.secondary[0].label, "Not ready");
+        assert_eq!(view.secondary[0].label, "Ready");
+        assert_eq!(
+            view.secondary[0].then,
+            Then::Act(Action::Ready { ready: false })
+        );
     }
 
     #[test]

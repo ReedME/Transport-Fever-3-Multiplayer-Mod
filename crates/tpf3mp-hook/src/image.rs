@@ -55,6 +55,13 @@ fn query(_address: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// The committed, readable region holding `address`, as the system answers
+/// it now (one `VirtualQuery`), for a cache of the caller's own that lives
+/// no longer than the structures it checks ([`crate::netread`]).
+pub fn region(address: usize) -> Option<(usize, usize)> {
+    query(address)
+}
+
 /// Regions already found readable, most recent first; at most `N`.
 #[derive(Debug, Clone)]
 pub struct RegionCache<const N: usize> {

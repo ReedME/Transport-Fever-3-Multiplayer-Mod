@@ -152,6 +152,7 @@ fn room_declaration() -> tpf3mp_proto::RoomDeclaration {
                     value: -3,
                 }],
             }],
+            native: Vec::new(),
         },
     }
 }
@@ -201,6 +202,7 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
         ClientMessage::Request {
             id: 8,
             request: Request::JoinRoom(JoinRoom {
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 invite: invite(),
                 password: None,
                 resume: Some(Resume {

@@ -421,6 +421,7 @@ impl LauncherArgs {
             content: split.manifest,
             mods: split.lists,
             picker,
+            native: None,
             installed,
             link: self.game_link.clone(),
             worlds: open_worlds(self.worlds.as_deref(), self.worlds_gib, &self.game_link)?,

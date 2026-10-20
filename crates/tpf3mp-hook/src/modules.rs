@@ -68,6 +68,18 @@ pub const KEPT: usize = 16;
 pub trait Memory {
     /// `len` bytes at `address`, or `None` when they are not all readable.
     fn read(&self, address: usize, len: usize) -> Option<Vec<u8>>;
+
+    /// `out.len()` bytes at `address` into `out`, without allocating where
+    /// the memory can; `false` when they are not all readable.
+    fn read_into(&self, address: usize, out: &mut [u8]) -> bool {
+        match self.read(address, out.len()) {
+            Some(bytes) => {
+                out.copy_from_slice(&bytes);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// The running game's memory, read only where [`crate::image::readable`]
@@ -161,7 +173,12 @@ pub(crate) fn ids(
 }
 
 /// One MSVC `std::string` at `address`, at most `max` bytes.
-fn string(memory: &dyn Memory, address: usize, max: usize, what: &str) -> Result<String, String> {
+pub(crate) fn string(
+    memory: &dyn Memory,
+    address: usize,
+    max: usize,
+    what: &str,
+) -> Result<String, String> {
     let raw = read(memory, address, layout::STRING_SIZE, what)?;
     let len = u64_at(&raw, layout::STRING_LEN);
     let capacity = u64_at(&raw, layout::STRING_CAPACITY);
@@ -186,7 +203,7 @@ fn string(memory: &dyn Memory, address: usize, max: usize, what: &str) -> Result
 
 /// A `ResName` as the game names it to scripts: `first + "::/" + second`
 /// (`::/depot/...` for the base game's), "" when `second` is empty.
-fn res_name(memory: &dyn Memory, address: usize, what: &str) -> Result<String, String> {
+pub(crate) fn res_name(memory: &dyn Memory, address: usize, what: &str) -> Result<String, String> {
     let first = string(memory, address, MAX_TEXT, what)?;
     let second = string(memory, address + layout::STRING_SIZE, MAX_TEXT, what)?;
     if second.is_empty() {

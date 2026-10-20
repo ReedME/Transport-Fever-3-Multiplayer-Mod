@@ -141,6 +141,7 @@ pub struct Load {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Begin {
     pub room: tpf3mp_proto::RoomId,
+    pub scan_plan: tpf3mp_proto::ScanPlan,
     /// The rules the room is played by (see `ToHook::Begin`).
     pub rules: RulesName,
     pub steps_per_second: u16,
@@ -355,6 +356,7 @@ impl Session {
             match message {
                 ToHook::Begin {
                     room,
+                    scan_plan,
                     rules,
                     steps_per_second,
                     checkpoint_interval,
@@ -367,6 +369,7 @@ impl Session {
                     self.lobby = Lobby::Begun;
                     return Ok(Some(Begin {
                         room,
+                        scan_plan,
                         rules,
                         steps_per_second,
                         checkpoint_interval,
@@ -987,6 +990,7 @@ mod tests {
     fn begin(checkpoint_interval: u32) -> ToHook {
         ToHook::Begin {
             room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             rules: RulesName::new("native").unwrap(),
             steps_per_second: 5,
             checkpoint_interval,
@@ -1472,6 +1476,7 @@ mod tests {
             &agent,
             &ToHook::Begin {
                 room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
+                scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
                 rules: RulesName::new("native").unwrap(),
                 steps_per_second: 5,
                 checkpoint_interval: 50,

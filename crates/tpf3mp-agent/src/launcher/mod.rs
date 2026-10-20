@@ -45,11 +45,12 @@ use tracing::{info, warn};
 
 pub use self::api::{
     Action, ChatLine, Connection, Differences, Game, InstalledGame, Member, MemberContent,
-    ModClass, ModHave, ModRow, Phase, PublicRoom, Room, RoomList, RoomModRow, RoomStart,
-    RulesChoice, ServerRow, StartProgress, State, World,
+    ModClass, ModHave, ModRow, Phase, PublicRoom, Room, RoomList, RoomModRow, RoomNativeRow,
+    RoomStart, RulesChoice, ServerRow, StartProgress, State, World,
 };
 pub use self::servers::ListedServer;
 use self::{api::View, http::Page, lobby::IdleLink};
+use crate::native_mods::Change;
 use crate::{
     Client, ClientError, ClientEvent, ConnectOptions, Events, TunnelChoice, Worlds,
     bridge::{
@@ -137,6 +138,10 @@ pub struct LauncherConfig {
     /// found them itself (no `--mods`): `content` and `mods` then follow
     /// them and the room (`crate::picker`; docs/MODS.md).
     pub picker: Option<crate::picker::Mods>,
+    /// Where native mods come from: the project's signed index, when this
+    /// launcher was built with its key (docs/NATIVE_MODS.md). Without, it
+    /// offers none.
+    pub native: Option<crate::native_mods::NativeSetup>,
     /// Transport Fever 3 as Steam installed it, if it did.
     pub installed: Option<crate::steam::Installed>,
     /// The shared-memory link the game's hook opens.
@@ -346,6 +351,9 @@ pub(crate) struct Shared {
     /// launcher plays on its release's servers.
     lookouts: servers::Lookouts,
     room_pages: Mutex<RoomPageCache>,
+    /// The room last joined, with its password: joined again once the game
+    /// started anew with the room's native mods.
+    last_join: Mutex<Option<(Invite, Option<Text<64>>)>>,
 }
 
 /// Whether a launcher set up as `config` starts on its release's servers:
@@ -397,6 +405,7 @@ impl Shared {
             picker: config.picker.clone().map(|mods| Arc::new(Mutex::new(mods))),
             lookouts: servers::Lookouts::default(),
             room_pages: Mutex::new(RoomPageCache::default()),
+            last_join: Mutex::new(None),
         });
         shared.show_mods();
         let lobby = LobbyEnds {
@@ -470,8 +479,32 @@ impl Shared {
             Some(mods) => mods
                 .declaration()
                 .unwrap_or_else(|_| Declaration::Content(mods.manifest())),
-            None => Declaration::Content(config.content.clone()),
+            None => Declaration::Content(
+                config.content.clone().with_native(
+                    self.view()
+                        .native_terms
+                        .iter()
+                        .map(tpf3mp_proto::NativeMod::term)
+                        .collect(),
+                ),
+            ),
         }
+    }
+
+    /// The native mods that change the simulation which this player's game
+    /// runs, or the next one will: declared beside their mods. Returns
+    /// whether they changed.
+    fn set_native(&self, terms: Vec<tpf3mp_proto::NativeMod>) -> bool {
+        let changed = {
+            let mut view = self.view();
+            let changed = view.native_terms != terms;
+            view.native_terms.clone_from(&terms);
+            changed
+        };
+        if let Some(mut mods) = self.picker() {
+            mods.set_native(terms);
+        }
+        changed
     }
 
     /// Puts the picker's mods in the view.
@@ -670,6 +703,13 @@ async fn control(
             shared.view().error = Some(error.clone());
         })
         .ok();
+    // The native mods panel, and what the first game would run.
+    refresh_native(&shared, &config, false).await;
+    // The room's native mods last matched in its lobby, so a list that
+    // cannot be matched is tried once; and the room to join again once the
+    // game has started anew with them.
+    let mut native_tried: Option<Vec<tpf3mp_proto::NativeMod>> = None;
+    let mut rejoin: Option<(Invite, Option<Text<64>>)> = None;
     let mut tick = tokio::time::interval(LOBBY_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut saves_tick = tokio::time::interval(SAVES_TICK);
@@ -688,12 +728,12 @@ async fn control(
                 let Some((action, reply)) = action else {
                     return;
                 };
-                let result = act(&shared, &config, action, &mut connected, &mut session, &mut game, &mut idle).await;
+                let result = act(&shared, &config, action, &mut connected, &mut session, &mut game, &mut idle, &mut rejoin).await;
                 shared.view().error = result.as_ref().err().cloned();
                 let _ = reply.send(result);
             }
             Some(asked) = lobby.actions.recv() => {
-                lobby_act(&shared, &config, asked, &mut connected, &mut session, &mut game, &mut idle).await;
+                lobby_act(&shared, &config, asked, &mut connected, &mut session, &mut game, &mut idle, &mut rejoin).await;
             }
             _ = tick.tick() => {
                 shared.show_mods();
@@ -754,7 +794,16 @@ async fn control(
                     }
                 }
                 for asked in asked {
-                    lobby_act(&shared, &config, asked, &mut connected, &mut session, &mut game, &mut idle).await;
+                    lobby_act(&shared, &config, asked, &mut connected, &mut session, &mut game, &mut idle, &mut rejoin).await;
+                }
+                // A room's lobby whose native mods this game does not run:
+                // get them, once for each list the room tells.
+                if let Some(room) = native_to_match(&shared, &config, session.as_ref(), &native_tried) {
+                    native_tried = Some(room.clone());
+                    if let Err(error) = sync_room_native(&shared, &config, room, &mut connected, &session, &mut game, &mut idle, &mut rejoin).await {
+                        warn!(%error, "cannot get the room's native mods");
+                        shared.view().error = Some(error);
+                    }
                 }
             }
             ended = session_end(&mut session) => {
@@ -801,6 +850,19 @@ async fn control(
                     shared.show_mods();
                     connected =
                         reconnect(&shared, finished.options, shared.content(&config)).await;
+                }
+                // Left to start the game again with the room's native mods:
+                // start it, and join the room again.
+                native_tried = None;
+                if let Some((invite, password)) = rejoin.take() {
+                    let again = async {
+                        launch_game(&shared, &config, &session, &mut game, &mut idle).await?;
+                        join(&shared, &config, &mut connected, &mut session, &mut idle, &mut game, invite, password).await
+                    };
+                    if let Err(error) = again.await {
+                        warn!(%error, "cannot join the room again with its native mods");
+                        shared.view().error = Some(error);
+                    }
                 }
                 if let Some(lost) = room_lost {
                     let mut view = shared.view();
@@ -850,6 +912,7 @@ async fn control(
 
 /// One action from the game's main-menu window (D17): the launcher's own,
 /// on its own server. A refusal shows in both windows, as a page's does.
+#[allow(clippy::too_many_arguments)]
 async fn lobby_act(
     shared: &Arc<Shared>,
     config: &LauncherConfig,
@@ -858,6 +921,7 @@ async fn lobby_act(
     session: &mut Option<Session>,
     game: &mut Option<tpf3mp_launch::Started>,
     idle: &mut Idle,
+    rejoin: &mut Option<(Invite, Option<Text<64>>)>,
 ) {
     let state = shared.snapshot();
     let action = lobby::action(asked, &state);
@@ -867,7 +931,10 @@ async fn lobby_act(
         action = action_kind(&action),
         "the game's Multiplayer window asks"
     );
-    let result = act(shared, config, action, connected, session, game, idle).await;
+    let result = act(
+        shared, config, action, connected, session, game, idle, rejoin,
+    )
+    .await;
     shared.view().error = result.err();
 }
 
@@ -891,10 +958,20 @@ fn action_kind(action: &Action) -> &'static str {
         Action::ChooseStart { .. } => "choose_start",
         Action::ChooseRoomMods { .. } => "choose_room_mods",
         Action::RescanMods => "rescan_mods",
+        Action::NativeRefresh => "native_refresh",
+        Action::NativeInstall { .. } => "native_install",
+        Action::NativeUninstall { .. } => "native_uninstall",
+        Action::NativeRollback { .. } => "native_rollback",
+        Action::NativeEnable { .. } => "native_enable",
+        Action::NativeInstallProposed { .. } => "native_install_proposed",
+        Action::NativeShowProposed { .. } => "native_show_proposed",
+        Action::NativeMatchRoom => "native_match_room",
+        Action::NativeConsentDecision { .. } => "native_consent_decision",
     }
 }
 
 /// One action from the page.
+#[allow(clippy::too_many_arguments)]
 async fn act(
     shared: &Arc<Shared>,
     config: &LauncherConfig,
@@ -903,7 +980,19 @@ async fn act(
     session: &mut Option<Session>,
     game: &mut Option<tpf3mp_launch::Started>,
     idle: &mut Idle,
+    rejoin: &mut Option<(Invite, Option<Text<64>>)>,
 ) -> Result<(), String> {
+    if shared.view().native_consent.is_some() {
+        if matches!(&action, Action::Disconnect) {
+            // Disconnect cancels the held operation; an answer to its prompt
+            // can no longer apply to the authenticated source it named.
+            shared.view().native_consent = None;
+        } else if !matches!(&action, Action::NativeConsentDecision { .. }) {
+            return Err(
+                "approve or decline the native plugin review before starting another action".into(),
+            );
+        }
+    }
     match action {
         Action::Connect { server, name } => {
             // A whole invite, as "Copy invite" gives it, connects and joins.
@@ -973,6 +1062,7 @@ async fn act(
                             connected,
                             session,
                             idle,
+                            game,
                             passed.invite,
                             None,
                         )
@@ -1058,7 +1148,11 @@ async fn act(
                     .map_err(|_| "that room name is too long".to_owned())?,
                 max_players,
                 password: password_text(password)?,
-                settings: config.room_settings,
+                settings: tpf3mp_proto::RoomSettings {
+                    scan_plan: tpf3mp_proto::ScanPlan::from_environment_overrides(&config.game_env)
+                        .map_err(str::to_owned)?,
+                    ..config.room_settings
+                },
                 rules,
                 // A public room starts with one company, the save's own
                 // (D21); its owner says when there are more.
@@ -1122,6 +1216,92 @@ async fn act(
             choose_room_mods(shared, config, session, start, &mods, &params).await
         }
         Action::RescanMods => rescan_mods(shared, config, connected, session).await,
+        Action::NativeRefresh => {
+            native_change(shared, config, Change::Refresh, connected, session, game).await
+        }
+        Action::NativeInstall { id } => {
+            native_change(
+                shared,
+                config,
+                Change::Install(id),
+                connected,
+                session,
+                game,
+            )
+            .await
+        }
+        Action::NativeUninstall { id } => {
+            native_change(
+                shared,
+                config,
+                Change::Uninstall(id),
+                connected,
+                session,
+                game,
+            )
+            .await
+        }
+        Action::NativeRollback { id } => {
+            native_change(
+                shared,
+                config,
+                Change::Rollback(id),
+                connected,
+                session,
+                game,
+            )
+            .await
+        }
+        Action::NativeEnable { id, on } => {
+            native_change(
+                shared,
+                config,
+                Change::Enable(id, on),
+                connected,
+                session,
+                game,
+            )
+            .await
+        }
+        Action::NativeInstallProposed { id } => {
+            native_change(
+                shared,
+                config,
+                Change::InstallProposed(id),
+                connected,
+                session,
+                game,
+            )
+            .await
+        }
+        Action::NativeShowProposed { on } => {
+            shared.view().native_proposed = on;
+            let server = shared.view().server.clone();
+            if on && let (Some(current), Some(server)) = (connected.as_ref(), server.as_deref()) {
+                fetch_server_native(shared, &current.client, server, true).await;
+            }
+            refresh_native(shared, config, true).await;
+            Ok(())
+        }
+        Action::NativeMatchRoom => {
+            let room = shared
+                .status()
+                .room_mods
+                .as_ref()
+                .map(|room| room.native.clone())
+                .ok_or("the room has not told its native mods")?;
+            sync_room_native(shared, config, room, connected, session, game, idle, rejoin).await?;
+            Ok(())
+        }
+        Action::NativeConsentDecision {
+            request_id,
+            approved,
+        } => {
+            native_consent_decision(
+                shared, config, request_id, approved, connected, session, game, idle, rejoin,
+            )
+            .await
+        }
         Action::Join {
             invite,
             server,
@@ -1177,6 +1357,7 @@ async fn act(
                 connected,
                 session,
                 idle,
+                game,
                 passed.invite,
                 password,
             )
@@ -1351,21 +1532,7 @@ async fn launch_game(
     if tpf3mp_launch::steam_running() == Some(false) {
         return Err(tpf3mp_launch::LaunchError::NoSteam.to_string());
     }
-    let exe = match &config.game_exe {
-        Some(exe) => exe.clone(),
-        None => {
-            let installed = config
-                .installed
-                .as_ref()
-                .ok_or("Transport Fever 3 was not found in Steam")?;
-            tpf3mp_launch::find_executable(&installed.dir).ok_or_else(|| {
-                format!(
-                    "cannot tell which program in {} is the game; start the launcher with --game-exe",
-                    installed.dir.display()
-                )
-            })?
-        }
-    };
+    let exe = game_exe(config)?;
     let hook = config
         .hook
         .clone()
@@ -1377,9 +1544,16 @@ async fn launch_game(
     }
     // The native mods the player enabled, for this build (D29).
     let native_mods = match setup::data_dir() {
-        Ok(data) => crate::native_mods::game_env(&data, &exe)?,
-        Err(_) => None,
+        Ok(data) => {
+            let exe = exe.clone();
+            tokio::task::spawn_blocking(move || crate::native_mods::game_env(&data, &exe))
+                .await
+                .map_err(|error| error.to_string())??
+        }
+        Err(_) => crate::native_mods::GameNative::default(),
     };
+    let native_terms = native_mods.terms;
+    let native_mods = native_mods.env;
     let launch = tpf3mp_launch::Launch {
         exe,
         args: Vec::new(),
@@ -1407,7 +1581,757 @@ async fn launch_game(
     .map_err(|error| error.to_string())?;
     info!(pid = started.pid, "started the game with the hook");
     *game = Some(started);
+    shared.set_native(native_terms);
     shared.status().notice(GAME_STARTED);
+    Ok(())
+}
+
+/// The game's executable the launcher starts.
+fn game_exe(config: &LauncherConfig) -> Result<PathBuf, String> {
+    match &config.game_exe {
+        Some(exe) => Ok(exe.clone()),
+        None => {
+            let installed = config
+                .installed
+                .as_ref()
+                .ok_or("Transport Fever 3 was not found in Steam")?;
+            tpf3mp_launch::find_executable(&installed.dir).ok_or_else(|| {
+                format!(
+                    "cannot tell which program in {} is the game; start the launcher with --game-exe",
+                    installed.dir.display()
+                )
+            })
+        }
+    }
+}
+
+/// Whether the game started from here runs.
+fn game_runs(game: &mut Option<tpf3mp_launch::Started>) -> bool {
+    game.as_mut()
+        .is_some_and(tpf3mp_launch::Started::is_running)
+}
+
+/// Reads the native mods panel again, and with no game running from here
+/// (`game_runs` false), what the next game will run: what this player
+/// declares meanwhile.
+async fn refresh_native(shared: &Arc<Shared>, config: &LauncherConfig, game_runs: bool) {
+    let Ok(data) = setup::data_dir() else {
+        return;
+    };
+    let setup = config.native.clone();
+    let exe = game_exe(config).ok();
+    let (server, proposed) = {
+        let view = shared.view();
+        (view.server.clone(), view.native_proposed)
+    };
+    let read = tokio::task::spawn_blocking(move || {
+        let build = exe
+            .as_deref()
+            .and_then(|exe| crate::native_mods::build_of(exe).ok());
+        let view = crate::native_mods::view(
+            &data,
+            setup.as_ref(),
+            build.as_deref(),
+            server.as_deref(),
+            proposed,
+        );
+        let next = exe
+            .as_deref()
+            .map(|exe| crate::native_mods::next_terms(&data, exe));
+        (view, next)
+    })
+    .await;
+    let Ok((view, next)) = read else {
+        return;
+    };
+    shared.view().native = view;
+    if !game_runs {
+        match next {
+            Some(Ok(terms)) => {
+                shared.set_native(terms);
+            }
+            Some(Err(error)) => warn!(%error, "cannot tell which native mods the next game runs"),
+            None => {}
+        }
+    }
+}
+
+/// Takes in the native mods `server` offers over `client`: its index, and
+/// with `proposed` the mods proposed for its registry. A server that offers
+/// none, or one that cannot be read, leaves what was kept; why is logged.
+async fn fetch_server_native(shared: &Shared, client: &Client, server: &str, proposed: bool) {
+    let Ok(data) = setup::data_dir() else {
+        return;
+    };
+    for proposals in [false, true] {
+        if proposals && !proposed {
+            continue;
+        }
+        match client.native_index(proposals).await {
+            Ok(Some((serial, json))) => {
+                let (data, server) = (data.clone(), server.to_owned());
+                let kept = tokio::task::spawn_blocking(move || {
+                    crate::native_mods::accept_server_index(
+                        &data, &server, serial, &json, proposals,
+                    )
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|kept| kept);
+                if let Err(error) = kept {
+                    warn!(%error, "cannot take in the server's native mods");
+                    shared.view().error = Some(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "the server did not say which native mods it offers"),
+        }
+    }
+}
+
+/// Whether the launcher may get a room's native mods by itself: from the
+/// project's signed index, or from the index of a server the release lists.
+/// From a server the player set themselves it does so only when asked.
+fn auto_native(shared: &Shared, config: &LauncherConfig) -> bool {
+    if config
+        .native
+        .as_ref()
+        .is_some_and(|setup| !setup.keys.is_empty())
+    {
+        return true;
+    }
+    let view = shared.view();
+    view.server.as_deref().is_some_and(|server| {
+        servers::find(&config.servers, server).is_some()
+            || view
+                .server_default
+                .as_deref()
+                .is_some_and(|default| same_server(default, server))
+    })
+}
+
+/// Declares this player's content anew: in the room, or on the server.
+async fn redeclare(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    connected: &mut Option<Connected>,
+    session: &Option<Session>,
+) -> Result<(), String> {
+    let declaration = shared.content(config);
+    if session.is_some() {
+        return forward(session, Control::Declare(declaration)).await;
+    }
+    if let Some(current) = connected.as_ref() {
+        current
+            .client
+            .declare(declaration)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Re-fetches one native-mod index through the authenticated connection to
+/// the selected server. A room owns its connection in the bridge, so a
+/// short-lived read-only connection uses the same trusted connection options
+/// while the room is active.
+async fn refresh_authenticated_server_native(
+    connected: &Option<Connected>,
+    session: &Option<Session>,
+    data: &Path,
+    server: &str,
+    proposed: bool,
+) -> Result<bool, String> {
+    let response = if let Some(current) = connected.as_ref() {
+        current
+            .client
+            .native_index(proposed)
+            .await
+            .map_err(|error| error.to_string())?
+    } else if let Some(session) = session.as_ref() {
+        let mut options = session.options.clone();
+        options.diagnostics = None;
+        options.banner = None;
+        let (client, _events) = connect(options).await.map_err(|error| error.to_string())?;
+        let response = client.native_index(proposed).await;
+        client.close().await;
+        response.map_err(|error| error.to_string())?
+    } else {
+        return Err("connect to the server again before reviewing its native mods".into());
+    };
+    let Some((serial, json)) = response else {
+        return Ok(false);
+    };
+    let data = data.to_owned();
+    let server = server.to_owned();
+    tokio::task::spawn_blocking(move || {
+        crate::native_mods::accept_server_index(&data, &server, serial, &json, proposed)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(true)
+}
+
+fn queue_plugin_consent(
+    shared: &Arc<Shared>,
+    action: String,
+    packages: Vec<crate::native_mods::PluginConsentPackage>,
+    operation: crate::native_mods::PendingPluginOperation,
+) -> Result<bool, String> {
+    if packages.iter().all(|package| package.approved) {
+        return Ok(false);
+    }
+    let mut view = shared.view();
+    if let Some(pending) = view.native_consent.as_ref() {
+        if pending.operation == operation && pending.prompt.packages == packages {
+            return Ok(true);
+        }
+        return Err(
+            "finish the native plugin approval already waiting in the launcher first".into(),
+        );
+    }
+    view.native_consent = Some(crate::native_mods::PendingPluginConsent {
+        prompt: crate::native_mods::PluginConsentPrompt {
+            request_id: random_token(),
+            action,
+            packages,
+        },
+        operation,
+    });
+    Ok(true)
+}
+
+fn native_change_consent_action(change: &Change) -> String {
+    match change {
+        Change::Install(id) => format!("Install native mod {id}"),
+        Change::InstallProposed(id) => format!("Install proposed native mod {id}"),
+        Change::Rollback(id) => format!("Roll back native mod {id}"),
+        Change::Enable(id, true) => format!("Enable native mod {id}"),
+        _ => "Change native mods".to_owned(),
+    }
+}
+
+fn cached_server_for_offline_install(server: Option<&str>, proposed: bool) -> Option<String> {
+    if proposed {
+        None
+    } else {
+        server.map(str::to_owned)
+    }
+}
+
+/// One change the player makes in the native mods panel, then the panel
+/// read again and, when no game runs from here, the content declared anew.
+async fn native_change(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    change: crate::native_mods::Change,
+    connected: &mut Option<Connected>,
+    session: &Option<Session>,
+    game: &mut Option<tpf3mp_launch::Started>,
+) -> Result<(), String> {
+    let setup = config
+        .native
+        .clone()
+        .ok_or("this launcher was built without native mods")?;
+    let data = setup::data_dir().map_err(|error| error.to_string())?;
+    let exe = game_exe(config).ok();
+    let (server, proposed_shown) = {
+        let view = shared.view();
+        (view.server.clone(), view.native_proposed)
+    };
+    if change == Change::Refresh
+        && let (Some(current), Some(server)) = (connected.as_ref(), server.as_deref())
+    {
+        shared.view().native_busy = Some("Looking for native mods".to_owned());
+        fetch_server_native(shared, &current.client, server, proposed_shown).await;
+    }
+    let install = matches!(&change, Change::Install(_) | Change::InstallProposed(_));
+    let proposed = matches!(&change, Change::InstallProposed(_));
+    let mut action_server = if install && connected.is_none() && session.is_none() {
+        cached_server_for_offline_install(server.as_deref(), proposed)
+    } else {
+        None
+    };
+    let mut build = None;
+    if install {
+        let exe = exe
+            .as_deref()
+            .ok_or("start the game once, or name it, so the launcher knows its build")?;
+        build = Some(crate::native_mods::build_of(exe)?);
+        if let Some(server) = server.as_deref() {
+            if connected.is_some() || session.is_some() {
+                shared.view().native_busy = Some("Checking the current native-mod index".into());
+                let current = match refresh_authenticated_server_native(
+                    connected, session, &data, server, proposed,
+                )
+                .await
+                {
+                    Ok(current) => current,
+                    Err(error) => {
+                        shared.view().native_busy = None;
+                        return Err(error);
+                    }
+                };
+                if current {
+                    action_server = Some(server.to_owned());
+                } else if proposed {
+                    shared.view().native_busy = None;
+                    return Err("the server no longer offers its proposed native-mod index".into());
+                }
+            } else if proposed {
+                return Err("connect to the server that proposed this native mod".into());
+            }
+        }
+        if proposed && action_server.is_none() {
+            shared.view().native_busy = None;
+            return Err("connect to the server that proposed this native mod".into());
+        }
+    }
+    let review = if matches!(
+        &change,
+        Change::Install(_)
+            | Change::InstallProposed(_)
+            | Change::Enable(_, true)
+            | Change::Rollback(_)
+    ) {
+        shared.view().native_busy = Some("Checking executable plugin approval".into());
+        let data = data.clone();
+        let setup = setup.clone();
+        let server = action_server.clone();
+        let change = change.clone();
+        let build = build.clone();
+        let refresh_project = install;
+        match tokio::task::spawn_blocking(move || {
+            crate::native_mods::plugin_consent_review(
+                &data,
+                &setup,
+                build.as_deref(),
+                server.as_deref(),
+                &change,
+                refresh_project,
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+        {
+            Ok(review) => review,
+            Err(error) => {
+                shared.view().native_busy = None;
+                return Err(error);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    shared.view().native_busy = None;
+    if !review.iter().all(|package| package.approved)
+        && action_server.is_some()
+        && connected.is_none()
+        && session.is_none()
+    {
+        return Err(
+            "connect to the native-mod source before reviewing new executable plugin code".into(),
+        );
+    }
+    if !review.iter().all(|package| package.approved)
+        && queue_plugin_consent(
+            shared,
+            native_change_consent_action(&change),
+            review,
+            crate::native_mods::PendingPluginOperation::Change(change.clone()),
+        )?
+    {
+        return Ok(());
+    }
+    shared.view().native_busy = Some(match &change {
+        Change::Refresh => "Looking for native mods".to_owned(),
+        Change::Install(id) => format!("Installing {id}"),
+        Change::InstallProposed(id) => format!("Installing {id}, proposed and not reviewed"),
+        _ => "Changing native mods".to_owned(),
+    });
+    let apply_build = build.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::native_mods::apply(
+            &data,
+            &setup,
+            apply_build.as_deref(),
+            action_server.as_deref(),
+            change,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
+    shared.view().native_busy = None;
+    let runs = game_runs(game);
+    let before = shared.view().native_terms.clone();
+    refresh_native(shared, config, runs).await;
+    if !runs && shared.view().native_terms != before {
+        redeclare(shared, config, connected, session).await?;
+    }
+    result
+}
+
+/// Applies the player's answer only to the exact prompt still displayed,
+/// then revalidates that package closure against current metadata before it
+/// stores consent or resumes the held action.
+#[allow(clippy::too_many_arguments)]
+async fn native_consent_decision(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    request_id: String,
+    approved: bool,
+    connected: &mut Option<Connected>,
+    session: &mut Option<Session>,
+    game: &mut Option<tpf3mp_launch::Started>,
+    idle: &mut Idle,
+    rejoin: &mut Option<(Invite, Option<Text<64>>)>,
+) -> Result<(), String> {
+    let pending = shared
+        .view()
+        .native_consent
+        .clone()
+        .ok_or("there is no native plugin approval waiting")?;
+    if pending.prompt.request_id != request_id {
+        return Err("that native plugin approval request has expired".into());
+    }
+    if !approved {
+        shared.view().native_consent = None;
+        return Err(match pending.operation {
+            crate::native_mods::PendingPluginOperation::MatchRoom { .. } => {
+                "you declined the room's native plugin code; joining remains blocked until you approve and match those mods".into()
+            }
+            crate::native_mods::PendingPluginOperation::Change(_) => {
+                "you declined the native plugin code; the requested change was not run".into()
+            }
+        });
+    }
+    let setup = config
+        .native
+        .clone()
+        .ok_or("this launcher was built without native mods")?;
+    let data = setup::data_dir().map_err(|error| error.to_string())?;
+    let build = game_exe(config)
+        .ok()
+        .and_then(|exe| crate::native_mods::build_of(&exe).ok());
+    let (server, needs_server_index, proposed) = match &pending.operation {
+        crate::native_mods::PendingPluginOperation::MatchRoom { room, .. } => {
+            (shared.view().server.clone(), !room.is_empty(), false)
+        }
+        crate::native_mods::PendingPluginOperation::Change(change) => (
+            shared.view().server.clone(),
+            matches!(change, Change::Install(_) | Change::InstallProposed(_)),
+            matches!(change, Change::InstallProposed(_)),
+        ),
+    };
+    let mut review_server = None;
+    if needs_server_index
+        && (connected.is_some() || session.is_some())
+        && let Some(server) = server.as_deref()
+    {
+        let current =
+            match refresh_authenticated_server_native(connected, session, &data, server, proposed)
+                .await
+            {
+                Ok(current) => current,
+                Err(error) => return Err(error),
+            };
+        if current {
+            review_server = Some(server.to_owned());
+        } else if proposed {
+            return Err("the server no longer offers the proposed native-mod index; the change remains blocked".into());
+        }
+    }
+    if needs_server_index && proposed && review_server.is_none() {
+        return Err("connect to the server that proposed this native mod".into());
+    }
+    let operation = pending.operation.clone();
+    let expected = pending.prompt.packages.clone();
+    let review_setup = setup.clone();
+    let review_data = data.clone();
+    let review_server_for_worker = review_server.clone();
+    let build_for_worker = build.clone();
+    let changed = tokio::task::spawn_blocking(move || {
+        crate::native_mods::approve_plugin_consent(
+            &review_data,
+            &review_setup,
+            build_for_worker.as_deref(),
+            review_server_for_worker.as_deref(),
+            &operation,
+            &expected,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    if let Some(mut packages) = changed {
+        if packages.is_empty() {
+            shared.view().native_consent = None;
+            return Err("the native package changed after review and no longer needs plugin consent; retry the action to inspect the current package before continuing".into());
+        }
+        // An approval click cannot approve a changed package. Present the
+        // exact new closure as a distinct request even if it was approved in
+        // an unrelated earlier action.
+        for package in &mut packages {
+            package.approved = false;
+        }
+        let mut view = shared.view();
+        if view
+            .native_consent
+            .as_ref()
+            .is_none_or(|current| current.prompt.request_id != request_id)
+        {
+            return Err("that native plugin approval request has expired".into());
+        }
+        view.native_consent = Some(crate::native_mods::PendingPluginConsent {
+            prompt: crate::native_mods::PluginConsentPrompt {
+                request_id: random_token(),
+                action: pending.prompt.action,
+                packages,
+            },
+            operation: pending.operation,
+        });
+        return Ok(());
+    }
+    {
+        let mut view = shared.view();
+        if view
+            .native_consent
+            .as_ref()
+            .is_none_or(|current| current.prompt.request_id != request_id)
+        {
+            return Err("that native plugin approval request has expired".into());
+        }
+        view.native_consent = None;
+    }
+    match pending.operation {
+        crate::native_mods::PendingPluginOperation::Change(change) => {
+            native_change(shared, config, change, connected, session, game).await
+        }
+        crate::native_mods::PendingPluginOperation::MatchRoom { room, resume_join } => {
+            if resume_join {
+                let (invite, password) = shared
+                    .last_join
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+                    .ok_or(
+                        "the room's native mods were approved; join the room again to continue",
+                    )?;
+                join(
+                    shared, config, connected, session, idle, game, invite, password,
+                )
+                .await
+            } else if session.is_some() {
+                sync_room_native(shared, config, room, connected, session, game, idle, rejoin).await
+            } else {
+                Err("the room session ended while approval was open; join it again to match its native mods".into())
+            }
+        }
+    }
+}
+
+/// The room's native mods when this game must get them: in a room's lobby
+/// whose list (as the room told it) is not what this game runs, and not
+/// tried before; never for the room's owner, whose game's list is the
+/// room's.
+fn native_to_match(
+    shared: &Shared,
+    config: &LauncherConfig,
+    session: Option<&Session>,
+    tried: &Option<Vec<tpf3mp_proto::NativeMod>>,
+) -> Option<Vec<tpf3mp_proto::NativeMod>> {
+    config.native.as_ref()?;
+    session?;
+    if !auto_native(shared, config) {
+        return None;
+    }
+    let me = shared.view().player;
+    let status = shared.status();
+    let room = status.room.as_ref()?;
+    if room.phase != RoomPhase::Lobby || Some(room.owner) == me {
+        return None;
+    }
+    let told = status.room_mods.as_ref()?.native.clone();
+    let same = |a: &[tpf3mp_proto::NativeMod], b: &[tpf3mp_proto::NativeMod]| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(a, b)| a.id == b.id && a.version == b.version)
+    };
+    if same(&told, &shared.view().native_terms) || tried.as_deref().is_some_and(|t| same(t, &told))
+    {
+        return None;
+    }
+    Some(told)
+}
+
+/// Makes the next game run the room's native mods `room` (installed from
+/// the signed index, with the room's settings), and says which they are
+/// then.
+async fn get_room_native(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    room: Vec<tpf3mp_proto::NativeMod>,
+    connected: &Option<Connected>,
+    session: &Option<Session>,
+    resume_join: bool,
+) -> Result<Vec<tpf3mp_proto::NativeMod>, String> {
+    let setup = config
+        .native
+        .clone()
+        .ok_or("the room runs native mods, and this launcher was built without them")?;
+    let data = setup::data_dir().map_err(|error| error.to_string())?;
+    let exe = game_exe(config)?;
+    let server = shared.view().server.clone();
+    let build = crate::native_mods::build_of(&exe)?;
+    let mut source_server = None;
+    let names = room
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    info!(mods = %names, "getting the room's native mods");
+    shared.view().native_busy = Some(if names.is_empty() {
+        "Switching off native mods the room does not run".to_owned()
+    } else {
+        format!("Getting the room's native mods: {names}")
+    });
+    if !room.is_empty()
+        && let Some(server) = server.as_deref()
+    {
+        let current =
+            match refresh_authenticated_server_native(connected, session, &data, server, false)
+                .await
+            {
+                Ok(current) => current,
+                Err(error) => {
+                    shared.view().native_busy = None;
+                    return Err(error);
+                }
+            };
+        if current {
+            source_server = Some(server.to_owned());
+        }
+    }
+    let review_data = data.clone();
+    let review_setup = setup.clone();
+    let review_room = room.clone();
+    let review_server = source_server.clone();
+    let review_build = build.clone();
+    let review = match tokio::task::spawn_blocking(move || {
+        crate::native_mods::room_plugin_consent_review(
+            &review_data,
+            &review_setup,
+            &review_build,
+            review_server.as_deref(),
+            &review_room,
+            true,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result)
+    {
+        Ok(review) => review,
+        Err(error) => {
+            shared.view().native_busy = None;
+            return Err(error);
+        }
+    };
+    if !review.iter().all(|package| package.approved) {
+        let action = if resume_join {
+            "Join this room and match its native mods"
+        } else {
+            "Match this room's native mods"
+        };
+        let queued = queue_plugin_consent(
+            shared,
+            action.to_owned(),
+            review,
+            crate::native_mods::PendingPluginOperation::MatchRoom {
+                room: room.clone(),
+                resume_join,
+            },
+        );
+        shared.view().native_busy = None;
+        if queued? {
+            return Err("review the native plugin packages before matching the room".into());
+        }
+    }
+    let match_data = data.clone();
+    let match_setup = setup.clone();
+    let match_exe = exe.clone();
+    let match_room = room.clone();
+    let match_server = source_server.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::native_mods::match_room(
+            &match_data,
+            &match_setup,
+            &build,
+            match_server.as_deref(),
+            &match_room,
+        )?;
+        crate::native_mods::next_terms(&match_data, &match_exe)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
+    shared.view().native_busy = None;
+    refresh_native(shared, config, true).await;
+    result
+}
+
+/// Closes the game started from here, for it to start again with other
+/// native mods, and waits until it has.
+async fn close_game(shared: &Shared, game: &mut Option<tpf3mp_launch::Started>, idle: &mut Idle) {
+    if let Some(mut started) = game.take() {
+        info!(
+            pid = started.pid,
+            "closing the game to start it again with the room's native mods"
+        );
+        started.kill();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(20), exited(|| started.is_running())).await;
+    }
+    shared.status().game = None;
+    *idle = idle.take().map(IdleLink::forget_game);
+}
+
+/// In a room's lobby: gets the room's native mods, then, when the game
+/// running from here runs others, leaves the room and closes the game, for
+/// the session's end to start it again and join the room anew (`rejoin`).
+/// With no game running, this player declares the room's at once.
+#[allow(clippy::too_many_arguments)]
+async fn sync_room_native(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    room: Vec<tpf3mp_proto::NativeMod>,
+    connected: &mut Option<Connected>,
+    session: &Option<Session>,
+    game: &mut Option<tpf3mp_launch::Started>,
+    idle: &mut Idle,
+    rejoin: &mut Option<(Invite, Option<Text<64>>)>,
+) -> Result<(), String> {
+    let next = get_room_native(shared, config, room, connected, session, false).await?;
+    if game_runs(game) && shared.view().native_terms != next {
+        let again = shared
+            .last_join
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or("start the game again to run the room's native mods")?;
+        shared
+            .status()
+            .notice("starting Transport Fever 3 again with the room's native mods; it joins the room again by itself");
+        *rejoin = Some(again);
+        leave(session)?;
+        close_game(shared, game, idle).await;
+        return Ok(());
+    }
+    if shared.set_native(next) {
+        redeclare(shared, config, connected, session).await?;
+    }
     Ok(())
 }
 
@@ -1665,22 +2589,8 @@ async fn rescan_mods(
         info!("the installed mods are as they were");
         return Ok(());
     }
-    let declaration = shared.content(config);
-    info!(
-        mods = declaration.manifest().mods.len(),
-        "the installed mods changed: declaring anew"
-    );
-    if session.is_some() {
-        return forward(session, Control::Declare(declaration)).await;
-    }
-    if let Some(current) = connected.as_ref() {
-        current
-            .client
-            .declare(declaration)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    info!("the installed mods changed: declaring anew");
+    redeclare(shared, config, connected, session).await
 }
 
 /// Whether `picked` names the save `room` already starts from: then only
@@ -1792,6 +2702,10 @@ fn begin_session(
         owned
     };
     let bridge_options = BridgeOptions {
+        scan_plan: Some(
+            tpf3mp_proto::ScanPlan::from_environment_overrides(&config.game_env)
+                .map_err(str::to_owned)?,
+        ),
         worlds: Some(config.worlds.clone()),
         status: Some(Arc::clone(&shared.status)),
         lobby: Some(shared.lobby.clone()),
@@ -1929,7 +2843,14 @@ async fn connect_to(
         // What the game runs goes with every connection, so rooms can
         // compare it and say how it differs.
         Ok((client, events)) => match client.declare(shared.content(config)).await {
-            Ok(()) => Ok((client, events)),
+            Ok(()) => {
+                // The native mods this server offers, for the panel and for
+                // its rooms.
+                let proposed = shared.view().native_proposed;
+                fetch_server_native(shared, &client, server, proposed).await;
+                refresh_native(shared, config, true).await;
+                Ok((client, events))
+            }
             Err(error) => Err(error.to_string()),
         },
         Err(error) => {
@@ -2232,7 +3153,10 @@ async fn join_on_list(
     // JoinRoom rechecks the code and password, as well as current capacity
     // and build eligibility. A change after ResolveInvite is a normal join
     // refusal; it must not trigger a fallback to another region.
-    join(shared, config, connected, session, idle, invite, password).await
+    join(
+        shared, config, connected, session, idle, game, invite, password,
+    )
+    .await
 }
 
 /// Asks every trusted region whether it can admit `invite` with `password`.
@@ -2548,16 +3472,22 @@ impl Remembered {
 }
 
 /// Joins the room of `invite` on the current connection.
+#[allow(clippy::too_many_arguments)]
 async fn join(
     shared: &Arc<Shared>,
     config: &LauncherConfig,
     connected: &mut Option<Connected>,
     session: &mut Option<Session>,
     idle: &mut Idle,
+    game: &mut Option<tpf3mp_launch::Started>,
     invite: Invite,
     password: Option<Text<64>>,
 ) -> Result<(), String> {
-    let current = connected.as_mut().ok_or("connect to a server first")?;
+    *shared
+        .last_join
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some((invite, password.clone()));
+    connected.as_ref().ok_or("connect to a server first")?;
     // Another's room: its shared mods are learned from what it says this
     // game lacks (docs/MODS.md). Until then, this game declares none.
     let fresh = shared.picker().map(|mut mods| {
@@ -2566,17 +3496,22 @@ async fn join(
     });
     if let Some(manifest) = fresh {
         shared.show_mods();
-        current
+        connected
+            .as_mut()
+            .ok_or("connect to a server first")?
             .client
             .declare_content(manifest)
             .await
             .map_err(|error| error.to_string())?;
     }
+    let current = connected.as_mut().ok_or("connect to a server first")?;
     // The room's mods, as the room tells them, come as the room is joined:
     // in the lobby on joining, at a running game before its refusal.
     let mut joined = current
         .client
         .join_room(JoinRoom {
+            scan_plan: tpf3mp_proto::ScanPlan::from_environment_overrides(&config.game_env)
+                .map_err(str::to_owned)?,
             invite,
             password: password.clone(),
             resume: None,
@@ -2588,17 +3523,45 @@ async fn join(
     if matches!(
         joined,
         Err(ClientError::Refused(RequestError::ContentMismatch))
-    ) && shared.picker.is_some()
+    ) && (shared.picker.is_some() || config.native.is_some())
     {
         let (room, diff) = refusal(&mut current.events).await;
-        let again = shared.picker().and_then(|mut mods| {
-            let changed = match &room {
-                // Refused a join: not this room's owner.
-                Some(room) => mods.adopt(Some(room), false),
-                None => diff.as_ref().is_some_and(|diff| mods.learn(diff)),
-            };
-            changed.then(|| mods.manifest())
-        });
+        // The running game's native mods first: from the signed index, with
+        // the room's settings, the game started again with them if it runs
+        // others (docs/NATIVE_MODS.md, "In a room").
+        let told_native = room.as_ref().map(|room| room.native.clone());
+        let native_changed = match told_native {
+            Some(native)
+                if native.iter().map(|m| (&m.id, &m.version)).ne(shared
+                    .view()
+                    .native_terms
+                    .iter()
+                    .map(|m| (&m.id, &m.version))) =>
+            {
+                let next =
+                    get_room_native(shared, config, native, connected, session, true).await?;
+                if game_runs(game) && shared.view().native_terms != next {
+                    close_game(shared, game, idle).await;
+                    launch_game(shared, config, session, game, idle).await?;
+                } else {
+                    shared.set_native(next);
+                }
+                true
+            }
+            _ => false,
+        };
+        let current = connected.as_mut().ok_or("connect to a server first")?;
+        let again = match shared.picker() {
+            Some(mut mods) => {
+                let changed = match &room {
+                    // Refused a join: not this room's owner.
+                    Some(room) => mods.adopt(Some(room), false),
+                    None => diff.as_ref().is_some_and(|diff| mods.learn(diff)),
+                };
+                (changed || native_changed).then(|| mods.manifest())
+            }
+            None => native_changed.then(|| shared.content(config).manifest().clone()),
+        };
         if let Some(room) = room {
             shared.status().room_mods = Some(room);
         }
@@ -2615,6 +3578,8 @@ async fn join(
             joined = current
                 .client
                 .join_room(JoinRoom {
+                    scan_plan: tpf3mp_proto::ScanPlan::from_environment_overrides(&config.game_env)
+                        .map_err(str::to_owned)?,
                     invite,
                     password: password.clone(),
                     resume: None,
@@ -2626,6 +3591,7 @@ async fn join(
         Ok(room) => room,
         Err(ClientError::Refused(RequestError::ContentMismatch)) => {
             // The room says how, on its own message.
+            let current = connected.as_mut().ok_or("connect to a server first")?;
             let diff = content_diff(&mut current.events).await;
             let message = match &diff {
                 Some(diff) => format!("your game differs from the room's: {diff}"),
@@ -2920,6 +3886,19 @@ fn random_token() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn offline_installs_keep_cached_server_indexes_but_not_unreviewed_proposals() {
+        assert_eq!(
+            cached_server_for_offline_install(Some("eu.example.org:29470"), false).as_deref(),
+            Some("eu.example.org:29470")
+        );
+        assert_eq!(
+            cached_server_for_offline_install(Some("eu.example.org:29470"), true),
+            None
+        );
+        assert_eq!(cached_server_for_offline_install(None, false), None);
+    }
+
     fn local_config(worlds_dir: &Path) -> LauncherConfig {
         let (identity, _) = Identity::generate().unwrap();
         LauncherConfig {
@@ -2937,6 +3916,7 @@ mod tests {
             content: ContentManifest::new(tpf3mp_proto::Text::new("test").unwrap(), Vec::new()),
             mods: None,
             picker: None,
+            native: None,
             installed: None,
             link: "renderer-recovery-test".into(),
             worlds: crate::Worlds::open(worlds_dir, 1 << 20).unwrap(),

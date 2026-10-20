@@ -1,0 +1,13 @@
+{
+    "dependencies": null,
+    "incompatibilities": null,
+    "modId": "tpf3mp_bigmap_1",
+    "options": null,
+    "params": null,
+    "postRunScript": { "fileName": "" },
+    "preRunScript": { "fileName": "" },
+    "revision": 1,
+    "runScript": { "fileName": "" },
+    "severityAdd": "None",
+    "severityRemove": "None"
+}

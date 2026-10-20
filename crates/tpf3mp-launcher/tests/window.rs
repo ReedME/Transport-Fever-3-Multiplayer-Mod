@@ -520,6 +520,295 @@ fn diagnostics_can_be_switched_off_in_settings() {
 }
 
 #[test]
+fn a_mod_with_code_says_so_and_one_this_launcher_cannot_run_is_not_offered() {
+    use tpf3mp_agent::native_mods::{NativeRow, NativeView};
+    let row = |id: &str, name: &str, code: bool, unsupported: Option<&str>| NativeRow {
+        id: id.into(),
+        name: name.into(),
+        description: String::new(),
+        homepage: None,
+        authors: vec!["Ann".into()],
+        preview: None,
+        simulation: true,
+        available: Some("1.0.0".into()),
+        available_size: None,
+        installed: None,
+        installed_size: None,
+        load_order: None,
+        clash: None,
+        code,
+        unsupported: unsupported.map(str::to_owned),
+        downloads: None,
+        updated: None,
+        previous: None,
+        enabled: false,
+        listed: true,
+        proposed: None,
+    };
+    let state = |rows: Vec<NativeRow>| State {
+        native: NativeView {
+            available: true,
+            serial: Some(3),
+            server: Some("play.example:29470".into()),
+            proposed_shown: false,
+            packages: rows,
+            problem: None,
+        },
+        ..State::default()
+    };
+    // Code of its own: said plainly, and still installed by choice.
+    let mut window = window(state(vec![row("trains", "Faster Trains", true, None)]));
+    window.get_by_label("Mod browser").click();
+    window.run_steps(4);
+    window.get_by_label("Runs code");
+    window.get_by_label(
+        "Runs its own code in the game, with your account's rights on this PC. Install it only \
+         from a server you trust.",
+    );
+    // The executable-code warning can push the action below the details
+    // pane's visible area. Reveal it before sending a physical pointer click.
+    window.get_by_label("Install").scroll_to_me();
+    window.run_steps(20);
+    assert!(
+        !window
+            .get_by_label("Install")
+            .accesskit_node()
+            .is_disabled()
+    );
+    window.get_by_label("Install").hover();
+    window.run_steps(2);
+    window.get_by_label("Install").click();
+    window.run_steps(2);
+    assert_eq!(
+        actions(&window),
+        [Action::NativeInstall {
+            id: "trains".into()
+        }]
+    );
+
+    // A plugin for another platform: why, and no install.
+    let mut window = self::window(state(vec![row(
+        "trains",
+        "Faster Trains",
+        true,
+        Some("it has no plugin for this platform"),
+    )]));
+    window.get_by_label("Mod browser").click();
+    window.run_steps(4);
+    window.get_by_label("Can't be installed: it has no plugin for this platform.");
+    window.get_by_label("Install").scroll_to_me();
+    window.run_steps(20);
+    assert!(
+        window
+            .get_by_label("Install")
+            .accesskit_node()
+            .is_disabled()
+    );
+    window.get_by_label("Install").hover();
+    window.run_steps(2);
+    window.get_by_label("Install").click();
+    window.run_steps(2);
+    assert!(actions(&window).is_empty(), "the button is off");
+}
+
+#[test]
+fn a_native_mod_that_clashes_cannot_be_switched_on() {
+    use tpf3mp_agent::native_mods::{NativeRow, NativeView};
+    let pages = NativeRow {
+        id: "pages".into(),
+        name: "Bigger Pages".into(),
+        description: String::new(),
+        homepage: None,
+        authors: Vec::new(),
+        preview: None,
+        simulation: false,
+        available: Some("1.0.0".into()),
+        available_size: None,
+        installed: Some("1.0.0".into()),
+        installed_size: None,
+        load_order: None,
+        clash: Some("it clashes with big_maps: pages.own and bigmap.page both patch ui::page, and one takes it over".into()),
+        downloads: None,
+        updated: None,
+        previous: None,
+        enabled: false,
+        listed: true,
+        proposed: None,
+        code: false,
+        unsupported: None,
+    };
+    let mut window = window(State {
+        native: NativeView {
+            available: true,
+            serial: Some(3),
+            server: None,
+            proposed_shown: false,
+            packages: vec![pages],
+            problem: None,
+        },
+        ..State::default()
+    });
+    window.get_by_label("Mod manager").click();
+    window.run_steps(4);
+    window.get_by_label(
+        "Can't be switched on: it clashes with big_maps: pages.own and bigmap.page both patch \
+         ui::page, and one takes it over. Switch that mod off first.",
+    );
+    window.get_by_label("Switch on").hover();
+    window.run_steps(2);
+    window.get_by_label("Switch on").click();
+    window.run_steps(2);
+    assert!(actions(&window).is_empty(), "the button is off");
+}
+
+#[test]
+fn native_mods_are_managed_in_the_mod_manager_and_found_in_the_mod_browser() {
+    use tpf3mp_agent::native_mods::{NativeRow, NativeView};
+    let big_maps = NativeRow {
+        id: "bigmap".into(),
+        name: "Big Maps".into(),
+        description: "Maps up to 128 km a side.".into(),
+        homepage: Some("https://example.invalid/bigmap".into()),
+        simulation: true,
+        available: Some("0.4.0".into()),
+        installed: Some("0.3.0".into()),
+        previous: None,
+        enabled: true,
+        listed: true,
+        proposed: None,
+        authors: vec!["Ann".into(), "Bob".into()],
+        preview: None,
+        available_size: Some(5 << 20),
+        installed_size: Some(4 << 20),
+        load_order: Some(1),
+        downloads: Some(1234),
+        updated: Some("2026-09-30".into()),
+        clash: None,
+        code: false,
+        unsupported: None,
+    };
+    let signs = NativeRow {
+        id: "signs".into(),
+        name: "Station Signs".into(),
+        description: "Bigger signs at stations.".into(),
+        homepage: None,
+        simulation: false,
+        available: Some("0.3.0".into()),
+        installed: None,
+        previous: None,
+        enabled: false,
+        listed: true,
+        proposed: Some(tpf3mp_nativemods::registry::Proposal {
+            number: 12,
+            title: "Add Station Signs".into(),
+            url: "https://example.invalid/pull/12".into(),
+        }),
+        authors: Vec::new(),
+        preview: None,
+        available_size: None,
+        installed_size: None,
+        load_order: None,
+        downloads: None,
+        updated: None,
+        clash: None,
+        code: false,
+        unsupported: None,
+    };
+    let state = State {
+        native: NativeView {
+            available: true,
+            serial: Some(3),
+            server: Some("play.example:29470".into()),
+            proposed_shown: true,
+            packages: vec![big_maps, signs],
+            problem: None,
+        },
+        ..State::default()
+    };
+
+    // The mod manager lists what is installed, and only that, with the
+    // first picked: its details beside the table.
+    let mut window = window(state.clone());
+    window.get_by_label("Mod manager").click();
+    window.run_steps(4);
+    assert_eq!(
+        window.query_all_by_label("Big Maps").count(),
+        2,
+        "its row, and its details"
+    );
+    window.get_by_label("0.4.0 available");
+    window.get_by_label("by Ann and Bob");
+    assert!(window.query_by_label("Station Signs").is_none());
+    // The pointer comes to the button before it is pressed, as a player's
+    // does.
+    window.get_by_label("Update").hover();
+    window.run_steps(2);
+    window.get_by_label("Update").click();
+    window.run_steps(2);
+    window.get_by_label("Switch off").click();
+    window.run_steps(2);
+    assert_eq!(
+        actions(&window),
+        [
+            Action::NativeInstall {
+                id: "bigmap".into()
+            },
+            Action::NativeEnable {
+                id: "bigmap".into(),
+                on: false
+            },
+        ]
+    );
+
+    // The mod browser lists what the server offers and the proposed ones;
+    // a mod picked in its table shows its details, and a proposed one is
+    // installed as proposed.
+    let mut window = self::window(state);
+    window.get_by_label("Mod browser").click();
+    window.run_steps(4);
+    assert!(
+        window
+            .query_by_label("Proposed in pull request #12: not reviewed")
+            .is_none()
+    );
+    window.get_by_label("Station Signs").hover();
+    window.run_steps(2);
+    window.get_by_label("Station Signs").click();
+    window.run_steps(4);
+    assert_eq!(
+        window.query_all_by_label("Station Signs").count(),
+        2,
+        "picked"
+    );
+    window.get_by_label("Proposed in pull request #12: not reviewed");
+    window.get_by_label("Install").hover();
+    window.run_steps(2);
+    window.get_by_label("Install").click();
+    window.run_steps(2);
+    assert_eq!(
+        actions(&window),
+        [Action::NativeInstallProposed { id: "signs".into() }]
+    );
+    // The search finds mods by name, author or description.
+    let search = window.get_by_role_and_label(Role::TextInput, "SEARCH");
+    search.focus();
+    search.type_text("ann");
+    window.run_steps(4);
+    assert!(window.query_by_label("Station Signs").is_none());
+    assert_eq!(window.query_all_by_label("Big Maps").count(), 2);
+
+    // Without an index from the server or the project, the browser says
+    // the server offers none, and the manager that none is installed.
+    let mut window = self::window(State::default());
+    window.get_by_label("Mod browser").click();
+    window.run_steps(4);
+    window.get_by_label("Your server offers no native mods yet.");
+    window.get_by_label("Installed (0)").click();
+    window.run_steps(4);
+    window.get_by_label("No native mods installed yet");
+}
+
+#[test]
 fn the_game_is_started_from_a_room() {
     let mut window = window(in_room(vec![member("Ann", true, true, false)], true));
     window.get_by_label("Start Transport Fever 3").click();
@@ -640,7 +929,7 @@ fn in_a_room_the_window_shows_it_but_its_buttons_are_in_the_game() {
     };
     // In the lobby here, the same room has them.
     let here = window_sized(state.clone(), 1200.0, Place::Launcher);
-    for there in ["Remove", "Send", "Leave room", "Not ready", "Copy invite"] {
+    for there in ["Remove", "Send", "Leave room", "Ready", "Copy invite"] {
         assert!(
             here.query_by_role_and_label(Role::Button, there).is_some(),
             "{there}"

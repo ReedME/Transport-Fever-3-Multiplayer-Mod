@@ -18,12 +18,15 @@ tpf3mp-hookcore.workspace = true
 tpf3mp-ipc.workspace = true
 # Without the installer: only what the launcher enabled (proposed D29).
 tpf3mp-nativemods.workspace = true
+# The interface native mods' plugins are built against (proposed D29 amendment).
+tpf3mp-plugin-abi.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 tpf3mp-proto.workspace = true
 ring.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 # A real Lua for the link's tests (Lua 5.1, as the workspace builds it).
 mlua.workspace = true
 

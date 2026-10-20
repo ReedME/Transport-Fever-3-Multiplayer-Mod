@@ -696,6 +696,43 @@ impl Client {
         }
     }
 
+    /// The native mods this server offers, as the JSON of its index (or with
+    /// `proposed`, of the mods proposed for it) and its serial; `None` when
+    /// it offers none. Every page comes from one index: when the server
+    /// reads a new one between pages, it starts again, once.
+    pub async fn native_index(
+        &self,
+        proposed: bool,
+    ) -> Result<Option<(u64, Vec<u8>)>, ClientError> {
+        for _ in 0..2 {
+            let mut json = Vec::new();
+            let mut first: Option<(u64, u16)> = None;
+            let mut page = 0;
+            loop {
+                let got = match self
+                    .request(Request::NativeIndex { proposed, page })
+                    .await?
+                {
+                    Response::NativeIndex(got) => got,
+                    _ => return Err(ClientError::UnexpectedResponse),
+                };
+                let Some(got) = got else {
+                    return Ok(None);
+                };
+                let (serial, pages) = *first.get_or_insert((got.serial, got.pages));
+                if got.serial != serial || got.page != page || got.pages != pages {
+                    break;
+                }
+                json.extend_from_slice(&got.bytes);
+                page += 1;
+                if page >= pages {
+                    return Ok(Some((serial, json)));
+                }
+            }
+        }
+        Err(ClientError::UnexpectedResponse)
+    }
+
     pub async fn join_room(&self, join: JoinRoom) -> Result<RoomView, ClientError> {
         match self.request(Request::JoinRoom(join)).await? {
             Response::RoomJoined(room) => Ok(room),

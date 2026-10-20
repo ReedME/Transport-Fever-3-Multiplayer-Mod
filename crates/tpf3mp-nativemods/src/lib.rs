@@ -40,6 +40,7 @@ pub mod enabled;
 pub mod features;
 pub mod fetch;
 pub mod index;
+pub mod registry;
 pub mod resolve;
 pub mod signed;
 pub mod store;

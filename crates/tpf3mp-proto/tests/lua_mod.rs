@@ -530,7 +530,7 @@ HOOK = { logged = {}, commands = {}, batch = nil, request = nil, saved = {}, wor
          dump = nil, dumped = {} }
 tpf3mp_native = {
     copy = function(text) HOOK.copied = text return true end,
-    version = 14,
+    version = 15,
     note = function(key, value)
         HOOK.notes = HOOK.notes or {}
         if value == nil then return HOOK.notes[key] end
@@ -591,6 +591,9 @@ tpf3mp_native = {
         if b.why then return nil, b.why end
         return b.proposal
     end,
+    -- The street and track tools' toolbar crossing type by click, as the
+    -- hook reads every player build's: none picked, unless a test says.
+    toolCrossing = function(n) return false end,
     replaying = function(on) HOOK.replaying[#HOOK.replaying + 1] = on end,
     applied = function(i, ok, entity, why)
         HOOK.applied[#HOOK.applied + 1] = { i = i, ok = ok, entity = entity, why = why }
@@ -885,7 +888,7 @@ fn a_hook_of_another_version_is_not_used() {
     run_frames(&lua, 1);
     assert!(
         log(&lua).ends_with(
-            "[tpf3mp] the hook speaks bridge version 1, the mod 14; this is the plain game"
+            "[tpf3mp] the hook speaks bridge version 1, the mod 15; this is the plain game"
         ),
         "{}",
         log(&lua)
@@ -978,7 +981,7 @@ fn attach_refuses_a_partial_hook() {
              local function why(t) local _, r = BRIDGE.attach(t); out[#out + 1] = r end
              why(nil)
              why('hook')
-             why({ version = 14, command = print, log = print })
+             why({ version = 15, command = print, log = print })
              return out",
         )
         .eval()
@@ -1181,7 +1184,7 @@ fn the_guard_goes_on_once_and_a_hook_that_cannot_say_means_the_room() {
              out[#out + 1] = select(2, guard.install(nil, env))
              out[#out + 1] = select(2, guard.install({}, env))
              local bridge = ug_require('tpf3mp_1::/scripts/tpf3mp/bridge.lua')
-             local native = { version = 14 }
+             local native = { version = 15 }
              for _, n in ipairs({ 'command', 'take', 'log', 'poll', 'saved', 'world',
                                   'checkpoint', 'lanes', 'clicks', 'replaying', 'applied', 'results',
                                   'status', 'chat', 'say', 'takeReplay', 'replayed', 'scanned' }) do
@@ -1317,6 +1320,11 @@ fn engine() -> (Lua, Table) {
         .exec()
         .unwrap();
     let script: Table = lua.load("return data()").eval().unwrap();
+    // How long an action took depends on the machine: no test's log has
+    // the line a slow one adds, but the one that asks for it.
+    lua.load("ug_require('tpf3mp_1::/scripts/tpf3mp/apply.lua').SLOW_MS = math.huge")
+        .exec()
+        .unwrap();
     // One simulation update as the game runs it: update, then postUpdate
     // with what update returned, and not when that is nil.
     lua.globals().set("SCRIPT", script.clone()).unwrap();
@@ -1416,6 +1424,54 @@ fn junction_tools_round_trip_through_the_wire_and_apply_with_each_games_ids() {
             .eval()
             .unwrap();
         assert_eq!(ids, [1, 1, 101, 102, 103, 40].map(|n| n + offset));
+    }
+}
+
+/// A junction's settings name its node and edges by places in millimetres;
+/// in another game a node may lie a fraction of a millimetre off, across a
+/// metre line from the place named (the replay looks for edges in the
+/// metre squares around it): still found, the same settings built.
+#[test]
+fn junction_edges_are_found_across_a_metre_line() {
+    use tpf3mp_proto::{
+        action::Action,
+        lua::{action_from_lua, action_to_lua},
+    };
+    let source = junction_game(0);
+    let captured: mlua::Value = source
+        .load("return C.windowBuild(nil,PROPOSAL)")
+        .eval()
+        .unwrap();
+    let action = action_from_lua(&common::tree(&captured)).unwrap();
+    let portable = Action::from_payload(&action.to_payload().unwrap()).unwrap();
+    for shift in [0.0, -0.0003, 0.0003] {
+        let replica = junction_game(0);
+        replica.globals().set("SHIFT", shift).unwrap();
+        // Every node moved: the junction at the origin into the squares
+        // below or above, its arms' ends with it.
+        replica
+            .load("for _, p in pairs(NODES) do p.x = p.x + SHIFT p.y = p.y + SHIFT end")
+            .exec()
+            .unwrap();
+        replica
+            .globals()
+            .set(
+                "ACTION",
+                lua_value(&replica, &action_to_lua(&portable).unwrap()),
+            )
+            .unwrap();
+        let segments: Vec<u32> = replica
+            .load(
+                r#"
+            HOOK.batch = {ACTION} UPDATE({},STATE,0.2)
+            assert(#SENT==1, table.concat(HOOK.logged,'\n'))
+            local c = SENT[1].proposal.streetProposal.nodeConfigsToAdd[1].comp
+            return {c.laneConnections[1].segment0, c.laneConnections[1].segment1, c.crosswalks[1], c.crosswalks[2]}
+        "#,
+            )
+            .eval()
+            .unwrap_or_else(|error| panic!("{shift}: {error}"));
+        assert_eq!(segments, [101, 102, 101, 103], "shift {shift}");
     }
 }
 
@@ -1635,6 +1691,63 @@ fn native_checkpoint_snapshots_and_fallback_preserve_hashes_and_refresh() {
     assert_eq!(changed, read_lanes(&game));
 }
 
+/// Where the hook decodes junctions, every reader names a phase's
+/// crosswalks by the owned copy's order, which copying can change: the
+/// rows read with the hook's decoder and those read here without it
+/// (`junctions.decoders = false`, compare mode's reference) are the same,
+/// and both differ from a read of the borrowed original.
+#[test]
+fn junction_rows_read_the_owned_copy_with_or_without_the_hooks_decoder() {
+    let game = junction_game(0);
+    let rows: Vec<String> = game
+        .load(
+            r#"
+        local J = ug_require('tpf3mp_1::/scripts/tpf3mp/junctions.lua')
+        local borrowed = table.concat(J.rows(api), "\n")
+        -- A copy lays the crosswalk set out anew: here, reversed.
+        api.type.BaseNodeConfig = { new = function(c)
+            local copy = {}
+            for k, v in pairs(c) do copy[k] = v end
+            local walks = {}
+            for i = #c.crosswalks, 1, -1 do walks[#walks + 1] = c.crosswalks[i] end
+            copy.crosswalks = walks
+            return copy
+        end }
+        DECODED = 0
+        tpf3mp_native.junctionConfig = function(c) DECODED = DECODED + 1 return c end
+        local decoded = table.concat(J.rows(api), "\n")
+        assert(DECODED > 0)
+        J.decoders = false
+        local own = table.concat(J.rows(api), "\n")
+        J.decoders = nil
+        -- Compare mode's reference of the whole network lane, as one part,
+        -- is the lane the hook's decoders read, row for row.
+        local L = ug_require('tpf3mp_1::/scripts/tpf3mp/lanes.lua')
+        local ref = L.partRows(api, 1, 0, 'all')[L.NETWORK]
+        table.sort(ref)
+        local text = #ref .. ":" .. L.hash(table.concat(ref, "\30"))
+        assert(J.decoders == nil and L.decoders == nil, "the switches are as before")
+        J.decoders = false
+        L.partRows(api, 1, 0, 'all')
+        assert(J.decoders == false, "a switch set before stays set")
+        J.decoders = nil
+        -- A decoder that reads nothing leaves the rows to the same copy.
+        tpf3mp_native.junctionConfig = function() return nil end
+        local undecoded = table.concat(J.rows(api), "\n")
+        return { borrowed, decoded, own, text, L.read(api)[L.NETWORK], undecoded }
+    "#,
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(rows[1], rows[2], "the reference reads the same copy");
+    assert_ne!(rows[0], rows[1], "the copy's order shows in the rows");
+    assert_eq!(
+        rows[3], rows[4],
+        "compare mode's reference is the lane read"
+    );
+    assert_eq!(rows[5], rows[1], "nothing decoded, the copy still counts");
+}
+
 #[test]
 fn every_junction_in_one_checkpoint_keeps_its_own_light_settings() {
     // One read names each light preference and resource once for all the
@@ -1714,6 +1827,201 @@ fn junction_replay_refuses_ambiguous_stale_private_and_mixed_edits() {
         local s=SENT[1].proposal.streetProposal
         assert(#s.nodeConfigsToRemove==1 and not s.nodeConfigsToAdd)
     "#).exec().unwrap();
+}
+
+/// The junction of `junction_world.lua` with no traffic lights (unless
+/// `KEEP_LIGHTS`) and the preference Auto, its four arms tracks with no
+/// street at the node (unless `STREET_NODE`), `strict_junctions` off, and
+/// `EDIT(f)`: the capture of the window's proposal of its configuration as
+/// `f` changes a copy of it. The stand-in's enum: AUTO=0, YES=1, NO=2.
+const NARROW_BASE: &str = r#"
+    local c = CONFIGS[1+OFFSET]
+    if not KEEP_LIGHTS then
+        c.trafficLightConfig = {trafficLightType=-1, states={}}
+        c.userModifiedTrafficLightStates = false
+    end
+    c.trafficLightPreference = 0
+    if not STREET_NODE then
+        local system = api.engine.system.streetSystem
+        system.getNode2TrackEdgeMap = function() return STREETS end
+        system.getNode2StreetEdgeMap = function() return {} end
+        system.getNodeTrackSegments = function(n) return STREETS[n] or {} end
+        system.getNodeStreetSegments = function() return {} end
+    end
+    J.strict_junctions = false
+    -- Imported upstream exception vectors run only in an explicit acceptance copy.
+    J.double_slip_only = true
+    local function copy(v)
+        if type(v) ~= 'table' then return v end
+        local o = {}
+        for k, x in pairs(v) do o[k] = copy(x) end
+        return o
+    end
+    function EDIT(f)
+        local e = copy(CONFIGS[1+OFFSET])
+        f(e)
+        PROPOSAL.proposal.nodeConfigsToAdd = {{entity=1+OFFSET, comp=e}}
+        return C.junction(PROPOSAL)
+    end
+"#;
+
+fn narrow_game(offset: u32, keep_lights: bool, street_node: bool) -> Lua {
+    let lua = junction_game(offset);
+    lua.globals().set("KEEP_LIGHTS", keep_lights).unwrap();
+    lua.globals().set("STREET_NODE", street_node).unwrap();
+    lua.load(NARROW_BASE).exec().unwrap();
+    lua
+}
+
+/// Captures `edit` in one game and replays it in another with other ids,
+/// both set up by `setup`; returns whether `check` holds for the
+/// configuration the replica sent.
+fn narrow_round_trip(keep_lights: bool, setup: &str, edit: &str, check: &str) -> bool {
+    use tpf3mp_proto::lua::{action_from_lua, action_to_lua};
+    let source = narrow_game(0, keep_lights, false);
+    source.load(setup).exec().unwrap();
+    let captured: mlua::Value = source
+        .load(format!("return EDIT(function(c) {edit} end)"))
+        .eval()
+        .unwrap_or_else(|e| panic!("{edit}: {e}"));
+    let action = action_from_lua(&common::tree(&captured)).unwrap();
+    let replica = narrow_game(5000, keep_lights, false);
+    replica.load(setup).exec().unwrap();
+    replica
+        .globals()
+        .set(
+            "ACTION",
+            lua_value(&replica, &action_to_lua(&action).unwrap()),
+        )
+        .unwrap();
+    replica
+        .load(format!(
+            r#"
+        HOOK.batch = {{ACTION}} UPDATE({{}},STATE,0.2)
+        assert(#SENT==1, table.concat(HOOK.logged,'\n'))
+        local cfg = SENT[1].proposal.streetProposal.nodeConfigsToAdd[1].comp
+        return ({check}) == true
+    "#
+        ))
+        .eval()
+        .unwrap_or_else(|e| panic!("{edit}: {e}"))
+}
+
+#[test]
+fn the_upstream_double_slip_exception_is_off_in_ordinary_reedme_rooms() {
+    let lua = narrow_game(0, false, false);
+    lua.load(
+        r#"
+        J.double_slip_only = nil
+        local ok, why = pcall(EDIT, function(c) c.doubleSlipSwitch = true end)
+        assert(not ok and tostring(why):find('strict_junctions', 1, true))
+        assert(#SENT == 0)
+        "#,
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn an_explicit_acceptance_copy_carries_the_upstream_double_slip_vectors() {
+    // As the window was seen to send it: the switch, and with it the
+    // preference from Auto to No at a node no street joins.
+    for (setup, edit, check) in [
+        ("", "c.doubleSlipSwitch=true", "cfg.doubleSlipSwitch"),
+        (
+            "",
+            "c.doubleSlipSwitch=true c.trafficLightPreference=2",
+            "cfg.doubleSlipSwitch and cfg.trafficLightPreference==2",
+        ),
+        (
+            "CONFIGS[1+OFFSET].doubleSlipSwitch=true",
+            "c.doubleSlipSwitch=false",
+            "not cfg.doubleSlipSwitch",
+        ),
+    ] {
+        assert!(narrow_round_trip(false, setup, edit, check), "{edit}");
+    }
+    // A phase kept as it is compares alike after the wire rounded it to
+    // milliseconds (12.3125 s: half a millisecond).
+    assert!(narrow_round_trip(
+        true,
+        "CONFIGS[1+OFFSET].trafficLightConfig.states[1].duration = 12.3125",
+        "c.doubleSlipSwitch=true",
+        "cfg.doubleSlipSwitch",
+    ));
+}
+
+#[test]
+fn every_other_junction_edit_stays_refused_before_the_junction_acceptance() {
+    use tpf3mp_proto::lua::{action_from_lua, action_to_lua};
+    let slip = "c.doubleSlipSwitch=true";
+    for (keep_lights, street_node, setup, edit, expected) in [
+        // Lanes stay exactly as they are, the switch's own included, and
+        // tram lanes wait for the crossing tool's own acceptance.
+        (false, false, "", format!("{slip} c.laneConnections[3]={{segment0=101,lane0=1,segment1=103,lane1=0,withRoad=false,withTram=false}}"), "lane connections"),
+        (false, false, "", format!("{slip} table.remove(c.laneConnections,2)"), "lane connections"),
+        (false, false, "", format!("{slip} c.laneConnections[2].withTram=false"), "lane connections"),
+        (false, false, "", "c.laneConnections[3]={segment0=102,lane0=1,segment1=103,lane1=0,withRoad=false,withTram=true}".to_string(), "no double slip switch change"),
+        (false, false, "", "c.laneConnections[2].withTram=false".to_string(), "no double slip switch change"),
+        // The preference: Auto to No alone, with the switch, where no
+        // street joins.
+        (false, false, "", "c.trafficLightPreference=2".to_string(), "no double slip switch change"),
+        (false, false, "", format!("{slip} c.trafficLightPreference=1"), "traffic lights"),
+        (false, false, "CONFIGS[1+OFFSET].trafficLightPreference=2", format!("{slip} c.trafficLightPreference=0"), "traffic lights"),
+        (false, true, "", format!("{slip} c.trafficLightPreference=2"), "traffic lights"),
+        // Everything else at the node.
+        (false, false, "", format!("{slip} c.crosswalks={{101}}"), "crosswalks"),
+        (false, false, "", format!("{slip} c.trafficLightConfig.trafficLightType=40"), "traffic lights"),
+        (false, false, "", format!("{slip} c.userModifiedTrafficLightStates=true"), "traffic lights"),
+        (true, false, "", format!("{slip} c.trafficLightConfig.states[1].duration=13"), "phases"),
+        (false, false, "", "c.doubleSlipSwitch=false".to_string(), "no double slip switch change"),
+    ] {
+        let lua = narrow_game(0, keep_lights, street_node);
+        lua.load(setup).exec().unwrap();
+        let (ok, why): (bool, String) = lua
+            .load(format!(
+                "local ok, why = pcall(EDIT, function(c) {edit} end) return ok, tostring(why)"
+            ))
+            .eval()
+            .unwrap();
+        assert!(
+            !ok && why.contains("strict_junctions") && why.contains(expected),
+            "{edit}: {why}"
+        );
+    }
+    // A reset.
+    let lua = narrow_game(0, false, false);
+    lua.load(
+        r#"
+        PROPOSAL.proposal.nodeConfigsToAdd = {}
+        local ok, why = pcall(C.junction, PROPOSAL)
+        assert(not ok and tostring(why):find('reset',1,true), tostring(why))
+    "#,
+    )
+    .exec()
+    .unwrap();
+    // Every game asks again at the replay: an edit captured where the gate
+    // was on changes nothing in a game where it is off.
+    let source = narrow_game(0, false, false);
+    let captured: mlua::Value = source
+        .load("J.strict_junctions=true return EDIT(function(c) c.doubleSlipSwitch=true c.crosswalks={101} end)")
+        .eval()
+        .unwrap();
+    let action = action_from_lua(&common::tree(&captured)).unwrap();
+    let replica = narrow_game(5000, false, false);
+    replica
+        .globals()
+        .set(
+            "ACTION",
+            lua_value(&replica, &action_to_lua(&action).unwrap()),
+        )
+        .unwrap();
+    let (ok, why): (bool, String) = replica
+        .load("local ok, why = A.run(ACTION) return ok == true, tostring(why)")
+        .eval()
+        .unwrap();
+    assert!(!ok && why.contains("crosswalks"), "{why}");
+    assert_eq!(replica.load("return #SENT").eval::<usize>().unwrap(), 0);
 }
 
 #[test]
@@ -1924,6 +2232,339 @@ fn rolling_checks_resume_from_saved_history_and_refuse_gaps_and_read_failures() 
     );
 }
 
+/// A hook that reads parts (`tpf3mp_native.part`), faked: it records what
+/// it was asked, answers with `NATIVE_TEXT`, fails with `PART_FAIL`, and
+/// compares with `PART_MODE = 'compare'`.
+const FAKE_PARTS: &str = r#"
+api.type.enum = api.type.enum or {}
+api.type.enum.TrafficLightPreference = api.type.enum.TrafficLightPreference or { AUTO = 0, YES = 1, NO = 2 }
+PART_CALLS, PART_TEXTS = {}, {}
+NATIVE_TEXT = 'native'
+tpf3mp_native.part = function(n, k, kind)
+    if n == nil then return { mode = PART_MODE or 'on', parts = PLAN_PARTS or 10, stride = PLAN_STRIDE or 1 } end
+    PART_CALLS[#PART_CALLS + 1] = n .. '/' .. k .. '/' .. kind
+    if PART_FAIL then return { mode = 'on', why = PART_FAIL } end
+    -- A hook from before it read the crossings hands no crossingTypes.
+    if PART_OLD then return { mode = PART_MODE or 'on', ms = 1, timing = 'fake', lights = {}, deferred = {} } end
+    return { mode = PART_MODE or 'on', ms = 1, timing = 'fake', lights = {}, deferred = {},
+             crossingTypes = PART_CROSSINGS or {} }
+end
+tpf3mp_native.partTexts = function(n, k, kind, preferences, lights, deferred, rows, crossingTypes)
+    PART_TEXTS[#PART_TEXTS + 1] = n .. '/' .. k .. '/' .. kind
+    if PART_TEXTS_FAIL then return nil, nil, PART_TEXTS_FAIL end
+    local net, cons = '1:' .. NATIVE_TEXT, '1:cons'
+    if kind == 'constructions' then net = nil else cons = nil end
+    -- The crossings' types as the Lua named them, on a junctions turn.
+    if kind == 'junctions' then
+        local names = {}
+        for _, index in ipairs(PART_CROSSINGS or {}) do names[#names + 1] = tostring(crossingTypes and crossingTypes[index]) end
+        net = net .. '|crossings ' .. table.concat(names, ',')
+    end
+    if rows then return net, cons, { 'row' }, { 'con@0,0' } end
+    return net, cons
+end
+REPORTS = {}
+ROLL_STEP = function(step, checkpoint)
+    local out, report
+    SCAN, out, report = ROLL.rolling(api, SCAN, step, checkpoint)
+    if report then REPORTS[#REPORTS + 1] = report end
+    return out
+end
+"#;
+
+/// Where the hook reads parts, a room's rolling history starts in parts:
+/// one part an update, in turn; the hook's texts count, compared ones give
+/// way to this Lua's own and a difference is said; a part that did not
+/// read, or a game no longer reading parts, holds the game; a saved
+/// history resumes in a fresh state; without parts it stays version 1.
+#[test]
+fn rolling_checks_read_native_parts_in_turn_and_fail_closed() {
+    let game = |setup: &str| {
+        let lua = rolling_game();
+        lua.load(FAKE_PARTS).exec().unwrap();
+        lua.load(setup).exec().unwrap();
+        lua
+    };
+    let read = |lua: &Lua, from: u32, to: u32| -> Vec<String> {
+        lua.load(format!(
+            "for s={from},{} do ROLL_STEP(s,false) end local r=ROLL_STEP({to},true) \
+             local out={{}} for n=0,6 do out[#out+1]=r[n] end return out",
+            to - 1
+        ))
+        .eval()
+        .unwrap()
+    };
+    let a = game("");
+    let first = read(&a, 1, 12);
+    // Edges and junctions are the network lane's: 8 of 12 updates.
+    assert!(first[0].starts_with("rolling-v2:1-12:8:"), "{first:?}");
+    assert!(first[1].starts_with("rolling-v2:1-12:4:"), "{first:?}");
+    let calls: Vec<String> = a.load("return PART_CALLS").eval().unwrap();
+    let kinds = ["edges", "junctions", "constructions"];
+    let turns: Vec<String> = (0..12)
+        .map(|s| format!("10/{}/{}", s / 3 % 10, kinds[s % 3]))
+        .collect();
+    assert_eq!(calls, turns);
+    let texts: Vec<String> = a.load("return PART_TEXTS").eval().unwrap();
+    assert_eq!(texts, turns, "texts asked for the part just read");
+    // The hook's text counts: another text, another history.
+    let other = read(&game("NATIVE_TEXT='other'"), 1, 12);
+    assert_ne!(other[0], first[0]);
+    assert_eq!(other[2..], first[2..], "the dynamic lanes are this Lua's");
+    // Compared, this Lua's own text counts whatever the hook says.
+    let c = game("PART_MODE='compare'");
+    let d = game("PART_MODE='compare' NATIVE_TEXT='other'");
+    let (rc, rd) = (read(&c, 1, 12), read(&d, 1, 12));
+    assert_eq!(rc[..2], rd[..2]);
+    assert_ne!(rc[0], first[0]);
+    let reports: Vec<String> = d.load("return REPORTS").eval().unwrap();
+    assert!(reports.iter().any(|r| r.contains("differs")), "{reports:?}");
+    // A save in the middle of a window resumes in a fresh state.
+    let e = game("for s=1,7 do ROLL_STEP(s,false) end");
+    let f = game("");
+    let saved: mlua::Value = e.globals().get("SCAN").unwrap();
+    f.globals()
+        .set("SCAN", lua_value(&f, &common::tree(&saved)))
+        .unwrap();
+    assert_eq!(read(&e, 8, 12), read(&f, 8, 12));
+    // Fail closed: texts refused on a constructions turn are no text of
+    // that lane.
+    let j = game("for s=1,2 do ROLL_STEP(s,false) end");
+    assert!(
+        j.load("PART_TEXTS_FAIL='no part was read' ROLL_STEP(3,false)")
+            .exec()
+            .is_err()
+    );
+    // Fail closed: a part that did not read, a game that reads no parts.
+    assert!(
+        f.load("PART_FAIL='no pool' ROLL_STEP(13,false)")
+            .exec()
+            .is_err()
+    );
+    // Fail closed: a junctions turn whose hook hands no crossings' types
+    // (one from before it read them) checks no crossings, so it holds.
+    let old = game("ROLL_STEP(1,false)");
+    assert!(
+        old.load("PART_OLD=true ROLL_STEP(2,false)").exec().is_err(),
+        "a part without its crossings"
+    );
+    let g = game("for s=1,3 do ROLL_STEP(s,false) end tpf3mp_native.part=nil");
+    assert!(g.load("ROLL_STEP(4,false)").exec().is_err());
+    // Every `stride` updates one part of one kind: 3 in 12 updates.
+    let h = game("PLAN_PARTS=4 PLAN_STRIDE=5");
+    let strided = read(&h, 1, 12);
+    assert!(strided[0].starts_with("rolling-v2:1-12:2:"), "{strided:?}");
+    let calls: Vec<String> = h.load("return PART_CALLS").eval().unwrap();
+    assert_eq!(calls, ["4/0/edges", "4/0/junctions", "4/0/constructions"]);
+    // Between two parts too, a history of parts holds once the game reads
+    // none.
+    let i = game(
+        "PLAN_PARTS=4 PLAN_STRIDE=5 for s=1,2 do ROLL_STEP(s,false) end tpf3mp_native.part=nil",
+    );
+    assert!(
+        i.load("ROLL_STEP(3,false)").exec().is_err(),
+        "not a slot, still held"
+    );
+    // Without parts, the rolling history of version 1.
+    assert!(read(&rolling_game(), 1, 12)[0].starts_with("rolling-v1:"));
+
+    // A saved history cannot silently resume under a different local mode
+    // or partition plan; refuse before producing another checkpoint hash.
+    let changed_plan = game("ROLL_STEP(1,false) PLAN_PARTS=4 PLAN_STRIDE=1");
+    let why = changed_plan
+        .load("ROLL_STEP(2,true)")
+        .exec()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        why.contains("saved rolling-v2 plan does not match"),
+        "{why}"
+    );
+    assert_eq!(
+        changed_plan.load("return SCAN.step").eval::<u32>().unwrap(),
+        1,
+        "a mismatched partition must be refused before advancing saved history"
+    );
+    let calls: Vec<String> = changed_plan.load("return PART_CALLS").eval().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "no second native part may be read: {calls:?}"
+    );
+    let reports: Vec<String> = changed_plan.load("return REPORTS").eval().unwrap();
+    assert!(
+        reports.is_empty(),
+        "no checkpoint hash may be published: {reports:?}"
+    );
+
+    let changed_stride = game("ROLL_STEP(1,false) ROLL_STEP(2,false) PLAN_STRIDE=2");
+    let why = changed_stride
+        .load("ROLL_STEP(3,true)")
+        .exec()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        why.contains("saved rolling-v2 plan does not match"),
+        "{why}"
+    );
+    assert_eq!(
+        changed_stride
+            .load("return SCAN.step")
+            .eval::<u32>()
+            .unwrap(),
+        2,
+        "a mismatched stride must be refused before advancing saved history"
+    );
+    let calls: Vec<String> = changed_stride.load("return PART_CALLS").eval().unwrap();
+    assert_eq!(
+        calls.len(),
+        2,
+        "no third native part may be read: {calls:?}"
+    );
+
+    let changed_mode = game("PART_MODE='compare' ROLL_STEP(1,false) PART_MODE='on'");
+    let why = changed_mode
+        .load("ROLL_STEP(2,true)")
+        .exec()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        why.contains("saved rolling-v2 plan does not match"),
+        "{why}"
+    );
+    assert_eq!(
+        changed_mode.load("return SCAN.step").eval::<u32>().unwrap(),
+        1,
+        "a mismatched mode must be refused before advancing saved history"
+    );
+    let calls: Vec<String> = changed_mode.load("return PART_CALLS").eval().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "no second native part may be read: {calls:?}"
+    );
+
+    let native_disabled = game("ROLL_STEP(1,false) tpf3mp_native.part=nil");
+    let why = native_disabled
+        .load("ROLL_STEP(2,true)")
+        .exec()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        why.contains("saved rolling-v2 history has no native part plan"),
+        "{why}"
+    );
+    assert_eq!(
+        native_disabled
+            .load("return SCAN.step")
+            .eval::<u32>()
+            .unwrap(),
+        1,
+        "missing native plan must be refused before advancing saved history"
+    );
+
+    let native_enabled = game(
+        "PART_QUERY=tpf3mp_native.part tpf3mp_native.part=nil ROLL_STEP(1,false) \
+         tpf3mp_native.part=PART_QUERY",
+    );
+    let why = native_enabled
+        .load("ROLL_STEP(2,true)")
+        .exec()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        why.contains("saved rolling-v1 history does not match"),
+        "{why}"
+    );
+    assert_eq!(
+        native_enabled
+            .load("return SCAN.step")
+            .eval::<u32>()
+            .unwrap(),
+        1,
+        "native plan appearing after a v1 save must be refused before history advances"
+    );
+
+    // The default/off rolling-v1 path records and validates the complete
+    // configured plan too, including an off-to-off partition change.
+    let native_off = game("PART_MODE='off' PLAN_PARTS=4 PLAN_STRIDE=2 ROLL_STEP(1,false)");
+    assert_eq!(
+        native_off
+            .load(
+                "return SCAN.version .. ':' .. SCAN.mode .. ':' .. SCAN.parts .. ':' .. SCAN.stride"
+            )
+            .eval::<String>()
+            .unwrap(),
+        "1:off:4:2"
+    );
+    let calls: Vec<String> = native_off.load("return PART_CALLS").eval().unwrap();
+    assert!(calls.is_empty(), "off mode must keep rolling-v1: {calls:?}");
+    let why = native_off
+        .load("PLAN_PARTS=5 ROLL_STEP(2,true)")
+        .exec()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        why.contains("saved rolling-v1 history does not match"),
+        "{why}"
+    );
+    assert_eq!(
+        native_off.load("return SCAN.step").eval::<u32>().unwrap(),
+        1,
+        "an off-mode partition change must be refused before history advances"
+    );
+
+    let legacy_off = game(
+        "PART_MODE='off' ROLL_STEP(1,false) \
+         SCAN.mode=nil SCAN.parts=nil SCAN.stride=nil",
+    );
+    let legacy_result: bool = legacy_off
+        .load("local out=ROLL_STEP(2,true); return out[0]:sub(1,11) == 'rolling-v1:'")
+        .eval()
+        .unwrap();
+    assert!(legacy_result, "an old off-mode v1 save remains rolling-v1");
+    assert_eq!(
+        legacy_off
+            .load("return SCAN.mode .. ':' .. SCAN.parts .. ':' .. SCAN.stride")
+            .eval::<String>()
+            .unwrap(),
+        "off:10:1",
+        "the legacy save adopts the current off plan exactly once"
+    );
+
+    let partial_off = game("PART_MODE='off' ROLL_STEP(1,false) SCAN.parts=nil");
+    let why = partial_off
+        .load("ROLL_STEP(2,true)")
+        .exec()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        why.contains("saved rolling-v1 history does not match"),
+        "partial plan metadata must not be migrated: {why}"
+    );
+    assert_eq!(
+        partial_off.load("return SCAN.step").eval::<u32>().unwrap(),
+        1,
+        "partial plan metadata is refused before history advances"
+    );
+
+    let off_to_on = game("PART_MODE='off' ROLL_STEP(1,false) PART_MODE='on'");
+    let why = off_to_on
+        .load("ROLL_STEP(2,true)")
+        .exec()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        why.contains("saved rolling-v1 history does not match"),
+        "{why}"
+    );
+    assert_eq!(
+        off_to_on.load("return SCAN.step").eval::<u32>().unwrap(),
+        1,
+        "enabling native mode after a v1 save must be refused before history advances"
+    );
+}
+
 #[test]
 fn rolling_checks_detect_builds_deletions_geometry_and_dynamic_changes() {
     for change in [
@@ -2016,6 +2657,20 @@ fn the_game_script_runs_rolling_checks_between_checkpoints_and_saves_their_histo
     )
     .exec()
     .unwrap();
+}
+
+/// A simulation state without `os` (or its clock) times nothing but still
+/// applies the room's actions and runs its world checks.
+#[test]
+fn the_game_script_runs_without_a_clock() {
+    for missing in ["os = nil", "os = { }"] {
+        let lua = rolling_game();
+        lua.load(format!(
+            "{missing} HOOK.scanStep=1 HOOK.batch = {{ {{ SellVehicle = {{ vehicles = {{ 7 }} }} }} }}              UPDATE({{}},STATE,0.2) assert(HOOK.scanResult.ok, HOOK.scanResult.why)              assert(HOOK.batch == nil, 'the action was taken')"
+        ))
+        .exec()
+        .unwrap();
+    }
 }
 
 #[test]
@@ -2155,6 +2810,10 @@ fn a_lane_dump_is_the_lanes_text_entry_by_entry_keyed_and_in_the_same_order_on_e
     assert_eq!(
         vehicles,
         [
+            "lane 3 step 300 vehicle-0/core state=1 stop=0 line=nil edge=3 pos=10.199999999999999 speed=5 \
+             path_count=0 path_hash=nil entity=401 row=1:0:3~10.20 v5.00",
+            "lane 3 step 300 vehicle-1/core state=2 stop=1 line=nil edge=0 pos=0 speed=0 \
+             path_count=0 path_hash=nil entity=402 row=2:1:0~0.00 v0.00",
             "lane 3 step 300 vehicle-0 state=1 stop=0 line=nil edge=3 pos=10.199999999999999 speed=5 \
              arrival=nil/nil arrival_locked=nil load=nil pending=nil free=nil \
              entity=401 row=1:0:3~10.20 v5.00",
@@ -2197,9 +2856,14 @@ fn a_lane_dump_is_the_lanes_text_entry_by_entry_keyed_and_in_the_same_order_on_e
     let dump_b = dump_at_checkpoint(&b, 350, "3");
     let differ: Vec<(&String, &String)> =
         dump_a.iter().zip(&dump_b).filter(|(x, y)| x != y).collect();
-    assert_eq!(differ.len(), 1, "{differ:#?}");
-    assert!(differ[0].0.starts_with("lane 3 step 350 vehicle-1 "));
+    assert_eq!(
+        differ.len(),
+        2,
+        "compact and verbose records both name the position"
+    );
+    assert!(differ[0].0.starts_with("lane 3 step 350 vehicle-1/core "));
     assert!(differ[0].1.contains(" pos=0.001 "), "{}", differ[0].1);
+    assert!(differ[1].0.starts_with("lane 3 step 350 vehicle-1 "));
 
     // No dump asked: nothing handed over at a checkpoint.
     a.load("HOOK.dumped = {} HOOK.checkpoint = true UPDATE({}, STATE, 0.2)")
@@ -2582,21 +3246,187 @@ fn long_vehicle_diagnostics_survive_upload_and_bound_route_reads() {
     );
     assert_eq!(
         game.load("return GEOMETRY_READS").eval::<usize>().unwrap(),
-        256
+        14
     );
     for line in &dump {
         assert!(line.len() < 1024, "{} bytes: {line}", line.len());
         assert_eq!(&tpf3mp_proto::redact(line), line);
     }
     let text = dump.join("\n");
-    assert!(text.contains("route_records=256 route_omitted=44"));
+    assert!(text.contains("route_records=14 route_omitted=286"));
     assert!(text.contains("free_part0="));
     assert!(text.contains("decision_offset=98"));
     assert!(text.contains(
-        "/path-0138 route_index=138 edge_entity=8139 lane_index=1 direction=false p0=8139,0,5"
+        "/path-0299 route_index=299 edge_entity=8300 lane_index=0 direction=false p0=8300,0,5"
     ));
     assert!(text.contains("path_hash_scope=local_ids"));
     assert!(text.contains("row=1:0:3~10.20"));
+}
+
+#[test]
+fn shifty_sized_vehicle_dumps_fit_two_checkpoints_in_the_hook_upload_budget() {
+    let game = dumping_game(false);
+    game.load(
+        r#"
+        local edges = {}
+        for i = 1, 300 do
+            edges[i] = { edgeId = { entity = 8000 + i, index = i % 3 }, dir = false }
+        end
+        WORLD[9][401].path = { edges = edges }
+        local cargo = {}
+        for i = 1, 15 do
+            cargo[i] = {}
+            for j = 1, 40 do cargo[i][j] = j end
+        end
+        WORLD[4][401].lineStop2cargo2available = cargo
+        for e = 403, 413 do
+            WORLD[4][e] = WORLD[4][401]
+            WORLD[9][e] = WORLD[9][401]
+        end
+    "#,
+    )
+    .exec()
+    .unwrap();
+    let first = dump_at_checkpoint(&game, 50, "3");
+    let second = dump_at_checkpoint(&game, 100, "3");
+    let wire_size = |dump: &[String]| -> usize { dump.iter().map(|line| line.len() + 16).sum() };
+    assert!(
+        first.len() > 100,
+        "13 vehicles still have sampled route detail"
+    );
+    assert!(
+        wire_size(&first) + wire_size(&second) <= 192 << 10,
+        "two 13-vehicle checkpoints must fit one minute of hook-log upload: {} + {} bytes",
+        wire_size(&first),
+        wire_size(&second)
+    );
+    assert_eq!(
+        first
+            .iter()
+            .filter(|line| line.contains(" state=")
+                && !line.contains("/path-")
+                && !line.contains("/core"))
+            .count(),
+        13,
+        "every vehicle keeps its base record"
+    );
+}
+
+#[test]
+fn peter_sized_vehicle_dump_keeps_both_compact_checkpoints_under_the_hook_budget() {
+    let game = dumping_game(false);
+    game.load(
+        r#"
+        local edges = {}
+        for i = 1, 300 do
+            edges[i] = { edgeId = { entity = 8000 + i, index = i % 3 }, dir = false }
+        end
+        WORLD[9][401].path = { edges = edges }
+        for e = 403, 557 do
+            WORLD[4][e] = WORLD[4][401]
+            WORLD[9][e] = WORLD[9][401]
+        end
+    "#,
+    )
+    .exec()
+    .unwrap();
+    let first = dump_at_checkpoint(&game, 50, "3");
+    let second = dump_at_checkpoint(&game, 100, "3");
+    let bytes: usize = second.iter().map(|line| line.len() + 16).sum();
+    assert_eq!(
+        second
+            .iter()
+            .filter(|line| line.contains(" state=")
+                && !line.contains("/path-")
+                && !line.contains("/core"))
+            .count(),
+        157
+    );
+    assert_eq!(
+        second.iter().filter(|line| line.contains("/core ")).count(),
+        157
+    );
+    assert!(
+        bytes <= 192 << 10,
+        "one 157-vehicle checkpoint used {bytes} bytes before other hook lines"
+    );
+    let logged = |dump: Vec<String>| -> String {
+        let mut lines = dump;
+        lines.sort_by_key(|line| {
+            let key = line.split_whitespace().nth(4).unwrap_or("");
+            match key {
+                key if key.contains("/path-") => 0,
+                "summary" | "err" => 3,
+                key if key.ends_with("/core") => 2,
+                _ => 1,
+            }
+        });
+        lines
+            .into_iter()
+            .map(|line| format!("[1759240010] {line}\n"))
+            .collect::<String>()
+    };
+    let combined = logged(first) + &logged(second);
+    let tail = &combined[combined.len().saturating_sub(192 << 10)..];
+    for step in [50, 100] {
+        let count = tail
+            .lines()
+            .filter(|line| line.contains(&format!(" step {step} ")) && line.contains("/core "))
+            .count();
+        assert_eq!(
+            count,
+            157,
+            "checkpoint {step}'s core records survived the newest 192 KiB of {} bytes",
+            combined.len()
+        );
+    }
+}
+
+#[test]
+fn an_unsampled_middle_route_change_is_visible_in_the_full_path_hash() {
+    let a = dumping_game(false);
+    let b = dumping_game(false);
+    for game in [&a, &b] {
+        game.load(
+            r#"
+            WORLD[9][401].path = { edges = {} }
+            for i = 1, 300 do
+                WORLD[9][401].path.edges[i] = {
+                    edgeId = { entity = 8000 + i, index = i % 3 }, dir = false
+                }
+            end
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+    b.load("WORLD[9][401].path.edges[139].edgeId.entity = 9000")
+        .exec()
+        .unwrap();
+    let da = dump_at_checkpoint(&a, 50, "3");
+    let db = dump_at_checkpoint(&b, 50, "3");
+    let routes = |dump: &[String]| -> Vec<String> {
+        dump.iter()
+            .filter(|line| line.contains("/path-"))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        routes(&da),
+        routes(&db),
+        "middle edge is deliberately unsampled"
+    );
+    let base = |dump: &[String]| -> String {
+        dump.iter()
+            .find(|line| line.contains(" path_hash="))
+            .unwrap()
+            .clone()
+    };
+    assert_ne!(
+        base(&da),
+        base(&db),
+        "the full path hash still exposes the change"
+    );
 }
 
 #[test]
@@ -4786,9 +5616,9 @@ fn a_station_the_room_builds_names_its_group_as_the_tool_named_it() {
 /// configures the station's own entrance node -1, the new junction -2 its
 /// entrance joins, and the street's existing ends 8 and 9, each added and
 /// removed. Every game leaves out the entrance, which the station makes
-/// again itself, and with it the settings that name it: those at -1, and
-/// those at -2, whose turns lead into it. The settings at 8 and 9 name only
-/// the rebuilt street, and travel as the tool made them.
+/// again itself, and the originator the settings that name it: those at
+/// -1, and those at -2, whose turns lead into it. The settings at 8 and 9
+/// name only the rebuilt street, and travel as the tool made them.
 #[test]
 fn a_station_by_a_road_leaves_its_own_entrances_junction_settings_to_it() {
     let (lua, _script) = engine();
@@ -4814,7 +5644,7 @@ fn a_station_by_a_road_leaves_its_own_entrances_junction_settings_to_it() {
          local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
          ACTION = assert(capture.construction(PROPOSAL)) \
          assert(schema_check(ACTION)) \
-         assert(#ACTION.BuildConstruction.connection.junctions == 4, 'the four the tool proposed')"
+         assert(#ACTION.BuildConstruction.connection.junctions == 2, 'the street ends; the entrance stays with the station')"
     ))
     .exec()
     .unwrap_or_else(|error| panic!("{error}"));
@@ -4851,8 +5681,8 @@ fn a_station_by_a_road_leaves_its_own_entrances_junction_settings_to_it() {
     );
     assert_eq!(removed, "8,9", "the settings they replace go");
     assert!(
-        hook_log(&lua).contains("left to the construction: 2 junction(s): Street(50.0,0.0)"),
-        "{}",
+        !hook_log(&lua).contains("left to the construction"),
+        "the originator left them out already: {}",
         hook_log(&lua)
     );
 }
@@ -4915,6 +5745,526 @@ fn a_construction_whose_own_track_the_tool_snapped_is_built_alone_then_snapped()
         "2|::/stations/rail/rail_station.con|0|0|5000|true",
         "the construction alone, then its refresh, which snaps its own track: {:?}",
         lua.load("return HOOK.logged").eval::<Vec<String>>()
+    );
+}
+
+/// A rail station snapped to a track end, whose tool also configured the
+/// switches of its own platform tracks (2026-10-07, live: refused in every
+/// game, "the junction no longer exists"). The platform track -10 > -11 >
+/// -12 reaches nothing that exists, so the room leaves it to the station;
+/// the setting at its switch -11, whose turns name its edges, goes with it.
+/// The setting at the snapped track's new internal node -2 stays with the station.
+#[test]
+fn a_rail_station_leaves_its_own_tracks_junction_settings_to_it() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    let joined = RAIL_STATION_OPEN.replace(
+        "{JOIN}",
+        ", { entity = -6, type = 1, comp = { node0 = -3, node1 = 8, type = 0, typeIndex = -1, \
+           tangent0 = { x = 50, y = 0, z = 0 }, tangent1 = { x = 50, y = 0, z = 0 }, \
+           roadTemplate = '::/track/standard.track_template', roadStyle = '' } }, \
+         { entity = -13, type = 1, comp = { node0 = -10, node1 = -11, type = 0, typeIndex = -1, \
+           tangent0 = { x = 50, y = 0, z = 0 }, tangent1 = { x = 50, y = 0, z = 0 }, \
+           roadTemplate = '::/track/standard.track_template', roadStyle = '' } }, \
+         { entity = -14, type = 1, comp = { node0 = -11, node1 = -12, type = 0, typeIndex = -1, \
+           tangent0 = { x = 50, y = 0, z = 0 }, tangent1 = { x = 50, y = 0, z = 0 }, \
+           roadTemplate = '::/track/standard.track_template', roadStyle = '' } }",
+    );
+    lua.load(format!(
+        "local function config(turns) \
+             local t = {{}} \
+             for i, p in ipairs(turns) do t[i] = {{ segment0 = p[1], lane0 = 0, segment1 = p[2], lane1 = 0, \
+                 withRoad = true, withTram = false }} end \
+             return {{ trafficLightPreference = 0, doubleSlipSwitch = false, userModifiedTrafficLightStates = false, \
+                 laneConnections = t, crosswalks = {{}}, trafficLightConfig = {{ trafficLightType = -1, states = {{}} }} }} \
+         end \
+         PROPOSAL = {joined} \
+         local s = PROPOSAL.proposal \
+         for _, n in ipairs({{ {{ -10, 250 }}, {{ -11, 300 }}, {{ -12, 350 }} }}) do \
+             s.addedNodes[#s.addedNodes + 1] = {{ entity = n[1], comp = {{ position = {{ x = n[2], y = 20, z = 0 }} }} }} \
+         end \
+         s.nodeConfigsToAdd = {{ \
+             {{ entity = -2, comp = config({{}}) }}, \
+             {{ entity = -11, comp = config({{ {{ -13, -14 }}, {{ -14, -13 }} }}) }} }} \
+         local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         ACTION = assert(capture.construction(PROPOSAL)) \
+         assert(schema_check(ACTION))"
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    // Every game builds it, as the station and its refresh.
+    lua.load(
+        "api.engine.system.streetSystem.getNode2TrackEdgeMap = function() return { [8] = { 100 } } end \
+         local find, get = api.res.streetTemplateRep.find, api.res.streetTemplateRep.get \
+         api.res.streetTemplateRep.find = function(n) \
+             if n == '::/track/standard.track_template' then return 6 end return find(n) end \
+         api.res.streetTemplateRep.get = function(id) \
+             if id == 6 then return { laneConfigs = { 'track lanes' }, streetStyle = '' } end return get(id) end",
+    )
+    .exec()
+    .unwrap();
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load("HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    let (ok, file): (bool, String) = lua
+        .load(
+            "return HOOK.applied[1].ok == true, \
+                 tostring(SENT[1] and SENT[1].proposal.constructionsToAdd[1].fileName)",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert!(ok, "the station is built: {}", hook_log(&lua));
+    assert_eq!(file, "::/stations/rail/rail_station.con");
+    // What travels: the snapped track and the setting on it.
+    let carried: String = lua
+        .load(
+            "local c = ACTION.BuildConstruction.connection \
+             local out = { #c.links } \
+             for _, j in ipairs(c.junctions) do out[#out + 1] = j.node.network .. '(' .. j.node.at.x .. ',' \
+                 .. j.node.at.y .. ')' end \
+             return table.concat(out, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        carried, "3",
+        "the snapped track; no setting on the station's own track, which every game leaves to it"
+    );
+}
+
+/// A rail station whose own track the tool joined onto the end of a track
+/// that exists: track 200 from node 21 (450,0) to its end, node 20 (400,0).
+/// As the game (2026-10-10, an underpass mod's tracks onto track ends):
+/// the station alone is refused while node 20 stands where its track ends;
+/// built, it makes its own track end, node 30, there.
+const STATION_ON_TRACK_END: &str = "\
+    function TRACK_LANE(electric) \
+        local m = {} for i = 0, 15 do m[i] = false end m[4] = electric \
+        return { speed = 33, width = 4, height = 0, offset = 0, forward = true, transportModes = m } end \
+    NODES[20], NODES[21] = { x = 400, y = 0, z = 0 }, { x = 450, y = 0, z = 0 } \
+    EDGES[200] = { node0 = 21, node1 = 20, type = 0, tangent0 = { x = -50, y = 0, z = 0 }, \
+        tangent1 = { x = -50, y = 0, z = 0 }, objects = {}, edgeDecorations = {}, \
+        roadTemplate = '::/track/standard.track_template', laneConfigs = { TRACK_LANE(true) } } \
+    TRACKS = { [20] = { 200 }, [21] = { 200 } } \
+    local streets = api.engine.system.streetSystem \
+    streets.getNode2TrackEdgeMap = function() local m = {} for n, e in pairs(TRACKS) do m[n] = e end return m end \
+    streets.getNodeTrackSegments = function(n) return TRACKS[n] or {} end \
+    local find, get = api.res.streetTemplateRep.find, api.res.streetTemplateRep.get \
+    api.res.streetTemplateRep.find = function(n) \
+        if n == '::/track/standard.track_template' then return 6 end return find(n) end \
+    api.res.streetTemplateRep.get = function(id) \
+        if id == 6 then return { laneConfigs = { TRACK_LANE(false) }, streetStyle = '' } end return get(id) end";
+
+/// The game for STATION_ON_TRACK_END, once STATION_REFRESH is loaded: its
+/// verdict, and what a build does to the tracks.
+const TRACK_END_GAME: &str = "\
+    api.engine.util.proposal.makeProposalData = function(p, context) \
+        local s = p.streetProposal or {} \
+        local away = false \
+        for _, n in ipairs(s.nodesToRemove or {}) do if n == 20 then away = true end end \
+        if #(p.constructionsToAdd or {}) > 0 and NODES[20] and not away then \
+            return { errorState = { critical = true, messages = { 'Construction Not Possible' } } } end \
+        if POOR and context ~= nil and #(p.constructionsToAdd or {}) == 0 then \
+            return { errorState = { critical = true, messages = { 'Not enough money' } } } end \
+        return { errorState = { critical = false, messages = {} } } end \
+    local send = api.cmd.sendCommand \
+    api.cmd.sendCommand = function(cmd, ...) \
+        local s = cmd.proposal and cmd.proposal.streetProposal \
+        for _, e in ipairs(s and s.edgesToRemove or {}) do \
+            for n, list in pairs(TRACKS) do \
+                local left = {} for _, x in ipairs(list) do if x ~= e then left[#left + 1] = x end end \
+                TRACKS[n] = left end \
+            EDGES[e] = nil end \
+        for _, n in ipairs(s and s.nodesToRemove or {}) do NODES[n], TRACKS[n] = nil, nil end \
+        local c = cmd.proposal and cmd.proposal.constructionsToAdd and cmd.proposal.constructionsToAdd[1] \
+        if c then NODES[30], TRACKS[30] = { x = 400, y = 0, z = 0 }, { 301 } end \
+        return send(cmd, ...) \
+    end";
+
+// Only staged fixtures opt into the non-atomic rejoin path. In ordinary
+// rooms the mod fingerprint holds this gate off for every participant.
+const ENABLE_TRACK_END_REJOIN: &str =
+    "ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').rejoinConstruction = true";
+
+/// The rail station of RAIL_STATION_OPEN with its own track joined onto
+/// node 20 of STATION_ON_TRACK_END, as the tool proposes it.
+fn station_on_track_end() -> String {
+    RAIL_STATION_OPEN.replace(
+        "{JOIN}",
+        ", { entity = -6, type = 1, comp = { node0 = -3, node1 = 20, type = 0, typeIndex = -1, \
+           tangent0 = { x = 50, y = 0, z = 0 }, tangent1 = { x = 50, y = 0, z = 0 }, \
+           roadTemplate = '::/track/standard.track_template', roadStyle = '' } }",
+    )
+}
+
+/// The ordinary room keeps the non-atomic fallback off. Even if the game
+/// says the construction would fit after removing the old track, no command
+/// may remove that track before its replacement is guaranteed.
+#[test]
+fn a_construction_refused_on_a_track_end_keeps_the_original_track_by_default() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_ON_TRACK_END).exec().unwrap();
+    lua.load(format!(
+        "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         ACTION = assert(capture.construction({}))",
+        station_on_track_end()
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load(TRACK_END_GAME).exec().unwrap();
+    lua.load("HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    let (gate, ok, sent, edge, node): (bool, bool, usize, bool, bool) = lua
+        .load(
+            "return ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').rejoinConstruction, \
+             HOOK.applied[1].ok == true, #SENT, EDGES[200] ~= nil, NODES[20] ~= nil",
+        )
+        .eval()
+        .unwrap();
+    assert!(!gate, "the release mod must leave the fallback disabled");
+    assert!(!ok, "{}", hook_log(&lua));
+    assert_eq!(sent, 0, "no command may remove the original track");
+    assert!(edge && node, "the original track remains in the world");
+    assert!(hook_log(&lua).contains("snapped track-end rejoin awaits a safe build"));
+}
+
+#[test]
+fn a_construction_refused_on_a_track_end_is_joined_to_it_as_the_tool_joined_it() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_ON_TRACK_END).exec().unwrap();
+    lua.load(format!(
+        "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         ACTION = assert(capture.construction({})) \
+         assert(schema_check(ACTION))",
+        station_on_track_end()
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load(TRACK_END_GAME).exec().unwrap();
+    lua.load(ENABLE_TRACK_END_REJOIN).exec().unwrap();
+    lua.load("HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    let (ok, built, again): (bool, String, String) = lua
+        .load(
+            "local a, b = SENT[1].proposal, SENT[2] and SENT[2].proposal \
+             local s = a.streetProposal \
+             local first = table.concat({ #SENT, a.constructionsToAdd[1].fileName, \
+                 table.concat(s.edgesToRemove, ','), table.concat(s.nodesToRemove, ',') }, '|') \
+             local t = b and b.streetProposal or {} \
+             local e = t.edgesToAdd and t.edgesToAdd[1] \
+             local n = t.nodesToAdd and t.nodesToAdd[1] \
+             local second = table.concat({ #(b and b.constructionsToAdd or {}), #(t.edgesToAdd or {}), \
+                 tostring(e and e.comp.node0), tostring(e and e.comp.node1), tostring(e and e.type), \
+                 tostring(n and n.entity), tostring(n and n.comp.position.x) }, '|') \
+             return HOOK.applied[1].ok == true, first, second",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert!(ok, "the station is built: {}", hook_log(&lua));
+    assert_eq!(
+        built, "3|::/stations/rail/rail_station.con|200|20,21",
+        "the station, the track piece at the end and its far end away; then two more"
+    );
+    assert_eq!(
+        again, "0|1|-2|30|1|-2|450",
+        "the piece again, from a new node where its far end was onto the station's own track end"
+    );
+    let electric: bool = lua
+        .load("return SENT[2].proposal.streetProposal.edgesToAdd[1].comp.laneConfigs[1].transportModes[5] == true")
+        .eval()
+        .unwrap();
+    assert!(
+        electric,
+        "its lanes as they were, not its template's: still electrified"
+    );
+    let paid: String = lua
+        .load("return tostring(SENT[2].context) .. '|' .. tostring(SENT[2].playerInitiated)")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        paid, "nil|false",
+        "laid again for free: the piece was the player's already"
+    );
+    assert!(
+        hook_log(&lua).contains(
+            "joining ::/stations/rail/rail_station.con onto track ends 20: \
+             its track pieces 200 laid again on it"
+        ),
+        "{}",
+        hook_log(&lua)
+    );
+}
+
+/// As above, with the track piece's far end, node 21, joined on to track
+/// 199 from node 22: node 21 stays, and the piece is laid again from it.
+#[test]
+fn a_construction_refused_on_a_track_end_lays_the_piece_again_from_its_far_end() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_ON_TRACK_END).exec().unwrap();
+    lua.load(
+        "NODES[22] = { x = 500, y = 0, z = 0 }          EDGES[199] = { node0 = 22, node1 = 21, type = 0, tangent0 = { x = -50, y = 0, z = 0 },              tangent1 = { x = -50, y = 0, z = 0 }, objects = {}, edgeDecorations = {},              roadTemplate = '::/track/standard.track_template', laneConfigs = { TRACK_LANE(false) } }          TRACKS[21], TRACKS[22] = { 199, 200 }, { 199 }",
+    )
+    .exec()
+    .unwrap();
+    lua.load(format!(
+        "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua')          ACTION = assert(capture.construction({}))",
+        station_on_track_end()
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load(TRACK_END_GAME).exec().unwrap();
+    lua.load(ENABLE_TRACK_END_REJOIN).exec().unwrap();
+    lua.load("HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    let (ok, removed, again): (bool, String, String) = lua
+        .load(
+            "local s = SENT[1].proposal.streetProposal              local t = SENT[2] and SENT[2].proposal.streetProposal or {}              local e = t.edgesToAdd and t.edgesToAdd[1]              return HOOK.applied[1].ok == true, table.concat(s.nodesToRemove, ','),                  table.concat({ #(t.nodesToAdd or {}), tostring(e and e.comp.node0), tostring(e and e.comp.node1) }, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}
+{}", hook_log(&lua)));
+    assert!(ok, "the station is built: {}", hook_log(&lua));
+    assert_eq!(removed, "20", "the far end stays");
+    assert_eq!(
+        again, "0|21|30",
+        "the piece again, from its far end onto the station's track end"
+    );
+}
+
+/// As above, where the player could not pay for laying the piece again
+/// (not enough money left after the station): it is laid again for free,
+/// as the game's refresh of a construction is, as it always is: the piece
+/// was the player's already.
+#[test]
+fn a_construction_refused_on_a_track_end_lays_the_piece_again_for_free() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_ON_TRACK_END).exec().unwrap();
+    lua.load(format!(
+        "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         ACTION = assert(capture.construction({}))",
+        station_on_track_end()
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load(TRACK_END_GAME).exec().unwrap();
+    lua.load(ENABLE_TRACK_END_REJOIN).exec().unwrap();
+    lua.load("POOR = true HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    let (ok, free): (bool, String) = lua
+        .load(
+            "local b = SENT[2] \
+             return HOOK.applied[1].ok == true, tostring(b and b.context) .. '|' \
+                 .. tostring(b and #b.proposal.streetProposal.edgesToAdd)",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert!(ok, "{}", hook_log(&lua));
+    assert_eq!(free, "nil|1", "the piece again, with no player to pay");
+}
+
+/// As above, with other tracks' nodes ten metres right above (25) and
+/// below (19, an older one) where the piece ended: the piece at its own
+/// level is taken, and laid again onto the station's own track end the
+/// replay found, by its entity, not onto the node above it.
+#[test]
+fn a_construction_refused_on_a_track_end_joins_the_piece_at_its_own_level() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_ON_TRACK_END).exec().unwrap();
+    lua.load(
+        "NODES[25] = { x = 400, y = 0, z = 10 } TRACKS[25] = { 250 } \
+         NODES[19] = { x = 400, y = 0, z = -10 } TRACKS[19] = { 190 }",
+    )
+    .exec()
+    .unwrap();
+    lua.load(format!(
+        "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         ACTION = assert(capture.construction({}))",
+        station_on_track_end()
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load(TRACK_END_GAME).exec().unwrap();
+    lua.load(ENABLE_TRACK_END_REJOIN).exec().unwrap();
+    lua.load("HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    let (ok, onto): (bool, String) = lua
+        .load(
+            "local e = SENT[2] and SENT[2].proposal.streetProposal.edgesToAdd[1] \
+             return HOOK.applied[1].ok == true, tostring(e and e.comp.node1)",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert!(ok, "{}", hook_log(&lua));
+    assert_eq!(
+        onto, "30",
+        "the station's own track end, not the node above"
+    );
+    let removed: String = lua
+        .load("return table.concat(SENT[1].proposal.streetProposal.edgesToRemove, ',')")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        removed, "200",
+        "the piece at its own level, not the one below"
+    );
+}
+
+/// As above, with the piece's far end, node 21, a junction of track 199
+/// whose traffic light the player set: the build stays refused, nothing is
+/// taken away, and the setting stays.
+#[test]
+fn a_construction_refused_on_a_track_end_keeps_a_junction_set_by_hand() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_ON_TRACK_END).exec().unwrap();
+    lua.load(
+        "NODES[22] = { x = 500, y = 0, z = 0 } \
+         EDGES[199] = { node0 = 22, node1 = 21, type = 0, tangent0 = { x = -50, y = 0, z = 0 }, \
+             tangent1 = { x = -50, y = 0, z = 0 }, objects = {}, edgeDecorations = {}, \
+             roadTemplate = '::/track/standard.track_template', laneConfigs = { TRACK_LANE(false) } } \
+         TRACKS[21], TRACKS[22] = { 199, 200 }, { 199 } \
+         local c = api.type.BaseNodeConfig.new() c.trafficLightPreference = 1 CONFIGS[21] = c",
+    )
+    .exec()
+    .unwrap();
+    lua.load(format!(
+        "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         ACTION = assert(capture.construction({}))",
+        station_on_track_end()
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load(TRACK_END_GAME).exec().unwrap();
+    lua.load(ENABLE_TRACK_END_REJOIN).exec().unwrap();
+    lua.load("HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    let (ok, sent): (bool, usize) = lua
+        .load("return HOOK.applied[1].ok == true, #SENT")
+        .eval()
+        .unwrap();
+    assert!(!ok, "{}", hook_log(&lua));
+    assert_eq!(sent, 0, "nothing built, nothing taken away");
+    assert!(
+        hook_log(&lua).contains("(a junction set by hand where it joins)"),
+        "{}",
+        hook_log(&lua)
+    );
+}
+
+/// As above, with a signal on the track piece: it is not taken away, and
+/// the build is refused as the game refused it, in every game.
+#[test]
+fn a_construction_refused_on_a_track_end_with_a_signal_stays_refused() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_ON_TRACK_END).exec().unwrap();
+    lua.load("EDGES[200].objects = { { 900, 2 } }")
+        .exec()
+        .unwrap();
+    lua.load(format!(
+        "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         ACTION = assert(capture.construction({}))",
+        station_on_track_end()
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load(TRACK_END_GAME).exec().unwrap();
+    lua.load(ENABLE_TRACK_END_REJOIN).exec().unwrap();
+    lua.load("HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    let (ok, sent): (bool, usize) = lua
+        .load("return HOOK.applied[1].ok == true, #SENT")
+        .eval()
+        .unwrap();
+    assert!(!ok, "{}", hook_log(&lua));
+    assert_eq!(sent, 0, "nothing built, nothing taken away");
+    assert!(
+        hook_log(&lua).contains(
+            "the game refuses the build: Construction Not Possible (a stop or signal on a track it joins)"
+        ),
+        "{}",
+        hook_log(&lua)
+    );
+}
+
+/// A joined station can have more than the 64 junction settings an action
+/// carries, mostly for switches on track the station builds itself. Capture
+/// leaves those settings with the construction before validating the action.
+#[test]
+fn a_large_station_does_not_send_its_own_switch_settings() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    let joined = RAIL_STATION_OPEN.replace(
+        "{JOIN}",
+        ", { entity = -6, type = 1, comp = { node0 = -3, node1 = 8, type = 0, typeIndex = -1, \
+           tangent0 = { x = 50, y = 0, z = 0 }, tangent1 = { x = 50, y = 0, z = 0 }, \
+           roadTemplate = '::/track/standard.track_template', roadStyle = '' } }",
+    );
+    lua.load(format!("PROPOSAL = {joined}")).exec().unwrap();
+    let (valid, carried, links): (bool, usize, usize) = lua
+        .load(
+            r#"
+            local s = PROPOSAL.proposal
+            s.nodeConfigsToAdd = {}
+            for i = 1, 70 do
+                local node = -100 - i
+                s.addedNodes[#s.addedNodes + 1] = {
+                    entity = node,
+                    comp = { position = { x = 300 + i, y = 10, z = 0 } }
+                }
+                s.addedSegments[#s.addedSegments + 1] = {
+                    entity = -300 - i, type = 1,
+                    comp = {
+                        node0 = -3, node1 = node, type = 0, typeIndex = -1,
+                        tangent0 = { x = 1, y = 10, z = 0 },
+                        tangent1 = { x = 1, y = 10, z = 0 },
+                        roadTemplate = '::/track/standard.track_template', roadStyle = ''
+                    }
+                }
+                s.nodeConfigsToAdd[i] = {
+                    entity = node,
+                    comp = {
+                        trafficLightPreference = 0, doubleSlipSwitch = false,
+                        userModifiedTrafficLightStates = false,
+                        laneConnections = {}, crosswalks = {},
+                        trafficLightConfig = { trafficLightType = -1, states = {} }
+                    }
+                }
+            end
+            local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua')
+            local action, why = capture.construction(PROPOSAL)
+            if not action then error(why) end
+            local connection = action.BuildConstruction.connection
+            return schema_check(action), #connection.junctions, #connection.links
+            "#,
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(valid, "the action stays within its junction limit");
+    assert_eq!(carried, 0, "the station keeps its own switch settings");
+    assert!(
+        links >= 70,
+        "the captured network still represents the placement"
     );
 }
 
@@ -4988,6 +6338,103 @@ fn a_station_with_a_long_entrance_keeps_the_external_junction_only() {
         lua.load("return CONNECTED and HOOK.applied[1].ok")
             .eval::<bool>()
             .unwrap()
+    );
+}
+
+/// Each click handed over is bound to its ticket, and one that was not to
+/// nothing, so the street and track tools continue only from what the room
+/// builds for that very click (tpf3mp/toolchain.lua, crates/tpf3mp-hook/src/
+/// toolchain.rs).
+#[test]
+fn each_handed_over_click_tells_the_hook_its_ticket() {
+    let (lua, _script) = engine();
+    let bound: Vec<(i64, i64)> = lua
+        .load(format!(
+            "HOOK.room = true HOOK.clicks = 0
+             local bound = {{}}
+             tpf3mp_native.chainClick = function(click, ticket)
+                 bound[#bound + 1] = {{ click, ticket or -1 }}
+             end
+             tpf3mp_native.chainPoll = function() end
+             local function ask(proposal)
+                 SCRIPT.guiHandleEvent({{}}, nil, nil, '', 'constructionBuilder',
+                     'builder.proposalCreate', {{ proposal }})
+             end
+             SCRIPT.guiUpdate({{}}, nil, nil)
+             ask({CONSTRUCTION_PROPOSAL})
+             HOOK.clicks = 1 SCRIPT.guiUpdate({{}}, nil, nil)
+             local unnamed = {CONSTRUCTION_PROPOSAL} unnamed.toAdd[1].name = ''
+             ask(unnamed)
+             HOOK.clicks = 2 SCRIPT.guiUpdate({{}}, nil, nil)
+             return bound"
+        ))
+        .eval::<Vec<Vec<i64>>>()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)))
+        .into_iter()
+        .map(|b| (b[0], b[1]))
+        .collect();
+    assert_eq!(
+        bound,
+        [(0, 1), (1, -1)],
+        "click 0 with ticket 1; click 1 not handed over"
+    );
+}
+
+/// The GUI's half of the tools continuing: the edge the room built is
+/// checked in the GUI's own state, and its end node's edges counted.
+#[test]
+fn the_rooms_edge_is_checked_in_the_guis_state() {
+    let (lua, _script) = engine();
+    let results: Vec<String> = lua
+        .load(
+            "local toolchain = ug_require('tpf3mp_1::/scripts/tpf3mp/toolchain.lua')
+             local C = { BASE_EDGE = 'edge', BASE_EDGE_STREET = 'street', BASE_NODE = 'node' }
+             local comps = {
+                 edge = { [11] = { node0 = 2, node1 = 3 }, [12] = { node0 = 3, node1 = 4 },
+                          [13] = { node0 = 3, node1 = 5 } },
+                 street = { [11] = {}, [12] = {} },
+                 node = { [2] = { position = { x = 0, y = 0, z = 0 } },
+                          [3] = { position = { x = 1200.25, y = -340.5, z = 81.75 } } } }
+             local segments = { [3] = { 11 } }
+             local api = { type = { ComponentType = C }, engine = {
+                 getComponent = function(e, c) return comps[c][e] end,
+                 system = { streetSystem = {
+                     getNodeSegments = function(n) return segments[n] or {} end } } } }
+             local out = {}
+             local function say(...)
+                 local t = {}
+                 for i = 1, select('#', ...) do t[i] = tostring((select(i, ...))) end
+                 out[#out + 1] = table.concat(t, ' ')
+             end
+             -- The room's end 0.4 mm off; the new street alone at its node.
+             say(toolchain.check(api, 11, 2, 3, 1, 1200.2504, -340.5, 81.75))
+             -- Two streets and a track there.
+             segments[3] = { 11, 12, 13 }
+             say(toolchain.check(api, 11, 2, 3, 1, 1200.25, -340.5, 81.75))
+             -- Other nodes, no such edge, the node 2 cm away.
+             say(toolchain.check(api, 11, 3, 2, 0, 1200.25, -340.5, 81.75))
+             say(toolchain.check(api, 99, 2, 3, 1, 1200.25, -340.5, 81.75))
+             say(toolchain.check(api, 11, 2, 3, 1, 1200.27, -340.5, 81.75))
+             local seen = {}
+             local link = {
+                 chainPoll = function() return 11, 2, 3, 1, 1200.25, -340.5, 81.75 end,
+                 chainSeen = function(_, ...) seen[#seen + 1] = table.concat({ ... }, ' ') end }
+             toolchain.frame(link, api)
+             api.engine.getComponent = function() error('the game raised') end
+             toolchain.frame(link, api)
+             link.chainPoll = function() return nil end
+             toolchain.frame(link, api)
+             out[#out + 1] = table.concat(seen, ';')
+             return out",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        results,
+        ["1 0", "2 1", "nil", "nil", "nil", "11 2 1"],
+        "the edge as the room built it, with its end node's edges counted; another \
+         orientation, a missing edge or a node elsewhere is not; a frame that raises \
+         tells the hook nothing"
     );
 }
 
@@ -5334,6 +6781,61 @@ fn a_track_the_room_ordered_has_its_templates_track_distance() {
     assert_eq!(distances, ["5", "nil"], "{}", log(&lua));
 }
 
+/// A track laid onto a street's end starts where the track tool put it: on
+/// the street's tram lane, 2 m beside the end node, where alone the game
+/// joins the tram lane to the track (build 40420, schema 27). Built from the
+/// node's centre instead, the track ended in a buffer stop in every game of
+/// the room (2026-10-15). A link that names no end of its own ends on its
+/// vertex.
+#[test]
+fn a_track_onto_a_street_end_starts_on_the_tram_lane() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(
+        r#"
+        local get = api.res.streetTemplateRep.get
+        local find = api.res.streetTemplateRep.find
+        api.res.streetTemplateRep.find = function(name)
+            if name == '::/track/standard.street_template' then return 6 end
+            return find(name)
+        end
+        api.res.streetTemplateRep.get = function(id)
+            if id == 6 then
+                return { laneConfigs = { 'track lanes' }, streetStyle = '::/style/track.street_style' }
+            end
+            return get(id)
+        end
+        local apply = ug_require('tpf3mp_1::/scripts/tpf3mp/apply.lua')
+        local function onto(start)
+            local link = { from = 0, to = 1, tangent0 = { x = -50, y = -8, z = 0 },
+                tangent1 = { x = -50, y = -8, z = 0 }, structure = 'Ground', position0 = start }
+            local p = apply.proposalOf({ BuildTrack = { track = '::/track/standard.street_template',
+                catenary = false, polyline = { vertices = {
+                    { pos = { x = 0, y = 0, z = 0 }, resolve = { Node = 'Street' } },
+                    { pos = { x = -50, y = -10, z = 0 }, resolve = 'New' } },
+                links = { link }, removals = {} } } }, {})
+            local s = p.streetProposal.edgesToAdd[1].comp
+            return string.format("%d>%d %.3f,%.3f,%.3f %.3f,%.3f,%.3f", s.node0, s.node1,
+                s.position0.x, s.position0.y, s.position0.z, s.position1.x, s.position1.y, s.position1.z)
+        end
+        BESIDE = onto({ x = -0.315, y = -1.975, z = 0 })
+        CENTRE = onto(nil)
+        "#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}
+{}", log(&lua)));
+    let (beside, centre): (String, String) = lua.load("return BESIDE, CENTRE").eval().unwrap();
+    assert_eq!(
+        beside, "7>-2 -0.315,-1.975,0.000 -50.000,-10.000,0.000",
+        "on the street's node 7, starting on its tram lane"
+    );
+    assert_eq!(
+        centre, "7>-2 0.000,0.000,0.000 -50.000,-10.000,0.000",
+        "no end of its own: on the node"
+    );
+}
+
 #[test]
 fn a_roads_preview_is_the_proposal_its_build_would_send() {
     let (lua, _script) = engine();
@@ -5373,9 +6875,10 @@ fn the_game_script_builds_a_road_as_the_players_tool_would() {
          +e-1/0:7>-5 ::/street/town_small.street_template \
          +e-2/0:-5>-6 ::/street/town_small.street_template \
          +e-3/0:8>-5 ::/street/country.street_template \
-         +e-4/0:-5>9 ::/street/country.street_template -e100 -n -c8,9",
+         +e-4/0:-5>9 ::/street/country.street_template -e100 -n -c8,9 \
+         +j8{lanes 0 tram 0} +j9{lanes 0 tram 0}",
         "applied, and what was sent in the log: the split street's ends lose their lane \
-         configurations with it"
+         configurations with it, and get them back"
     );
     let built: String = lua
         .load(
@@ -5548,6 +7051,349 @@ fn street_precedence_survives_capture_and_room_replay() {
         local e = SENT[1].proposal.streetProposal.edgesToAdd[1].streetEdge
         assert(e.precedenceNode0 == 0 and e.precedenceNode1 == 2)
     "#)).exec().unwrap();
+}
+
+/// The level crossing types the game offers here (6 hidden), and the hook's
+/// reading of the street and track tools' toolbar type by click (`TOOL[n]`:
+/// `{ kind = }`, `{ kind = false, why = }` or `{ why = }`), taken once.
+const FAKE_TOOL_CROSSINGS: &str = r#"
+TYPES = { [3] = 'railroad_crossing/era_a_eu.rcr', [5] = 'railroad_crossing/era_c_eu.rcr', [6] = 'hidden.rcr' }
+api.res.railroadCrossingTypeRep = {
+    getName = function(i) return TYPES[i] end,
+    find = function(name) for i, n in pairs(TYPES) do if n == name then return i end end return -1 end,
+    isVisible = function(i) return i ~= 6 end,
+}
+TOOL = {}
+tpf3mp_native.toolCrossing = function(n)
+    local r = TOOL[n]
+    TOOL[n] = nil
+    if r == nil then return nil end
+    if r.why ~= nil then return r.kind, r.why end
+    return r.kind
+end
+"#;
+
+/// The street tool's click carries the level crossing type its toolbar
+/// picked, by its file, once `crossingTypes` is on; while it is off, the
+/// build goes without it, as before. With it on, a click read as picking
+/// none goes as it is; everything else stops the build and the player is
+/// told: a hook that cannot tell, and a type that does not read (forced,
+/// mixed, hidden, nothing kept).
+#[test]
+fn a_street_tool_click_carries_its_toolbars_crossing_type() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(FAKE_TOOL_CROSSINGS).exec().unwrap();
+    lua.load(format!(
+        r#"HOOK.room = true HOOK.clicks = 0
+        SCRIPT.guiUpdate({{}}, nil, nil)
+        function CLICK(read)
+            SCRIPT.guiHandleEvent({{}}, nil, nil, '', 'streetBuilder', 'builder.proposalCreate', {{ {STREET_PROPOSAL} }})
+            TOOL[HOOK.clicks] = read
+            HOOK.clicks = HOOK.clicks + 1
+            SCRIPT.guiUpdate({{}}, nil, nil)
+        end
+        ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossingTypes = false
+        CLICK({{ kind = 5 }})
+        ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossingTypes = true
+        CLICK({{ kind = 5 }})
+        CLICK({{ kind = false }})
+        CLICK({{ kind = false, why = 'the profile does not find the maps' }})
+        CLICK({{ why = "a build that forces a level crossing's type" }})
+        CLICK({{ kind = 6 }})
+        CLICK(nil)
+        NOTICE = HOOK.notes and HOOK.notes['tpf3mp.notice']
+        tpf3mp_native.toolCrossing = nil
+        CLICK(nil)"#
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let sent: Vec<String> = lua
+        .load(
+            "local out = {} \
+             for i, c in ipairs(HOOK.commands) do out[i] = tostring(c.BuildRoad.crossing_type) end \
+             return out",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(
+        sent,
+        ["nil", "railroad_crossing/era_c_eu.rcr", "nil"],
+        "{}",
+        log(&lua)
+    );
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    assert!(
+        logged.iter().any(|l| l.contains(
+            "the build's level crossing type is left out: crossingTypes awaits two-player game acceptance"
+        )),
+        "{logged:?}"
+    );
+    for why in [
+        "the profile does not find the maps",
+        "a build that forces a level crossing's type",
+        "the hook kept nothing for the click",
+        "the hook does not read the tools' level crossing type",
+    ] {
+        let line = format!("stopped a build the room cannot carry: {why}");
+        assert!(
+            logged.iter().any(|l| l.contains(&line)),
+            "{line}: {logged:?}"
+        );
+    }
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.contains("crossing type hidden.rcr is not offered here")),
+        "{logged:?}"
+    );
+    assert_eq!(
+        lua.load("return NOTICE").eval::<String>().unwrap(),
+        "4\tNot in multiplayer yet: a level crossing type picked in the build tool \
+         (the hook kept nothing for the click)"
+    );
+}
+
+/// Every game lays a track across the street 8-9 with the toolbar's level
+/// crossing type as the tool maps it, each vertex's node to -2 - type
+/// (preferred: a crossing there already keeps its own), reads the crossing
+/// laid back and says when the game did not take the type; a type this game
+/// does not offer is refused before anything is sent, alike in every game.
+#[test]
+fn every_game_lays_a_new_crossing_of_the_toolbars_type() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(FAKE_TOOL_CROSSINGS).exec().unwrap();
+    lua.load(
+        r#"
+        ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossingTypes = true
+        local find, get = api.res.streetTemplateRep.find, api.res.streetTemplateRep.get
+        api.res.streetTemplateRep.find = function(name)
+            if name == '::/track/standard.street_template' then return 6 end
+            return find(name)
+        end
+        api.res.streetTemplateRep.get = function(id)
+            if id == 6 then return { laneConfigs = { 'track lanes' }, streetStyle = '::/style/track.street_style' } end
+            return get(id)
+        end
+        api.type.ComponentType.RAILROAD_CROSSING = 14
+        CROSSINGS = {}
+        local component = api.engine.getComponent
+        api.engine.getComponent = function(e, kind)
+            if kind == 14 then return CROSSINGS[e] end
+            return component(e, kind)
+        end
+        api.engine.system.railRoadCrossingSystem = { getRailroadCrossingForNode = function(node)
+            for e, c in pairs(CROSSINGS) do
+                for _, n in ipairs(c.nodes) do if n == node then return e end end
+            end
+            return -1
+        end }
+        -- The game's build: the street split at (50, 0) by node 50, the
+        -- crossing 800 laid there of the type LAID (nil: the map's).
+        local send = api.cmd.sendCommand
+        api.cmd.sendCommand = function(command, callback)
+            local map = command.proposal and command.proposal.streetProposal.node2rcType
+            if map then
+                NODES[50] = { x = 50, y = 0, z = 0 }
+                EDGES[102] = { node0 = 8, node1 = 50, objects = {} }
+                EDGES[103] = { node0 = 50, node1 = 9, objects = {} }
+                STREETS[8], STREETS[9], STREETS[50] = { 102 }, { 103 }, { 102, 103 }
+                CROSSINGS[800] = { nodes = { 50 }, typeIndex = LAID or (-2 - map[-6]) }
+            end
+            return send(command, callback)
+        end
+        function TRACK(crossing_type)
+            return { BuildTrack = { track = '::/track/standard.street_template', catenary = false,
+                crossing_type = crossing_type, polyline = { vertices = {
+                    { pos = { x = 20, y = 0, z = 0 }, resolve = 'New' },
+                    { pos = { x = 50, y = 0, z = 0 }, resolve = { Split = { network = 'Street',
+                        ends = { a = { x = 50, y = -40, z = 0 }, b = { x = 50, y = 40, z = 0 } } } } },
+                    { pos = { x = 80, y = 0, z = 0 }, resolve = 'New' } },
+                links = {
+                    { from = 0, to = 1, tangent0 = { x = 30, y = 0, z = 0 }, tangent1 = { x = 30, y = 0, z = 0 },
+                      structure = 'Ground' },
+                    { from = 1, to = 2, tangent0 = { x = 30, y = 0, z = 0 }, tangent1 = { x = 30, y = 0, z = 0 },
+                      structure = 'Ground' } },
+                removals = {} } } }
+        end
+        HOOK.batch = { TRACK('railroad_crossing/era_c_eu.rcr') }
+        UPDATE({}, STATE, 0.2)
+        "#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    let map: String = lua
+        .load(
+            "local m = SENT[1].proposal.streetProposal.node2rcType local keys = {} \
+             for k, v in pairs(m) do keys[#keys + 1] = k .. '=' .. v end \
+             table.sort(keys) return table.concat(keys, ' ')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert_eq!(
+        map, "-5=-7 -6=-7 -7=-7",
+        "every vertex's node, the split's included, to -2 - 5"
+    );
+    let applied: String = lua
+        .load("return tostring(HOOK.applied[1].ok) .. ' ' .. tostring(HOOK.applied[1].why)")
+        .eval()
+        .unwrap();
+    assert_eq!(applied, "true nil", "{}", hook_log(&lua));
+    assert!(
+        !hook_log(&lua).contains("took type"),
+        "the crossing laid is of the type: {}",
+        hook_log(&lua)
+    );
+
+    // A game that did not take the map: said, the build applied alike.
+    lua.load(
+        "LAID = 3 NODES[50] = nil EDGES[102], EDGES[103] = nil, nil CROSSINGS = {} \
+         STREETS[8], STREETS[9], STREETS[50] = { 100 }, { 100 }, nil \
+         HOOK.batch = { TRACK('railroad_crossing/era_c_eu.rcr') } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert!(
+        hook_log(&lua).contains(
+            "level crossing 800 at vertex 2 took type 3, not 5 (the toolbar's railroad_crossing/era_c_eu.rcr is 5)"
+        ),
+        "{}",
+        hook_log(&lua)
+    );
+
+    // A type this game does not offer, and the channel off: refused, nothing sent.
+    lua.load(
+        "SENT = {} HOOK.applied = {} \
+         HOOK.batch = { TRACK('hidden.rcr') } UPDATE({}, STATE, 0.2) \
+         ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossingTypes = false \
+         HOOK.batch = { TRACK('railroad_crossing/era_c_eu.rcr') } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    let refused: Vec<String> = lua
+        .load(
+            "local out = {} for i, a in ipairs(HOOK.applied) do \
+             out[i] = tostring(a.ok) .. ' ' .. tostring(a.why) end return out",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(
+        refused,
+        [
+            "false crossing type hidden.rcr is not offered here",
+            "false crossingTypes awaits two-player game acceptance"
+        ]
+    );
+    assert_eq!(lua.load("return #SENT").eval::<usize>().unwrap(), 0);
+}
+
+/// The track tool's proposal for a track from (20, 0) to (80, 0) across the
+/// street 8-9, as the tool hands it to game scripts: the crossing's node -1
+/// new, the street laid again as its two halves to it, edge 100 removed.
+const TRACK_PROPOSAL: &str = "{ toAdd = {}, toRemove = {}, proposal = { \
+    addedNodes = { { entity = -1, comp = { position = { x = 50, y = 0, z = 0 } } }, \
+                   { entity = -2, comp = { position = { x = 20, y = 0, z = 0 } } }, \
+                   { entity = -3, comp = { position = { x = 80, y = 0, z = 0 } } } }, \
+    addedSegments = { \
+        { entity = -4, type = 1, comp = { node0 = -2, node1 = -1, type = 0, typeIndex = -1, \
+          tangent0 = { x = 30, y = 0, z = 0 }, tangent1 = { x = 30, y = 0, z = 0 }, \
+          roadTemplate = '::/track/standard.street_template', roadStyle = '' } }, \
+        { entity = -5, type = 1, comp = { node0 = -1, node1 = -3, type = 0, typeIndex = -1, \
+          tangent0 = { x = 30, y = 0, z = 0 }, tangent1 = { x = 30, y = 0, z = 0 }, \
+          roadTemplate = '::/track/standard.street_template', roadStyle = '' } }, \
+        { entity = -6, type = 0, comp = { node0 = 9, node1 = -1, type = 0, typeIndex = -1, \
+          tangent0 = { x = 0, y = -40, z = 0 }, tangent1 = { x = 0, y = -40, z = 0 }, \
+          roadTemplate = '::/street/country.street_template', roadStyle = '' } }, \
+        { entity = -7, type = 0, comp = { node0 = -1, node1 = 8, type = 0, typeIndex = -1, \
+          tangent0 = { x = 0, y = -40, z = 0 }, tangent1 = { x = 0, y = -40, z = 0 }, \
+          roadTemplate = '::/street/country.street_template', roadStyle = '' } } }, \
+    removedSegments = { { entity = 100, type = 0, comp = { node0 = 9, node1 = 8 } } }, \
+    removedNodes = {}, edgeObjectsToAdd = {} } }";
+
+/// A track the tool laid across a street, from the tool's own proposal
+/// through the room to every game's build: the toolbar's type goes with it,
+/// every game maps the build's nodes to it, and the crossing laid at the
+/// new node where the street's halves meet the track is read back.
+#[test]
+fn a_track_the_tool_laid_across_a_street_takes_its_toolbars_crossing_type() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(FAKE_TOOL_CROSSINGS).exec().unwrap();
+    lua.load(format!(
+        r#"
+        ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossingTypes = true
+        local find, get = api.res.streetTemplateRep.find, api.res.streetTemplateRep.get
+        api.res.streetTemplateRep.find = function(name)
+            if name == '::/track/standard.street_template' then return 6 end
+            return find(name)
+        end
+        api.res.streetTemplateRep.get = function(id)
+            if id == 6 then return {{ laneConfigs = {{ 'track lanes' }}, streetStyle = '::/style/track.street_style' }} end
+            return get(id)
+        end
+        api.type.ComponentType.RAILROAD_CROSSING = 14
+        CROSSINGS = {{}}
+        local component = api.engine.getComponent
+        api.engine.getComponent = function(e, kind)
+            if kind == 14 then return CROSSINGS[e] end
+            return component(e, kind)
+        end
+        api.engine.system.railRoadCrossingSystem = {{ getRailroadCrossingForNode = function(node)
+            for e, c in pairs(CROSSINGS) do
+                for _, n in ipairs(c.nodes) do if n == node then return e end end
+            end
+            return -1
+        end }}
+        -- The game's build: the street's halves meet at node 50, a crossing
+        -- of the type its node is mapped to.
+        local send = api.cmd.sendCommand
+        api.cmd.sendCommand = function(command, callback)
+            local p = command.proposal and command.proposal.streetProposal
+            if p and p.node2rcType then
+                MAP = p.node2rcType
+                NODES[50] = {{ x = 50, y = 0, z = 0 }}
+                EDGES[102] = {{ node0 = 50, node1 = 8, objects = {{}} }}
+                EDGES[103] = {{ node0 = 9, node1 = 50, objects = {{}} }}
+                STREETS[8], STREETS[9], STREETS[50] = {{ 102 }}, {{ 103 }}, {{ 102, 103 }}
+                local laid = -1
+                for _, v in pairs(MAP) do laid = -2 - v end
+                CROSSINGS[800] = {{ nodes = {{ 50 }}, typeIndex = laid }}
+            end
+            return send(command, callback)
+        end
+        HOOK.room = true HOOK.clicks = 0
+        SCRIPT.guiUpdate({{}}, nil, nil)
+        SCRIPT.guiHandleEvent({{}}, nil, nil, '', 'trackBuilder', 'builder.proposalCreate', {{ {TRACK_PROPOSAL} }})
+        TOOL[0] = {{ kind = 5 }}
+        HOOK.clicks = 1 SCRIPT.guiUpdate({{}}, nil, nil)
+        HOOK.batch = {{ (assert(HOOK.commands[1], 'the click went to the room')) }}
+        UPDATE({{}}, STATE, 0.2)
+        "#
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    let (handed, map, crossing): (String, String, String) = lua
+        .load(
+            "local b = HOOK.commands[1].BuildTrack \
+             local keys = {} for k, v in pairs(MAP) do keys[#keys + 1] = k .. '=' .. v end \
+             table.sort(keys) \
+             return tostring(b.crossing_type), table.concat(keys, ' '), \
+                 tostring(CROSSINGS[800].typeIndex) .. ' ' .. tostring(HOOK.applied[1].ok)",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert_eq!(handed, "railroad_crossing/era_c_eu.rcr");
+    assert_eq!(
+        map, "-5=-7 -6=-7 -7=-7 8=-7 9=-7",
+        "every vertex's node, the new ones by their ids and the street's ends by theirs"
+    );
+    assert_eq!(crossing, "5 true", "{}", hook_log(&lua));
+    let logged = hook_log(&lua);
+    assert!(
+        !logged.contains("took type") && !logged.contains("no level crossing"),
+        "the crossing at the new node read back of the type: {logged}"
+    );
 }
 
 /// A mod's build from its game script's GUI half, as Parallel Roads sends
@@ -5736,6 +7582,224 @@ fn the_game_script_rebuilds_a_street_through_a_new_junction() {
     );
 }
 
+/// The engine's octree as the fake network holds it: each edge where its
+/// end nodes are, found by any box that reaches its span (twice, as the
+/// game may name one more than once). `OCTREE` 'none' leaves the game
+/// without one, 'empty' has one that holds nothing yet (a network built
+/// earlier in the same update). WHOLE counts the reads of a whole network.
+const FAKE_OCTREE: &str = r#"
+api.type.Box3 = { new = function(a, b) return { min = a, max = b } end }
+QUERIES, WHOLE = 0, 0
+if OCTREE ~= 'none' then
+    api.engine.system.octreeSystem = { findIntersectingEntities = function(box, visit)
+        QUERIES = QUERIES + 1
+        if OCTREE == 'empty' then return end
+        for e, c in pairs(EDGES) do
+            local a, b = NODES[c.node0], NODES[c.node1]
+            if a and b and math.max(a.x, b.x) >= box.min.x and math.min(a.x, b.x) <= box.max.x
+                and math.max(a.y, b.y) >= box.min.y and math.min(a.y, b.y) <= box.max.y then
+                visit(e)
+                visit(e)
+            end
+        end
+    end }
+end
+local street = api.engine.system.streetSystem
+local streets, tracks = street.getNode2StreetEdgeMap, street.getNode2TrackEdgeMap
+street.getNode2StreetEdgeMap = function() WHOLE = WHOLE + 1 return streets() end
+street.getNode2TrackEdgeMap = function() WHOLE = WHOLE + 1 return tracks() end
+"#;
+
+/// A street rebuilt through a new junction keeps the settings of the
+/// junctions at the ends of the edges it removes, and reads only the edges
+/// at the nodes those settings name, never every edge of the world
+/// (2026-10-16: ~600 ms of every such build in a late game, a street
+/// upgrade included). What it builds is what reading every edge built; an
+/// octree changes nothing in a build the room applies.
+#[test]
+fn a_rebuilt_street_reads_only_the_edges_its_junctions_name() {
+    let mut built = Vec::new();
+    for octree in ["none", "spatial"] {
+        let (lua, _script) = engine();
+        lua.load(FAKE_NETWORK).exec().unwrap();
+        // The country street through node 11: edges 100 (8-11) and 102
+        // (11-9); a town street 103 on from 9 to 12. The junction at 9 turns
+        // from the removed 102 onto 103, which stays. A street 200 far away.
+        lua.load(
+            "NODES[11] = { x = 50, y = 0, z = 0 } NODES[12] = { x = 50, y = 90, z = 0 } \
+             NODES[20] = { x = 900, y = 900, z = 0 } NODES[21] = { x = 990, y = 900, z = 0 } \
+             EDGES[100].node1 = 11 \
+             EDGES[102] = { node0 = 11, node1 = 9, tangent0 = { x = 0, y = 40, z = 0 }, \
+                            tangent1 = { x = 0, y = 40, z = 0 }, objects = {}, laneConfigs = { 'country lanes' } } \
+             EDGES[103] = { node0 = 9, node1 = 12, tangent0 = { x = 0, y = 50, z = 0 }, \
+                            tangent1 = { x = 0, y = 50, z = 0 }, objects = {}, laneConfigs = { 'town lanes' } } \
+             EDGES[200] = { node0 = 20, node1 = 21, tangent0 = { x = 90, y = 0, z = 0 }, \
+                            tangent1 = { x = 90, y = 0, z = 0 }, objects = {}, laneConfigs = { 'town lanes' } } \
+             STREETS[8], STREETS[11], STREETS[9], STREETS[12] = { 100 }, { 100, 102 }, { 102, 103 }, { 103 } \
+             STREETS[20], STREETS[21] = { 200 }, { 200 } \
+             CONFIGS[9] = { laneConnections = { { segment0 = 102, lane0 = 0, segment1 = 103, lane1 = 0, \
+                 withRoad = true, withTram = false } }, crosswalks = { 103 }, trafficLightPreference = 1, \
+                 trafficLightConfig = { trafficLightType = -1, states = {} }, doubleSlipSwitch = false, \
+                 userModifiedTrafficLightStates = false } \
+             FAR_READS = 0 \
+             local get = api.engine.getComponent \
+             api.engine.getComponent = function(id, kind) \
+                 if id == 200 and kind == api.type.ComponentType.BASE_EDGE then FAR_READS = FAR_READS + 1 end \
+                 return get(id, kind) \
+             end",
+        )
+        .exec()
+        .unwrap();
+        lua.globals().set("OCTREE", octree).unwrap();
+        lua.load(FAKE_OCTREE).exec().unwrap();
+        lua.load(format!(
+            "HOOK.batch = {{ {JUNCTION} }} UPDATE({{}}, STATE, 0.2)"
+        ))
+        .exec()
+        .unwrap();
+        let (shape, far): (String, u32) = lua
+            .load(
+                "local p = SENT[1].proposal.streetProposal
+                 local out = { #p.nodesToAdd, table.concat(p.edgesToRemove, ','), table.concat(p.nodesToRemove, ','),
+                               table.concat(p.nodeConfigsToRemove, ',') }
+                 for _, e in ipairs(p.edgesToAdd) do
+                     out[#out + 1] = e.entity .. ':' .. e.comp.node0 .. '>' .. e.comp.node1
+                 end
+                 for _, n in ipairs(p.nodeConfigsToAdd or {}) do
+                     local turns = {}
+                     for _, t in ipairs(n.comp.laneConnections) do turns[#turns + 1] = t.segment0 .. '>' .. t.segment1 end
+                     out[#out + 1] = 'config ' .. n.entity .. ' ' .. table.concat(turns, ',')
+                         .. ' walk ' .. table.concat(n.comp.crosswalks, ',')
+                 end
+                 return table.concat(out, ' | '), FAR_READS",
+            )
+            .eval()
+            .unwrap_or_else(|error| panic!("{octree}: {error}\n{}", hook_log(&lua)));
+        assert_eq!(far, 0, "{octree}: the far street's edge was read");
+        built.push(shape);
+    }
+    assert_eq!(
+        built[0],
+        "1 | 100,102 | 11 | 8,9 | -1:7>-4 | -2:8>-4 | -3:-4>9 | config 8  walk  | config 9 -3>103 walk 103",
+        "the junction at 9 turns from the new edge onto the street that stays"
+    );
+    assert_eq!(built[1], built[0], "an octree changes nothing in a build");
+}
+
+/// Two edges a junction could mean by the same ends are still refused,
+/// though only the edges near them are read.
+#[test]
+fn a_junction_edge_named_twice_is_still_refused() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(
+        "NODES[11] = { x = 50, y = 0, z = 0 } NODES[12] = { x = 50, y = 90, z = 0 } \
+         EDGES[100].node1 = 11 \
+         EDGES[102] = { node0 = 11, node1 = 9, tangent0 = { x = 0, y = 40, z = 0 }, \
+                        tangent1 = { x = 0, y = 40, z = 0 }, objects = {}, laneConfigs = { 'country lanes' } } \
+         EDGES[103] = { node0 = 9, node1 = 12, tangent0 = { x = 0, y = 50, z = 0 }, \
+                        tangent1 = { x = 0, y = 50, z = 0 }, objects = {}, laneConfigs = { 'town lanes' } } \
+         EDGES[104] = { node0 = 12, node1 = 9, tangent0 = { x = 0, y = -50, z = 0 }, \
+                        tangent1 = { x = 0, y = -50, z = 0 }, objects = {}, laneConfigs = { 'town lanes' } } \
+         STREETS[8], STREETS[11], STREETS[9], STREETS[12] = { 100 }, { 100, 102 }, { 102, 103, 104 }, { 103, 104 } \
+         CONFIGS[9] = { laneConnections = { { segment0 = 102, lane0 = 0, segment1 = 103, lane1 = 0, \
+             withRoad = true, withTram = false } }, crosswalks = {}, trafficLightPreference = 1, \
+             trafficLightConfig = { trafficLightType = -1, states = {} }, doubleSlipSwitch = false, \
+             userModifiedTrafficLightStates = false }",
+    )
+    .exec()
+    .unwrap();
+    lua.load(format!(
+        "HOOK.batch = {{ {JUNCTION} }} UPDATE({{}}, STATE, 0.2)"
+    ))
+    .exec()
+    .unwrap();
+    assert_eq!(lua.load("return #SENT").eval::<usize>().unwrap(), 0);
+    let log = hook_log(&lua);
+    assert!(log.contains("ambiguous junction edge"), "{log}");
+}
+
+/// A preview of another player's road finds its nodes near them through
+/// the engine's octree, not by reading the whole network, and makes the
+/// same proposal (2026-10-16: 130-150 ms a preview in the GUI of a late
+/// game, several a second). Where the octree holds nothing near (a road
+/// built a moment ago) it reads the whole network, as before.
+#[test]
+fn a_road_preview_finds_its_nodes_near_them() {
+    let mut made = Vec::new();
+    for octree in ["none", "spatial", "empty"] {
+        let (lua, _script) = engine();
+        lua.load(FAKE_NETWORK).exec().unwrap();
+        lua.globals().set("OCTREE", octree).unwrap();
+        lua.load(FAKE_OCTREE).exec().unwrap();
+        let (shape, reads): (String, u32) = lua
+            .load(format!(
+                "local apply = ug_require('tpf3mp_1::/scripts/tpf3mp/apply.lua')
+                 local proposal = assert(apply.proposalOf({ROAD}, {{}}))
+                 local p = proposal.streetProposal
+                 local out = {{ table.concat(p.edgesToRemove, ',') }}
+                 for _, e in ipairs(p.edgesToAdd) do
+                     out[#out + 1] = e.entity .. ':' .. e.comp.node0 .. '>' .. e.comp.node1
+                 end
+                 return table.concat(out, ' | '), WHOLE"
+            ))
+            .eval()
+            .unwrap_or_else(|error| panic!("{octree}: {error}"));
+        made.push(shape);
+        assert_eq!(
+            reads == 0,
+            octree == "spatial",
+            "{octree}: {reads} whole reads"
+        );
+    }
+    assert_eq!(made[1], made[0]);
+    assert_eq!(made[2], made[0]);
+}
+
+/// An applied road reads its nodes from the whole network, as it always
+/// did, whatever the octree holds: one the octree missed could make one
+/// game choose another node than another game.
+#[test]
+fn an_applied_road_reads_the_whole_network() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.globals().set("OCTREE", "spatial").unwrap();
+    lua.load(FAKE_OCTREE).exec().unwrap();
+    lua.load(format!(
+        "HOOK.batch = {{ {ROAD} }} UPDATE({{}}, STATE, 0.2)"
+    ))
+    .exec()
+    .unwrap();
+    let (sent, queries, whole): (usize, u32, u32) =
+        lua.load("return #SENT, QUERIES, WHOLE").eval().unwrap();
+    assert_eq!(sent, 1, "{}", hook_log(&lua));
+    assert_eq!(queries, 0, "the octree is not asked");
+    assert!(whole > 0);
+}
+
+/// An applied action's cost by part is said in the log once it is slow:
+/// for finding what makes another player's builds stutter here (2026-10-16).
+#[test]
+fn a_slow_action_says_what_it_cost() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(format!(
+        "local apply = ug_require('tpf3mp_1::/scripts/tpf3mp/apply.lua') \
+         apply.SLOW_MS = 0 \
+         HOOK.batch = {{ {ROAD} }} UPDATE({{}}, STATE, 0.2)"
+    ))
+    .exec()
+    .unwrap();
+    let log = hook_log(&lua);
+    let line = log
+        .lines()
+        .find(|l| l.contains("applying BuildRoad took"))
+        .unwrap_or_else(|| panic!("{log}"));
+    for part in ["nodes Street 1x", "junctions 1x", "commands 1x"] {
+        assert!(line.contains(part), "{part}: {line}");
+    }
+}
+
 #[test]
 fn a_street_build_the_room_cannot_carry_says_why() {
     let (lua, _script) = engine();
@@ -5887,6 +7951,38 @@ fn the_registry_names_vehicles_in_the_order_they_came_and_never_again() {
 }
 
 #[test]
+fn an_unreadable_component_does_not_retire_a_rooms_canonical_id() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_FLEET).exec().unwrap();
+    let named: String = lua
+        .load(
+            "local registry = ug_require('tpf3mp_1::/scripts/tpf3mp/registry.lua')
+             local reg = registry.sync(nil)
+             local old = api.engine.getComponent
+             LINES = {} -- the line system temporarily omits an existing line
+             api.engine.getComponent = function(e, kind)
+                 if e == 301 and kind == api.type.ComponentType.LINE then error('component unreadable') end
+                 return old(e, kind)
+             end
+             reg = registry.sync(reg)
+             local during = tostring(registry.id(reg, 'lines', 301))
+             api.engine.getComponent = old
+             LINES = { 301 }
+             reg = registry.sync(reg)
+             local recovered = tostring(registry.id(reg, 'lines', 301))
+             LINES = {}
+             reg = registry.sync(reg)
+             return table.concat({ during, recovered, tostring(registry.id(reg, 'lines', 301)) }, ',')",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(
+        named, "0,0,nil",
+        "an unreadable entity keeps its id until absence is established"
+    );
+}
+
+#[test]
 fn the_game_script_buys_the_vehicle_and_tells_the_buyer_which() {
     let (lua, _script) = engine();
     lua.load(FAKE_FLEET).exec().unwrap();
@@ -5919,14 +8015,18 @@ fn the_game_script_buys_the_vehicle_and_tells_the_buyer_which() {
         .load("return table.concat(HOOK.logged, '\\n')")
         .eval()
         .unwrap();
-    for phase in ["before-assign", "after-assign"] {
-        assert!(
-            assignment_log.contains(&format!(
-                "vehicle-action {phase} vehicle-2 line-0 first=1 time=777000 entity=500"
-            )),
-            "missing assignment boundary: {assignment_log}"
-        );
-    }
+    assert!(
+        assignment_log.contains(
+            "assign-vehicle action_index=2 vehicle=2 native=500 line=0 native_line=301 first=1 carrier=none models=none mode=none owner=unavailable line_owner=unavailable outcome=applied"
+        ),
+        "missing assignment boundary: {assignment_log}"
+    );
+    assert!(
+        assignment_log.contains(
+            "buy-vehicle action_index=1 outcome=applied models=vehicle/bus/city.mdl native=500 canonical=2"
+        ),
+        "missing purchase boundary: {assignment_log}"
+    );
     let applied: String = lua
         .load(
             "local out = {} for _, a in ipairs(HOOK.applied) do \
@@ -6933,6 +9033,273 @@ fn the_bulldozer_removes_a_construction_or_edges_in_every_game() {
     assert_eq!(why, "removing an edge with a stop or signal on it");
 }
 
+/// Two tracks stacked over each other along the same line, the older one
+/// on the ground (nodes 20 and 21, edge 200) and an elevated one 10 m above
+/// it (nodes 30 and 31, edge 300); the street 8-9 (edge 100) with a street
+/// 10 m above it (nodes 40 and 41, edge 102). The lower ones have the lower
+/// entity ids, which a match by horizontal place alone used to choose.
+const STACKED: &str = "
+NODES[20] = { x = 0, y = 0, z = 0 } NODES[21] = { x = 100, y = 0, z = 0 }
+NODES[30] = { x = 0, y = 0, z = 10 } NODES[31] = { x = 100, y = 0, z = 10 }
+EDGES[200] = { node0 = 20, node1 = 21, tangent0 = { x = 100, y = 0, z = 0 },
+               tangent1 = { x = 100, y = 0, z = 0 }, objects = {} }
+EDGES[300] = { node0 = 30, node1 = 31, tangent0 = { x = 100, y = 0, z = 0 },
+               tangent1 = { x = 100, y = 0, z = 0 }, objects = {} }
+TRACKS = { [20] = { 200 }, [21] = { 200 }, [30] = { 300 }, [31] = { 300 } }
+local streets = api.engine.system.streetSystem
+streets.getNode2TrackEdgeMap = function()
+    local m = {}
+    for node, edges in pairs(TRACKS) do m[node] = edges end
+    return m
+end
+streets.getNodeTrackSegments = function(node) return TRACKS[node] or {} end
+NODES[40] = { x = 50, y = -40, z = 10 } NODES[41] = { x = 50, y = 40, z = 10 }
+EDGES[102] = { node0 = 40, node1 = 41, tangent0 = { x = 0, y = 80, z = 0 }, tangent1 = { x = 0, y = 80, z = 0 },
+               objects = {}, roadTemplate = '::/street/country.street_template', laneConfigs = { 'country lanes' } }
+STREETS[40] = { 102 } STREETS[41] = { 102 }
+api.engine.util.proposal = {
+    makeSegmentsRemoveProposal = function(ids) return { removesEdges = table.concat(ids, ',') } end }
+";
+
+/// A track or street named by its ends is the one at their height: with an
+/// elevated track over an older one along the same line, a bulldoze or a
+/// split of either is of that one in every game, never of the one above or
+/// below it (2026-10-16: a match by horizontal place alone took the lower,
+/// the lower entity id). Ends at neither height name nothing, and two
+/// nodes as near refuse the action rather than choosing between them.
+#[test]
+fn a_track_over_another_is_named_by_its_height() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STACKED).exec().unwrap();
+    // A bulldoze of the ends at `z`, as every game applies it: the edges it
+    // removes, or why it removes none.
+    let bulldoze = |setup: &str, z: &str| -> String {
+        lua.load(format!(
+            "{setup} SENT = {{}} HOOK.logged = {{}} \
+             HOOK.batch = {{ {{ Bulldoze = {{ Edges = {{ network = 'Track', buildings = {{}}, \
+                 edges = {{ {{ a = {{ x = 100, y = 0, z = {z} }}, b = {{ x = 0, y = 0, z = {z} }} }} }} }} }} }} }} \
+             UPDATE({{}}, STATE, 0.2)"
+        ))
+        .exec()
+        .unwrap_or_else(|error| panic!("{error}"));
+        lua.load(
+            "if #SENT > 0 then return SENT[1].proposal.removesEdges end \
+             return 'refused: ' .. table.concat(HOOK.logged, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"))
+    };
+    assert_eq!(bulldoze("", "10"), "300", "the elevated track");
+    assert_eq!(bulldoze("", "0"), "200", "the track on the ground");
+    let between = bulldoze("", "5");
+    assert!(
+        between.starts_with("refused") && between.contains("no Track edge to remove (1)"),
+        "{between}"
+    );
+    let twice = bulldoze(
+        "NODES[32] = { x = 0, y = 0, z = 10 } TRACKS[32] = { 300 }",
+        "10",
+    );
+    assert!(
+        twice.starts_with("refused") && twice.contains("two nodes as near (0.000, 0.000, 10.000)"),
+        "{twice}"
+    );
+
+    // A road split onto the street 10 m up splits that street, not the one
+    // below it; onto the street below, that one.
+    let split = |z: &str| -> String {
+        let road = ROAD
+            .replace(
+                "{ pos = { x = 50, y = 0, z = 0 }",
+                &format!("{{ pos = {{ x = 50, y = 0, z = {z} }}"),
+            )
+            .replace(
+                "a = { x = 50, y = 40, z = 0 }, b = { x = 50, y = -40, z = 0 }",
+                &format!("a = {{ x = 50, y = 40, z = {z} }}, b = {{ x = 50, y = -40, z = {z} }}"),
+            );
+        lua.load(format!(
+            "NODES[32] = nil TRACKS[32] = nil \
+             local apply = ug_require('tpf3mp_1::/scripts/tpf3mp/apply.lua') \
+             local p, why = apply.proposalOf({road}, {{}}) \
+             if p == nil then return 'refused: ' .. tostring(why) end \
+             return table.concat(p.streetProposal.edgesToRemove, ',')"
+        ))
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"))
+    };
+    assert_eq!(split("10"), "102", "the street above");
+    assert_eq!(split("0"), "100", "the street below");
+}
+
+/// Tracks with signals on them, as the bulldozer removes them (build 40420,
+/// 2026-10-16: "1 Signal Will Be Removed", refused in a room before): the
+/// edges go to the room, and every game removes them with exactly the
+/// signals on them, whether its own proposal lists them or not.
+#[test]
+fn the_bulldozer_removes_tracks_with_their_signals_in_every_game() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(FAKE_STOPS).exec().unwrap();
+    lua.load(
+        "NODES[20] = { x = 200, y = 0, z = 0 } NODES[21] = { x = 300, y = 0, z = 0 } \
+         NODES[22] = { x = 400, y = 0, z = 0 } \
+         local t = { x = 100, y = 0, z = 0 } \
+         EDGES[200] = { node0 = 20, node1 = 21, tangent0 = t, tangent1 = t, objects = { { 700, 2 } } } \
+         EDGES[201] = { node0 = 21, node1 = 22, tangent0 = t, tangent1 = t, objects = { { 701, 2 }, { 702, 2 } } } \
+         TRACKS = { [20] = { 200 }, [21] = { 200, 201 }, [22] = { 201 } } \
+         local streets = api.engine.system.streetSystem \
+         streets.getNode2TrackEdgeMap = function() return TRACKS end \
+         streets.getNodeTrackSegments = function(n) return TRACKS[n] or {} end \
+         api.type.ComponentType.PLAYER_OWNED = 15 \
+         OWNERS = {} \
+         local get = api.engine.getComponent \
+         api.engine.getComponent = function(e, kind) \
+             if kind == 15 then return OWNERS[e] and { player = OWNERS[e] } or nil end return get(e, kind) end \
+         GAME_LISTS = {} \
+         api.engine.util.proposal = { makeSegmentsRemoveProposal = function(ids) \
+             return { removesEdges = table.concat(ids, ','), toAdd = {}, toRemove = {}, \
+                 proposal = { edgeObjectsToRemove = GAME_LISTS } } end } \
+         function SIGNALLED(removed) \
+             local function seg(e) local c, objects = EDGES[e], {} \
+                 for i, o in ipairs(EDGES[e].objects) do objects[i] = { o[1], o[2] } end \
+                 return { entity = e, type = 1, \
+                 comp = { node0 = c.node0, node1 = c.node1, objects = objects } } end \
+             return { toAdd = {}, toRemove = {}, proposal = { addedNodes = {}, addedSegments = {}, \
+                 removedNodes = {}, removedSegments = { seg(200), seg(201) }, \
+                 edgeObjectsToAdd = {}, edgeObjectsToRemove = removed } } \
+         end",
+    )
+    .exec()
+    .unwrap();
+    let captured: String = lua
+        .load(
+            "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+             local action, why = capture.bulldoze(SIGNALLED({ 700, 701, 702 })) \
+             if not action then error(why) end \
+             TRACKS_GONE = action \
+             local e = action.Bulldoze.Edges \
+             return table.concat({ e.network, #e.edges, e.edges[1].a.x, e.edges[2].b.x, \
+                 tostring(schema_check(action)) }, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(captured, "Track|2|200|400|true");
+
+    // A signal missing from the removal, one listed twice, one not on the
+    // tracks, a stop on them, or a construction removed with them: refused.
+    for (mutation, expected) in [
+        ("removed = { 700, 701 }", "removing a stop or signal"),
+        (
+            "removed = { 700, 701, 702, 702 }",
+            "removing a stop or signal",
+        ),
+        (
+            "removed = { 700, 701, 702, 703 }",
+            "removing a stop or signal",
+        ),
+        (
+            "p.proposal.removedSegments[2].comp.objects[2] = { 702, 0 }",
+            "removing a stop or signal",
+        ),
+        ("p.toRemove = { 5000 }", "removing a stop or signal"),
+        (
+            "p.proposal.removedSegments[2].type = 0",
+            "removing a stop or signal",
+        ),
+    ] {
+        let why: String = lua
+            .load(format!(
+                "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+                 local removed = {{ 700, 701, 702 }} \
+                 {} \
+                 local p = SIGNALLED(removed) {} \
+                 local _, why = capture.bulldoze(p) return tostring(why)",
+                if mutation.starts_with("removed") {
+                    mutation
+                } else {
+                    ""
+                },
+                if mutation.starts_with("removed") {
+                    ""
+                } else {
+                    mutation
+                },
+            ))
+            .eval()
+            .unwrap();
+        assert_eq!(why, expected, "{mutation}");
+    }
+    // Signals on the removed edges but none in the removal: still refused.
+    let why: String = lua
+        .load(
+            "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+             local _, why = capture.bulldoze(SIGNALLED({})) return tostring(why)",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(why, "removing an edge with a stop or signal on it");
+
+    // Every game removes both tracks and the three signals: given where
+    // its own proposal leaves any out, its own list kept where it names
+    // them all.
+    for (listed, sent) in [
+        ("{}", "700,701,702"),
+        ("{ 701 }", "700,701,702"),
+        ("{ 702, 700, 701 }", "702,700,701"),
+    ] {
+        lua.load(format!(
+            "GAME_LISTS = {listed} SENT = {{}} HOOK.applied = {{}} \
+             HOOK.batch = {{ TRACKS_GONE }} UPDATE({{}}, STATE, 0.2)"
+        ))
+        .exec()
+        .unwrap();
+        let removed: String = lua
+            .load(
+                "local p = SENT[1] and SENT[1].proposal \
+                 return table.concat({ tostring(HOOK.applied[1].ok), tostring(p and p.removesEdges), \
+                     p and table.concat(p.proposal.edgeObjectsToRemove, ',') or 'none', \
+                     tostring(SENT[1] and SENT[1].context.player) }, '|')",
+            )
+            .eval()
+            .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+        assert_eq!(
+            removed,
+            format!("true|200,201|{sent}|25"),
+            "game lists {listed}"
+        );
+    }
+
+    // A game whose removal would take another object, a stop on a track
+    // where the room's has a signal, or another company's signal: refused
+    // there, nothing sent.
+    for (setup, why) in [
+        (
+            "GAME_LISTS = { 700, 999 }",
+            "the game would remove an edge object 999 the bulldozer did not",
+        ),
+        (
+            "EDGES[201].objects = { { 701, 2 }, { 702, 1 } }",
+            "edge 2 has a stop on it",
+        ),
+        ("OWNERS[701] = 30", "the signal belongs to another company"),
+    ] {
+        lua.load(format!(
+            "GAME_LISTS = {{}} OWNERS = {{}} \
+             EDGES[201].objects = {{ {{ 701, 2 }}, {{ 702, 2 }} }} \
+             {setup} SENT = {{}} HOOK.applied = {{}} \
+             HOOK.batch = {{ TRACKS_GONE }} UPDATE({{}}, STATE, 0.2)"
+        ))
+        .exec()
+        .unwrap();
+        let refused: String = lua
+            .load("return #SENT .. '|' .. tostring(HOOK.applied[1].ok) .. '|' .. tostring(HOOK.applied[1].why)")
+            .eval()
+            .unwrap();
+        assert_eq!(refused, format!("0|false|{why}"), "{setup}");
+    }
+}
+
 #[test]
 fn the_bulldozer_removes_only_a_stock_airports_frozen_runway_signals() {
     let (lua, _script) = engine();
@@ -7432,6 +9799,90 @@ fn trees_bulldozed_go_in_every_game_behind_the_flag() {
     );
 }
 
+/// The asset brush through the room: the stroke as the hook read it (two
+/// new groups of firs, and the group of two at (400, 20) it replaces)
+/// goes to the room as one PlantAssets action, the replaced group named by
+/// its first tree and its count; every game removes its own copy of that
+/// group and builds the stroke's groups for the acting company, as the tool
+/// does. A game without that group refuses the stroke and builds nothing.
+#[test]
+fn the_asset_brush_plants_the_same_trees_in_every_game() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(FAKE_TOWN).exec().unwrap();
+    lua.load(FAKE_TREES).exec().unwrap();
+    let eval = |code: &str| -> String {
+        lua.load(code).eval::<String>().unwrap_or_else(|error| {
+            panic!(
+                "{code}: {error}\n{:?}",
+                lua.load("return HOOK.logged").eval::<Vec<String>>()
+            )
+        })
+    };
+    lua.load(
+        "local function at(x, y) return { 0.6, 0.8, 0, 0, -0.8, 0.6, 0, 0, 0, 0, 1.25, 0, x, y, 3, 1 } end \
+         local fir = '::/assets/trees/fir.mdl' \
+         HOOK.room = true HOOK.clicks = 0 SCRIPT.guiUpdate({}, nil, nil) \
+         HOOK.built[0] = { proposal = { assets = { removed = { 7001 }, groups = { \
+             { { model = fir, m = at(400, 20) }, { model = fir, m = at(404, 20) }, { model = fir, m = at(402, 23) } }, \
+             { { model = fir, m = at(410, 30) } } } } } } \
+         HOOK.clicks = 1 SCRIPT.guiUpdate({}, nil, nil)",
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let carried = eval(
+        "STROKE = HOOK.commands[1] local t = STROKE.PlantAssets local r = t.removed[1] \
+         local a = t.groups[1][3] \
+         return table.concat({ #HOOK.commands, #t.models, t.models[1], r.first.model, r.first.at.x, r.first.at.y, \
+             r.count, #t.groups, #t.groups[1], a.model, a.transform.origin.x, a.transform.origin.y, \
+             a.transform.basis[2], tostring(schema_check(STROKE)) }, '|')",
+    );
+    assert_eq!(
+        carried,
+        "1|1|::/assets/trees/fir.mdl|::/assets/trees/fir.mdl|400|20|2|2|3|0|402|23|0.8|true"
+    );
+    let logged = eval("return table.concat(HOOK.logged, '|')");
+    assert!(
+        logged.contains(
+            "asset brush handed to the room: 2 group(s) of 4 asset(s), replacing 1 group(s)"
+        ),
+        "{logged}"
+    );
+    // Every game: group 7001 removed, the two groups built for the company.
+    lua.load("SENT = {} HOOK.applied = {} HOOK.batch = { STROKE } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
+    let built = eval(
+        "local a = HOOK.applied[1] local s = SENT[1] local ce = s.proposal.toAdd[1] \
+         local models = ce.construction.subconstructions[1].models local m = models[3].transf \
+         return table.concat({ tostring(a.ok) .. (a.why and (':' .. a.why) or ''), s.proposal.toRemove[1], \
+             #s.proposal.toAdd, #models, models[1].id, ce.playerEntity, s.context.player, \
+             tostring(ce.desc.autoRemovable), string.format('%.2f,%.2f,%.1f,%.1f', m[1][1], m[1][2], m[4][1], m[4][2]) }, '|')",
+    );
+    assert_eq!(
+        built,
+        "true|7001|2|3|::/assets/trees/fir.mdl|25|25|true|0.60,0.80,402.0,23.0"
+    );
+    let logged = eval("return table.concat(HOOK.logged, '|')");
+    assert!(
+        logged.contains("asset brush applied: 2 group(s) of 4 asset(s), replacing 1 group(s)"),
+        "{logged}"
+    );
+    // A game whose group differs (a tree fewer) refuses, and sends nothing.
+    lua.load(
+        "SENT = {} HOOK.applied = {} table.remove(GROUPS[7001], 2) \
+         HOOK.batch = { STROKE } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap();
+    assert_eq!(
+        eval(
+            "local a = HOOK.applied[1] return tostring(a.ok) .. ':' .. tostring(a.why) .. ':' .. #SENT"
+        ),
+        "false:no asset group of 2 assets with ::/assets/trees/fir.mdl at 400.00, 20.00 here (group 1 the stroke replaces):0"
+    );
+}
+
 /// Rocks and whole groups bulldozed through the room, behind
 /// TPF3MP_TREE_BULLDOZE=1: a boulder (a full model instance) taken out of a
 /// group with a fir, the group rebuilt with the fir alone; the fir taken
@@ -7576,6 +10027,25 @@ local get = api.engine.getComponent
 api.engine.getComponent = function(id, kind)
     if kind == 14 then return OBJECTS[id] end
     return get(id, kind)
+end
+"#;
+
+/// Station groups and ownership for paired-stop replay and capture checks.
+const FAKE_STOP_GROUPS: &str = r#"
+api.type.ComponentType.STATION_GROUP, api.type.ComponentType.PLAYER_OWNED = 9, 15
+STOP_GROUPS, STOP_GROUPS_BY_ENTITY, STOP_OWNERS = {}, {}, {}
+api.engine.system.stationGroupSystem = { getStationGroup = function(entity)
+    return STOP_GROUPS_BY_ENTITY[entity] or -1
+end }
+local get = api.engine.getComponent
+api.engine.getComponent = function(entity, kind)
+    if kind == 9 then return STOP_GROUPS[entity] end
+    if kind == 15 then return STOP_OWNERS[entity] and { player = STOP_OWNERS[entity] } or nil end
+    return get(entity, kind)
+end
+function STOP_GROUP(group, stations)
+    STOP_GROUPS[group] = { stations = stations }
+    for _, station in ipairs(stations) do STOP_GROUPS_BY_ENTITY[station] = group end
 end
 "#;
 
@@ -8282,6 +10752,227 @@ fn the_bulldozer_removes_a_stop_in_every_game() {
         removed, "1|1|556|100|555|25",
         "the other stop kept under its own entity"
     );
+}
+
+/// A two-sided stop, as the bulldozer removes it with one click (build
+/// 40420, 2026-10-16: "removing more than one stop at once" in a room): both
+/// its stops go to the room as one action, and every game rebuilds the edge
+/// once without them, its other stop kept.
+#[test]
+fn the_bulldozer_removes_both_stops_of_a_two_sided_stop_in_every_game() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(FAKE_STOPS).exec().unwrap();
+    lua.load(FAKE_STOP_GROUPS).exec().unwrap();
+    lua.load(
+        "local two = '::/stations/street/small_stops/small_new_twosided.con' \
+         OBJECTS[555] = { transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 56,0.2,0,1 }, edgeObjectConstruction = two } \
+         OBJECTS[556] = { transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 44,0.2,0,1 }, edgeObjectConstruction = two } \
+         OBJECTS[558] = { transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 56,20,0,1 }, edgeObjectConstruction = two } \
+         function TWO_SIDED(objects, kept) \
+             local function seg(e, o) return { entity = e, type = 0, comp = { node0 = 8, node1 = 9, \
+                 tangent0 = { x = 0, y = 80, z = 0 }, tangent1 = { x = 0, y = 80, z = 0 }, objects = o } } end \
+             return { toAdd = {}, toRemove = {}, proposal = { addedNodes = {}, removedNodes = {}, \
+                 removedSegments = { seg(100, objects) }, addedSegments = { seg(-1, kept) }, \
+                 edgeObjectsToAdd = {} } } \
+         end",
+    )
+    .exec()
+    .unwrap();
+    lua.load("STOP_GROUP(600, { 555, 556 })").exec().unwrap();
+    let removal: String = lua
+        .load(
+            "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+             local action, why = capture.bulldoze(TWO_SIDED({ { 555, 0 }, { 556, 1 }, { 558, 0 } }, { { 558, 0 } })) \
+             if not action then error(why) end \
+             STOPS = action \
+             local b = action.Bulldoze.EdgeObjects \
+             return table.concat({ tostring(schema_check(action)), b.edge.network, #b.objects, \
+                 b.objects[1].at.x, b.objects[2].at.x, b.objects[1].model }, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        removal,
+        "true|Street|2|56|44|::/stations/street/small_stops/small_new_twosided.con"
+    );
+    // Two stops on one side, or of two constructions, are not one stop.
+    for (objects, setup) in [
+        ("{ { 555, 0 }, { 556, 0 } }", ""),
+        (
+            "{ { 555, 0 }, { 556, 1 } }",
+            "OBJECTS[556].edgeObjectConstruction = '::/stations/street/small_stops/small_new.con'",
+        ),
+    ] {
+        let why: String = lua
+            .load(format!(
+                "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+                 local model = OBJECTS[556].edgeObjectConstruction {setup} \
+                 local _, why = capture.bulldoze(TWO_SIDED({objects}, {{}})) \
+                 OBJECTS[556].edgeObjectConstruction = model \
+                 return tostring(why)"
+            ))
+            .eval()
+            .unwrap();
+        assert_eq!(
+            why, "removing more than one stop at once",
+            "{objects} {setup}"
+        );
+    }
+
+    // Every game rebuilds edge 100 once, without both, stop 558 kept.
+    lua.load(
+        "EDGES[100].objects = { { 555, 0 }, { 556, 1 }, { 558, 0 } } HOOK.batch = { STOPS } \
+         UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap();
+    let removed: String = lua
+        .load(
+            "local p = SENT[1].proposal.streetProposal local e = p.edgesToAdd[1] \
+             return table.concat({ #SENT, #e.comp.objects, e.comp.objects[1][1], \
+                 table.concat(p.edgesToRemove, ','), table.concat(p.edgeObjectsToRemove, ',') }, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert_eq!(removed, "1|1|558|100|555,556");
+
+    // A game where one of them is gone removes neither.
+    lua.load(
+        "EDGES[100].objects = { { 555, 0 }, { 558, 0 } } SENT = {} HOOK.applied = {} \
+         HOOK.batch = { STOPS } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap();
+    let refused: String = lua
+        .load("return #SENT .. '|' .. tostring(HOOK.applied[1].ok) .. '|' .. tostring(HOOK.applied[1].why)")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        refused,
+        "0|false|no ::/stations/street/small_stops/small_new_twosided.con there"
+    );
+}
+
+#[test]
+fn the_bulldozer_does_not_pair_two_different_stops() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(FAKE_STOPS).exec().unwrap();
+    lua.load(FAKE_STOP_GROUPS).exec().unwrap();
+    let result: String = lua
+        .load(
+        "local model = '::/stations/street/small_stops/small_new_twosided.con' \
+         OBJECTS[555] = { transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 56,0.2,0,1 }, edgeObjectConstruction = model } \
+         OBJECTS[556] = { transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 44,0.2,0,1 }, edgeObjectConstruction = model } \
+         STOP_GROUP(600, { 555 }) STOP_GROUP(601, { 556 }) \
+         local function seg(entity, objects) return { entity = entity, type = 0, comp = { node0 = 8, node1 = 9, \
+             tangent0 = { x = 0, y = 80, z = 0 }, tangent1 = { x = 0, y = 80, z = 0 }, objects = objects } } end \
+         local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         local action, why = capture.bulldoze({ toAdd = {}, toRemove = {}, proposal = { addedNodes = {}, \
+             removedNodes = {}, removedSegments = { seg(100, { { 555, 0 }, { 556, 1 } }) }, \
+             addedSegments = { seg(-1, {}) }, edgeObjectsToAdd = {} } }) \
+         return tostring(action) .. '|' .. tostring(why)",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(result, "nil|the two stops are not one two-sided stop");
+}
+
+#[test]
+fn replay_refuses_malformed_or_unrelated_two_sided_stop_objects() {
+    let model = "::/stations/street/small_stops/small_new_twosided.con";
+    let first = format!("{{ at = {{ x = 56, y = 0.2, z = 0 }}, model = '{model}' }}");
+    let second = format!("{{ at = {{ x = 44, y = 0.2, z = 0 }}, model = '{model}' }}");
+    let cases = [
+        (
+            "empty removal",
+            "{}".to_owned(),
+            "",
+            "a two-sided stop removal must name both objects",
+            "Street",
+        ),
+        (
+            "one-sided removal",
+            format!("{{ {first} }}"),
+            "",
+            "a two-sided stop removal must name both objects",
+            "Street",
+        ),
+        (
+            "signals",
+            format!("{{ {first}, {second} }}"),
+            "EDGES[100].objects = { { 555, 2 }, { 556, 2 } }",
+            "resolved to a signal or waypoint",
+            "Street",
+        ),
+        (
+            "different stops",
+            format!("{{ {first}, {second} }}"),
+            "STOP_GROUP(600, { 555 }) STOP_GROUP(601, { 556 })",
+            "the two stops are not one two-sided stop",
+            "Street",
+        ),
+        (
+            "different places on one edge",
+            format!("{{ {first}, {{ at = {{ x = 44, y = 10.2, z = 0 }}, model = '{model}' }} }}"),
+            "OBJECTS[556].transf[14] = 10.2",
+            "the two stops are at different places on the edge",
+            "Street",
+        ),
+        (
+            "other company owns one stop",
+            format!("{{ {first}, {second} }}"),
+            "STOP_OWNERS[556] = 30",
+            "the stop belongs to another company",
+            "Street",
+        ),
+        (
+            "edge not in this game",
+            format!("{{ {first}, {second} }}"),
+            "STOP_GROUP(600, { 555, 556 })",
+            "no Street edge for the stop",
+            "Street",
+        ),
+    ];
+
+    for (name, refs, setup, expected, network) in cases {
+        let edge_ends = if name == "edge not in this game" {
+            "a = { x = 50, y = -400, z = 0 }, b = { x = 50, y = 400, z = 0 }"
+        } else {
+            "a = { x = 50, y = -40, z = 0 }, b = { x = 50, y = 40, z = 0 }"
+        };
+        let (lua, _script) = engine();
+        lua.load(FAKE_NETWORK).exec().unwrap();
+        lua.load(FAKE_STOPS).exec().unwrap();
+        lua.load(FAKE_STOP_GROUPS).exec().unwrap();
+        lua.load(format!(
+            "local model = '{model}' \
+             OBJECTS[555] = {{ transf = {{ 1,0,0,0, 0,1,0,0, 0,0,1,0, 56,0.2,0,1 }}, edgeObjectConstruction = model }} \
+             OBJECTS[556] = {{ transf = {{ 1,0,0,0, 0,1,0,0, 0,0,1,0, 44,0.2,0,1 }}, edgeObjectConstruction = model }} \
+             EDGES[100].objects = {{ {{ 555, 0 }}, {{ 556, 1 }} }} STOP_GROUP(600, {{ 555, 556 }}) {setup} \
+             ACTION = {{ Bulldoze = {{ EdgeObjects = {{ edge = {{ network = '{network}', ends = {{ {edge_ends} }} }}, \
+                 objects = {refs} }} }} }} \
+             HOOK.batch = {{ ACTION }} UPDATE({{}}, STATE, 0.2)"
+        ))
+        .exec()
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let outcome: (usize, bool, String) = lua
+            .load(
+                "return #SENT, HOOK.applied[1] and HOOK.applied[1].ok == true, \
+                 HOOK.applied[1] and tostring(HOOK.applied[1].why) or 'missing result'",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(outcome.0, 0, "{name} sent a build: {}", hook_log(&lua));
+        assert!(!outcome.1, "{name} applied: {}", hook_log(&lua));
+        assert!(
+            outcome.2.contains(expected),
+            "{name}: expected {expected:?}, got {:?}; {}",
+            outcome.2,
+            hook_log(&lua)
+        );
+    }
 }
 
 /// Junctions with traffic lights at both ends of edge 100: node 8, where
@@ -9187,6 +11878,53 @@ fn a_vehicle_the_game_makes_anew_keeps_its_id() {
     assert_eq!(
         named, "450 0 nil 1 2",
         "vehicle-0 names the new entity; the old is gone, and no new id is made"
+    );
+}
+
+#[test]
+fn an_unreadable_replacement_result_holds_replay_without_reassigning_vehicle_id() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_FLEET).exec().unwrap();
+    lua.load(FAKE_TRAINS).exec().unwrap();
+    lua.load(format!(
+        "HOOK.room = true UPDATE({{}}, STATE, 0.2) REPLACE_AS = 450 \
+         local original = api.engine.getComponent local unread = true \
+         api.engine.getComponent = function(e, kind) \
+             if unread and e == 450 and kind == api.type.ComponentType.TRANSPORT_VEHICLE then \
+                 unread = false error('replacement component unreadable') end \
+             return original(e, kind) end \
+         HOOK.replayToken = 'replace' HOOK.replayBatch = {{ {}, \
+             {{ SellVehicle = {{ vehicles = {{ 0 }} }} }} }} \
+         SCRIPT.handleEvent({{}}, STATE, '', 'tpf3mp', 'replay', 'replace')",
+        replace_train(0, LOCO, 0, COACH)
+    ))
+    .exec()
+    .unwrap();
+    let (held, reason, old_id, new_id, sent): (bool, String, Option<u32>, Option<u32>, usize) = lua
+        .load(
+            "local reg = STATE.value.registry \
+             local registry = ug_require('tpf3mp_1::/scripts/tpf3mp/registry.lua') \
+             return not HOOK.replayDone.ok, tostring(HOOK.replayDone.why), \
+                 registry.id(reg, 'vehicles', 401), registry.id(reg, 'vehicles', 450), #SENT",
+        )
+        .eval()
+        .unwrap();
+    assert!(
+        held,
+        "an uncertain post-command result must stop room replay"
+    );
+    assert!(
+        reason.contains("replacement component unreadable"),
+        "{reason}"
+    );
+    assert_eq!(
+        (old_id, new_id),
+        (Some(0), None),
+        "the saved id must not be silently rebound"
+    );
+    assert_eq!(
+        sent, 1,
+        "no later ordered command runs after the uncertain result"
     );
 }
 
@@ -10894,12 +13632,27 @@ fn with_two_companies_each_takes_its_share_of_every_town_by_its_deliveries_and_r
     );
     assert_eq!(
         log[3],
-        "progression at game time 0: company-0 score 440.0000, experience 1500, rank 7 reached, 1 taken"
+        "progression at game time 0: company-0 score 440.0000, experience 1500, rank 7 reached, 1 taken, prior experience 1500, sample quarter 0"
     );
     assert!(
         log[4].starts_with("progression at game time 0: company-1 score 489.28")
-            && log[4].ends_with(", experience 489, rank 2 reached, 1 taken"),
+            && log[4].ends_with(
+                ", experience 489, rank 2 reached, 1 taken, prior experience 0, sample quarter 0"
+            ),
         "{log:?}"
+    );
+    let loaded: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    assert!(
+        loaded
+            .iter()
+            .any(|line| line.starts_with("room ranks loaded: quarter=")),
+        "{loaded:?}"
+    );
+    assert!(
+        loaded
+            .iter()
+            .any(|line| line.starts_with("room ranks loaded: company-0")),
+        "{loaded:?}"
     );
     // The game's delivery statistics per line, over half a year.
     let asked: String = lua
@@ -11049,7 +13802,8 @@ fn a_sample_the_game_cannot_measure_changes_no_rank() {
     let (lua, _script) = engine();
     lua.load(FAKE_PROGRESSION).exec().unwrap();
     lua.load(
-        "GAME_MODULES['/game_mechanics/towns/town_util.tl'] = nil \
+        "SAVED_TOWN_UTIL = GAME_MODULES['/game_mechanics/towns/town_util.tl'] \
+         GAME_MODULES['/game_mechanics/towns/town_util.tl'] = nil \
          HOOK.room = true \
          HOOK.batch = { { CompanyOp = { Create = { name = 'Rival' } } } } HOOK.origins = { A } \
          UPDATE({}, STATE, 0.2) UPDATE({}, STATE, 0.2)",
@@ -11068,6 +13822,63 @@ fn a_sample_the_game_cannot_measure_changes_no_rank() {
         .eval()
         .unwrap();
     assert!(none, "nothing guessed");
+    let quarter: Option<i64> = lua
+        .load("return STATE.value.progression.quarter")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        quarter, None,
+        "a failed sample must remain due this quarter"
+    );
+    lua.load("GAME_MODULES['/game_mechanics/towns/town_util.tl'] = SAVED_TOWN_UTIL UPDATE({}, STATE, 0.2)")
+        .exec().unwrap();
+    let recovered: String = lua.load(
+        "local p = STATE.value.progression return tostring(p.quarter) .. ':' .. tostring(#p.records)"
+    ).eval().unwrap();
+    assert_eq!(
+        recovered, "0:2",
+        "the repaired module lets the same quarter earn XP"
+    );
+}
+
+#[test]
+fn a_failed_tally_keeps_saved_progression_and_retries_the_same_quarter() {
+    let lua = two_companies(false);
+    let state = "local p = STATE.value.progression \
+        return tostring(p.quarter) .. ':' .. tostring(#p.records) .. ':' .. tostring(#p.passengers) \
+            .. ':' .. tostring(p.passengers[1].value)";
+    let before: String = lua.load(state).eval().unwrap();
+    lua.load(
+        "GAME_T = 1000 \
+         SAVED_SENSITIVITY = GAME_MODULES['/game_mechanics/towns/town_util.tl'].getRatingSensitivity \
+         GAME_MODULES['/game_mechanics/towns/town_util.tl'].getRatingSensitivity = function() error('temporary town read failure') end \
+         UPDATE({}, STATE, 0.2)",
+    ).exec().unwrap();
+    let after_failure: String = lua.load(state).eval().unwrap();
+    assert_eq!(
+        after_failure, before,
+        "a partial tally must not change persisted state"
+    );
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    assert!(
+        logged.iter().any(
+            |line| line.starts_with("the companies' scores were not sampled:")
+                && line.contains("temporary town read failure")
+        ),
+        "{logged:?}"
+    );
+    lua.load(
+        "GAME_MODULES['/game_mechanics/towns/town_util.tl'].getRatingSensitivity = SAVED_SENSITIVITY \
+         UPDATE({}, STATE, 0.2)",
+    ).exec().unwrap();
+    let quarter: i64 = lua
+        .load("return STATE.value.progression.quarter")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        quarter, 1,
+        "the same quarter succeeds after the read recovers"
+    );
 }
 
 #[test]
@@ -11964,7 +14775,16 @@ fn founded_company_loan_offers_are_checked_consumed_and_company_scoped() {
     lua.load(
         r#"
         GAME_T = 0
-        HOOK.seed = 12345
+        -- Lua 5.1's rand/srand are process-global across parallel test VMs.
+        -- Exercise independent cooldowns deterministically, at both bounds,
+        -- instead of relying on two seeded draws happening to be equal.
+        LOAN_COOLDOWNS = { 4000, 8000 }
+        math.random = function(first, last)
+            assert(first == 4000 and last == 8000, 'native cooldown bounds')
+            local delay = table.remove(LOAN_COOLDOWNS, 1)
+            assert(delay, 'an unexpected cooldown draw')
+            return delay
+        end
         api.type.ComponentType.GAME_TIME = 99
         api.type.ComponentType.GAME_SCRIPT = 7
         api.engine.util.getWorld = function() return 1 end
@@ -12066,7 +14886,7 @@ fn founded_company_loan_offers_are_checked_consumed_and_company_scoped() {
         )
         .eval::<(i64, i64, i64, i64)>()
         .unwrap();
-    assert!(after_first.0 >= 4_000 && after_first.0 <= 8_000);
+    assert_eq!(after_first.0, 4_000, "Ann gets the first cooldown draw");
     assert_eq!(after_first.1, 1200, "Bob's same slot remains available");
     assert_eq!(after_first.2, 1200, "the native offer remains untouched");
     assert_eq!(after_first.3, 1, "one loan booking only");
@@ -12086,20 +14906,52 @@ fn founded_company_loan_offers_are_checked_consumed_and_company_scoped() {
     );
     let journals: i64 = lua.load("return JOURNALS()").eval().unwrap();
     assert_eq!(journals, 2, "the refused reuse made no duplicate charge");
-    let refreshed: (i64, i64, Option<i64>, i64) = lua
+    let at_boundary: (Option<i64>, Option<i64>, i64, i64, i64) = lua
         .load(
-            "local roster = STATE.value.companies local untilTime = roster.loanOffers[1].availableLoans[1].cooldownUntil \
-             GAME_T = untilTime + 1 UPDATE({}, STATE, 0.2) \
+            "GAME_T = 4000 UPDATE({}, STATE, 0.2) local roster = STATE.value.companies \
              return roster.loanOffers[1].availableLoans[1].amount, \
                  roster.loanOffers[2].availableLoans[1].amount, \
-                 roster.loanOffers[1].availableLoans[1].cooldownUntil, JOURNALS()",
+                 roster.loanOffers[1].availableLoans[1].cooldownUntil, \
+                 roster.loanOffers[2].availableLoans[1].cooldownUntil, JOURNALS()",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(
+        at_boundary,
+        (None, None, 4000, 8000, 2),
+        "neither company's offer refreshes at Ann's exact cooldown boundary"
+    );
+    let first_refreshed: (i64, Option<i64>, Option<i64>, i64, i64, i64) = lua
+        .load(
+            "GAME_T = 4001 UPDATE({}, STATE, 0.2) local roster = STATE.value.companies \
+             return roster.loanOffers[1].availableLoans[1].amount, \
+                 roster.loanOffers[2].availableLoans[1].amount, \
+                 roster.loanOffers[1].availableLoans[1].cooldownUntil, \
+                 roster.loanOffers[2].availableLoans[1].cooldownUntil, \
+                 LOANS.availableLoans[1].amount, JOURNALS()",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(
+        first_refreshed,
+        (1300, None, None, 8000, 1200, 2),
+        "Ann's expiry refreshes only her slot, leaving Bob and native offers untouched"
+    );
+    let refreshed: (i64, i64, Option<i64>, Option<i64>, i64, i64) = lua
+        .load(
+            "GAME_T = 8001 UPDATE({}, STATE, 0.2) local roster = STATE.value.companies \
+             return roster.loanOffers[1].availableLoans[1].amount, \
+                 roster.loanOffers[2].availableLoans[1].amount, \
+                 roster.loanOffers[1].availableLoans[1].cooldownUntil, \
+                 roster.loanOffers[2].availableLoans[1].cooldownUntil, \
+                 JOURNALS(), #LOAN_COOLDOWNS",
         )
         .eval()
         .unwrap();
     assert_eq!(
         refreshed,
-        (1300, 1300, None, 2),
-        "both slots refresh independently after cooldown"
+        (1300, 1300, None, None, 2, 0),
+        "both slots refresh after their own cooldowns without duplicate borrowing"
     );
 }
 
@@ -13608,6 +16460,81 @@ fn the_economy_lane_carries_the_companies_and_the_subsidy_offers() {
     );
 }
 
+/// The game's Lua 5.2 formats `%d` through a 32-bit C `long` on Windows
+/// and raises past 2^31 (docs/BIGMAPS.md); the tests' Lua does not.
+const GAME_FORMAT: &str = r#"
+local format = string.format
+string.format = function(f, ...)
+    local args, i = { ... }, 0
+    for _, conv in f:gmatch('%%([-+ #0-9.]*)([%a%%])') do
+        if conv ~= '%' then
+            i = i + 1
+            local n = tonumber(args[i])
+            if (conv == 'd' or conv == 'i') and n and (n >= 2^31 or n < -2^31) then
+                error("bad argument #" .. (i + 1) .. " to 'format' (not a number in proper range)")
+            end
+        end
+    end
+    return format(f, ...)
+end
+"#;
+
+/// Offer numbers are drawn past 2^31 in a real game, and balances grow
+/// past it: the economy lane still reads them, as the game's own Lua
+/// formats numbers, instead of failing the rolling world check, which held
+/// the world and refused every action (a playtest on 2026-10-12).
+#[test]
+fn the_economy_lane_reads_offer_numbers_and_balances_past_2_31() {
+    let (lua, _) = engine();
+    lua.load(FAKE_WORLD).exec().unwrap();
+    lua.load(GAME_FORMAT).exec().unwrap();
+    lua.load(
+        r#"
+        local CT = api.type.ComponentType
+        CT.GAME_SCRIPT = 77
+        WORLD[CT.ACCOUNT][25] = { balance = 3000000000 }
+        WORLD[CT.ACCOUNT][901] = { balance = -2500000000 }
+        SUB = { lastSpawnTime = 1200, spawnIntervalModifier = 1,
+                proposedSubventions = { { uid = 2999999999, id = 'deliver_passengers.res', spawnTime = 1200,
+                    data = { upfront = { { type = 'Money', params = { amount = 4000 } } },
+                             expireDurationProposed = 18000 } } },
+                activeSubventions = {}, completedSubventions = {}, failedSubventions = {} }
+        MODSTATE = { companies = { list = { { id = 0, entity = 25 }, { id = 1, entity = 901 } } } }
+        api.engine.system.gameScriptSystem = { getEntityForGameScript = function(name)
+            if name == '::/game_mechanics/subventions/subventions.gs' then return 500 end
+            if name == 'tpf3mp_1::/tpf3mp_sim/tpf3mp_sim.gs' then return 501 end
+            return -1 end }
+        local get = api.engine.getComponent
+        api.engine.getComponent = function(e, kind)
+            if kind == 77 and e == 500 then return { state = SUB } end
+            if kind == 77 and e == 501 then return { state = MODSTATE } end
+            return get(e, kind)
+        end
+        "#,
+    )
+    .exec()
+    .unwrap();
+    let lanes = read_lanes(&lua);
+    assert!(
+        lanes[4]
+            .1
+            .starts_with("25:3000000000 companies 0=25:3000000000,1=901:-2500000000 subsidies 1:"),
+        "{}",
+        lanes[4].1
+    );
+    let dump: Vec<String> = lua
+        .load("return ug_require('tpf3mp_1::/scripts/tpf3mp/lanes.lua').dump(api, 4, nil)")
+        .eval()
+        .unwrap();
+    assert!(
+        dump.iter().any(|l| l.contains(
+            "offered 2999999999 deliver_passengers.res spawn=1200 accepted=- completed=- upfront=4000 \
+             complete=0 failure=0 deliver=- delivered=- lapses=18000 taker=-"
+        )),
+        "{dump:#?}"
+    );
+}
+
 /// The mod's game script says the subsidy script's offers in the log at a
 /// checkpoint whenever they changed, each with its number, kind and terms:
 /// two games' logs show where their offers part.
@@ -13897,10 +16824,9 @@ fn unaccepted_ports_cannot_be_sent_or_replayed() {
         local link = assert(bridge.attach(bridge.find()))
         local actions = {
             { Preserve = { building = { file = 'b.con', at = { x = 0, y = 0, z = 0 } }, index = 0, preserved = true } },
-            { CreateLine = { line = { stops = { { waypoints = { {} } } } } } },
-            { EditLine = { line = 1, change = { Update = { stops = { { waypoints = { {} } } } } } } },
             { Perk = { Greenify = { industry = 0 } } },
             { Perk = { Marketing = { town = 0, duration_ms = 1, line_cost_factor = 0.5, cost = 1 } } },
+            { SetCrossingType = { nodes = { { x = 0, y = 0, z = 0 } }, crossing_type = 'c.rcr' } },
         }
         for _, action in ipairs(actions) do
             local sent, reason = link:command(action)
@@ -13909,11 +16835,12 @@ fn unaccepted_ports_cannot_be_sent_or_replayed() {
             assert(not applied and why:find('awaits two%-player game acceptance'), tostring(why))
         end
         assert(#HOOK.commands == 0)
-        -- Renaming and recolouring (investigation/TPF3_RENAME_2026-10-07.md)
-        -- and subsidies (investigation/TPF3_SUBSIDIES_2026-10-07.md) passed
-        -- two-player game acceptance: neither port refuses them for it any
-        -- more, whatever else it finds wrong.
+        -- Rename/recolour, subsidies and line waypoints passed two-player
+        -- acceptance; the crossing channel remains gated pending ordinary-
+        -- start two-player acceptance.
         local accepted = {
+            { CreateLine = { line = { stops = { { waypoints = { {} } } } } } },
+            { EditLine = { line = 1, change = { Update = { stops = { { waypoints = { {} } } } } } } },
             { Rename = { what = { Vehicle = 1 }, name = 'x' } },
             { VehicleOp = { vehicle = 1, change = { Recolor = { r = 1, g = 0, b = 0 } } } },
             { Subsidy = { Accept = { uid = 1, kind = 'x' } } },
@@ -14079,7 +17006,7 @@ fn a_terrain_tools_click_goes_to_the_room_as_terraform_actions() {
              {{ {CONSTRUCTION_PROPOSAL} }}) \
          HOOK.built[0] = {{ proposal = STROKE }} \
          HOOK.clicks = 1 SCRIPT.guiUpdate({{}}, nil, nil) \
-         HOOK.built[1] = {{ why = 'terrain tool: terrain paint: the room does not carry it yet' }} \
+         HOOK.built[1] = {{ why = 'terrain tool: the asset brush: the room does not carry it yet' }} \
          HOOK.clicks = 2 SCRIPT.guiUpdate({{}}, nil, nil)"
     ))
     .exec()
@@ -14099,7 +17026,7 @@ fn a_terrain_tools_click_goes_to_the_room_as_terraform_actions() {
     let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
     for line in [
         "terraform handed to the room: 3 by 2 cells of 4 m from cell (-10, 7), 5 changed, heights 100.00 to 105.00 m",
-        "stopped a build the room cannot carry: terrain tool: terrain paint: the room does not carry it yet [terrain tool]",
+        "stopped a build the room cannot carry: terrain tool: the asset brush: the room does not carry it yet [terrain tool]",
     ] {
         assert!(logged.iter().any(|l| l == line), "{line}: {logged:?}");
     }
@@ -14138,6 +17065,82 @@ fn a_stroke_larger_than_one_action_goes_in_bands_of_whole_rows() {
             && l.contains("100 by 10 cells of 4 m from cell (5, 20)")),
         "{logged:?}"
     );
+}
+
+/// A painter's stroke as the hook hands it at the click: one Paint action
+/// of 4 by 2 texels from (-40, 28), material 3 on five of them, and its
+/// mask.
+const PAINT: &str = "{ Paint = { materials = { x0 = -40, y0 = 28, columns = 4, rows = 2, runs = { \
+    { value = 255, count = 1 }, { value = 3, count = 5 }, { value = 255, count = 2 } } }, \
+    mask = { x0 = -40, y0 = 28, columns = 4, rows = 2, runs = { \
+    { value = 0, count = 1 }, { value = 1, count = 5 }, { value = 0, count = 2 } } } } }";
+
+#[test]
+fn a_terrain_painters_click_goes_to_the_room_as_paint_actions() {
+    let (lua, _script) = engine();
+    lua.load(format!(
+        "HOOK.room = true HOOK.clicks = 0 SCRIPT.guiUpdate({{}}, nil, nil) \
+         HOOK.built[0] = {{ proposal = {{ paint = {{ {PAINT}, {PAINT} }} }} }} \
+         HOOK.clicks = 1 SCRIPT.guiUpdate({{}}, nil, nil)"
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let carried: String = lua
+        .load(
+            "local p = HOOK.commands[1].Paint \
+             return table.concat({ #HOOK.commands, p.materials.x0, p.materials.columns, \
+                 #p.materials.runs, p.mask.runs[2].count }, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(carried, "2|-40|4|3|5", "both bands, as the hook made them");
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    let line = "paint handed to the room: 4 by 2 texels from (-40, 28), 5 painted, a mask with 5 set (part 2 of 2)";
+    assert!(logged.iter().any(|l| l == line), "{line}: {logged:?}");
+}
+
+#[test]
+fn every_game_applies_paint_through_the_hook_as_the_players_build() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_TERRAIN_HOOK).exec().unwrap();
+    lua.load(format!(
+        "HOOK.batch = {{ {PAINT} }} UPDATE({{}}, STATE, 0.2)"
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let armed: String = lua
+        .load(
+            "local g = HOOK.grids[1] \
+             return table.concat({ #HOOK.grids, g.materials.x0, g.materials.rows, #g.mask.runs, \
+                 #SENT, tostring(SENT[1].proposal.carrier), SENT[1].context.player, tostring(HOOK.armed) }, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        armed, "1|-40|2|3|1|true|25|nil",
+        "the stroke armed, the carrier sent and paid, disarmed"
+    );
+    let (ok, logged): (bool, Vec<String>) = lua
+        .load("return HOOK.applied[1].ok, HOOK.logged")
+        .eval()
+        .unwrap();
+    assert!(ok, "{logged:?}");
+    assert!(
+        logged
+            .iter()
+            .any(|l| l
+                == "paint applied: 4 by 2 texels from (-40, 28), 5 painted, a mask with 5 set"),
+        "{logged:?}"
+    );
+    // A carrier no build took fails in every game.
+    lua.load(format!(
+        "NO_FILL = true HOOK.batch = {{ {PAINT} }} UPDATE({{}}, STATE, 0.2) NO_FILL = false"
+    ))
+    .exec()
+    .unwrap();
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    let line = "action 1 of this step was not applied: the hook filled no build with the paint";
+    assert!(logged.iter().any(|l| l == line), "{line}: {logged:?}");
 }
 
 /// The hook's `terrain`, as the game script uses it: the grid armed, and
@@ -14880,9 +17883,15 @@ fn a_signal_keeps_the_settings_the_tool_built_it_with_in_every_game() {
     assert_eq!(cut, "the tool's settings were cut short");
 
     // Auto Signals' settings on the base game's signal: carried, sorted.
+    // With them Signal Distance's, a key with a dot in it
+    // (signal_distance_1, mod.script.lua: "signal_distance.local", its
+    // slider's index), refused in a room until 2026-10-11 ("a setting named
+    // signal_distance.local"): carried and built as that one key, never as
+    // a path.
     assert_eq!(
         ask(&format!(
-            "{{ {signal_c}, params = {{ oneWay = 2, auto_signals_replace = 1, auto_signals_distance = 4 }} }}"
+            "{{ {signal_c}, params = {{ oneWay = 2, auto_signals_replace = 1, auto_signals_distance = 4, \
+             ['signal_distance.local'] = 18 }} }}"
         )),
         "nil",
         "the signal tool builds through the room"
@@ -14902,7 +17911,7 @@ fn a_signal_keeps_the_settings_the_tool_built_it_with_in_every_game() {
     assert_eq!(
         handed,
         "Signal infrastructure/signal/signal_path_c.con \
-         auto_signals_distance=4,auto_signals_replace=1,oneWay=2 true"
+         auto_signals_distance=4,auto_signals_replace=1,oneWay=2,signal_distance.local=18 true"
     );
     // Every game builds it with them.
     lua.load("HOOK.batch = { HOOK.commands[#HOOK.commands] } UPDATE({}, STATE, 0.2)")
@@ -14911,11 +17920,12 @@ fn a_signal_keeps_the_settings_the_tool_built_it_with_in_every_game() {
     let built: String = lua
         .load(
             "local o = SENT[1].proposal.streetProposal.edgeObjectsToAdd[1] \
-             return o.params.auto_signals_distance .. ' ' .. o.params.auto_signals_replace .. ' ' .. o.params.oneWay",
+             return o.params.auto_signals_distance .. ' ' .. o.params.auto_signals_replace .. ' ' .. o.params.oneWay \
+                 .. ' ' .. tostring(o.params['signal_distance.local']) .. ' ' .. tostring(o.params.signal_distance)",
         )
         .eval()
         .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
-    assert_eq!(built, "4 1 2");
+    assert_eq!(built, "4 1 2 18 nil");
 }
 
 /// Auto Signals after its player's signal (D27; docs/MODS.md): the script's
@@ -15202,5 +18212,935 @@ fn a_signal_build_the_room_cannot_carry_says_why() {
         "built",
         "{}",
         hook_log(&lua)
+    );
+}
+
+/// Action-boundary company and assignment diagnostics name only the
+/// canonical/native entities needed to compare replicas. Unreadable optional
+/// components are markers, and a later vehicle refusal does not erase the
+/// successful earlier assignment.
+#[test]
+fn event_boundary_diagnostics_cover_company_and_partial_line_assignment() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_FLEET).exec().unwrap();
+    lua.load(
+        r#"
+        PLAYER = string.rep('a', 64)
+        HOOK.room = true
+        HOOK.batch = { { CompanyOp = { Create = { name = 'Fixture Company' } } } }
+        HOOK.origins = { PLAYER }
+        HOOK.seals = { { scope = 'SENTINEL_SCOPE', tag = 'SENTINEL_SEAL' } }
+        UPDATE({}, STATE, 0.2)
+
+        local CT = api.type.ComponentType
+        CT.PLAYER_OWNED = 13
+        local base = api.engine.getComponent
+        api.engine.getComponent = function(e, kind)
+            if kind == CT.PLAYER_OWNED then
+                if e == 301 or e == 401 or e == 402 then return { player = 901 } end
+                return nil
+            end
+            if kind == CT.TRANSPORT_VEHICLE then
+                if e == 401 then return { transportVehicleConfig = { vehicles = {
+                    { part = { modelId = 41 } }, { part = { modelId = 42 } } } } } end
+                if e == 402 then error('SENTINEL_COMPONENT_FAILURE') end
+            end
+            if kind == CT.LINE and e == 301 then
+                return { vehicleInfo = { transportModes = { [3] = true, [7] = true } } }
+            end
+            return base(e, kind)
+        end
+        api.res.modelRep.getName = function(id)
+            if id == 41 then return 'vehicle/bus/city.mdl' end
+            if id == 42 then return 'vehicle/bus/ferry.mdl' end
+        end
+        local send, setLineCalls = api.cmd.sendCommand, 0
+        api.cmd.sendCommand = function(command, ...)
+            if command.setLine then
+                setLineCalls = setLineCalls + 1
+                if setLineCalls == 2 then error('second vehicle refused') end
+            end
+            return send(command, ...)
+        end
+        SENT, HOOK.applied = {}, {}
+        HOOK.batch = { { AssignLine = { vehicles = { 0, 1 }, line = 0, first_stop = 1 } } }
+        HOOK.origins = { PLAYER }
+        UPDATE({}, STATE, 0.2)
+        "#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+
+    let logs: String = lua
+        .load("return table.concat(HOOK.logged, '\\n')")
+        .eval()
+        .unwrap();
+    assert!(
+        logs.contains("company-event action_index=1 op=Create actor_before=company-0/entity-25 actor_after=company-1/entity-901 local_before=company-0/entity-25 local_after=company-0/entity-25 outcome=applied"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("assign-vehicle action_index=1 vehicle=0 native=401 line=0 native_line=301 first=1 carrier=bus models=vehicle/bus/city.mdl,vehicle/bus/ferry.mdl mode=3,7 owner=company-1/entity-901 line_owner=company-1/entity-901 outcome=applied"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("assign-vehicle action_index=1 vehicle=1 native=402 line=0 native_line=301 first=1 carrier=unavailable models=unavailable mode=3,7 owner=company-1/entity-901 line_owner=company-1/entity-901 outcome=refused"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("action-event action_index=1 kind=AssignLine outcome=refused"),
+        "{logs}"
+    );
+    assert!(!logs.contains("SENTINEL_SEAL"), "{logs}");
+    assert!(!logs.contains("SENTINEL_SCOPE"), "{logs}");
+    assert!(!logs.contains("SENTINEL_COMPONENT_FAILURE"), "{logs}");
+    assert!(!logs.contains(&"a".repeat(64)), "{logs}");
+    let (sent, applied): (usize, bool) =
+        lua.load("return #SENT, HOOK.applied[1].ok").eval().unwrap();
+    assert_eq!(
+        (sent, applied),
+        (1, false),
+        "the first command remains applied"
+    );
+}
+
+/// A buy diagnostic reports ordered model resources and the entity ids after
+/// the registry binds the new vehicle. Bulldoze diagnostics reuse the
+/// construction already resolved by constructionAt, and distinguish a
+/// missing owner from a throwing owner read.
+#[test]
+fn event_boundary_diagnostics_report_buys_and_resolved_bulldozes() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_FLEET).exec().unwrap();
+    let setup = r#"
+        PLAYER = string.rep('b', 64)
+        HOOK.room = true
+        HOOK.batch = { { CompanyOp = { Create = { name = 'Fixture Company' } } } }
+        HOOK.origins = { PLAYER }
+        UPDATE({}, STATE, 0.2)
+
+        local CT = api.type.ComponentType
+        CT.PLAYER_OWNED = 13
+        local base = api.engine.getComponent
+        api.engine.getComponent = function(e, kind)
+            if kind == CT.PLAYER_OWNED then
+                if e == 202 then return { player = 901 } end
+                return nil
+            end
+            return base(e, kind)
+        end
+        api.res.modelRep.find = function(name)
+            if name == 'vehicle/bus/city.mdl' then return 41 end
+            if name == 'vehicle/ship/ferry.mdl' then return 42 end
+            return -1
+        end
+        api.cmd.makeEntitySetColorCmd = function(entity, color) return { paint = entity } end
+        api.engine.util.proposal = {
+            createProposalRemove = function(entity) return { removes = entity } end,
+        }
+        CONSTRUCTION_SCANS = 0
+        local list = api.engine.getEntitiesWithComponent
+        api.engine.getEntitiesWithComponent = function(kind)
+            if kind == CT.CONSTRUCTION then CONSTRUCTION_SCANS = CONSTRUCTION_SCANS + 1 end
+            return list(kind)
+        end
+
+        local buy = __BUY_BUS__
+        buy.BuyVehicle.consist[2] = {
+            model = 'vehicle/ship/ferry.mdl', reversed = false,
+            loads = { { config = 0, cargo = 3 } }, color = { r = 0, g = 0, b = 1 },
+        }
+        buy.BuyVehicle.groups = { 1, 1 }
+        buy.BuyVehicle.multiple_units = { '', '' }
+        HOOK.batch, HOOK.origins = { buy }, { PLAYER }
+        UPDATE({}, STATE, 0.2)
+
+        CONSTRUCTION_SCANS = 0
+        SENT = {}
+        HOOK.batch = { { Bulldoze = { Construction = {
+            file = 'depot/bus_depot.con', at = { x = 600, y = 10, z = 2 },
+        } } } }
+        HOOK.origins = { PLAYER }
+        UPDATE({}, STATE, 0.2)
+
+        local get = api.engine.getComponent
+        api.engine.getComponent = function(e, kind)
+            if e == 201 and kind == CT.PLAYER_OWNED then error('SENTINEL_OWNER_FAILURE') end
+            return get(e, kind)
+        end
+        REFUSE = true
+        HOOK.batch = { { Bulldoze = { Construction = {
+            file = 'depot/bus_depot.con', at = { x = 600, y = 10, z = 2 },
+        } } } }
+        HOOK.origins = { PLAYER }
+        UPDATE({}, STATE, 0.2)
+        "#
+    .replace("__BUY_BUS__", BUY_BUS);
+    lua.load(setup)
+        .exec()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+
+    let logs: String = lua
+        .load("return table.concat(HOOK.logged, '\\n')")
+        .eval()
+        .unwrap();
+    assert!(
+        logs.contains("buy-vehicle action_index=1 outcome=applied models=vehicle/bus/city.mdl,vehicle/ship/ferry.mdl native=500 canonical=2"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("bulldoze-construction action_index=1 ref=depot/bus_depot.con@(600.0,10.0,2.0) native=201 actual=(600.0,10.0,2.0) owner=none"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("action-event action_index=1 kind=Bulldoze outcome=applied"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("bulldoze-construction action_index=1 ref=depot/bus_depot.con@(600.0,10.0,2.0) native=201 actual=(600.0,10.0,2.0) owner=unavailable"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("action-event action_index=1 kind=Bulldoze outcome=refused"),
+        "{logs}"
+    );
+    assert!(!logs.contains("SENTINEL_OWNER_FAILURE"), "{logs}");
+    assert!(!logs.contains(&"b".repeat(64)), "{logs}");
+    let scans: usize = lua.load("return CONSTRUCTION_SCANS").eval().unwrap();
+    assert_eq!(scans, 2, "one constructionAt traversal per bulldoze action");
+}
+
+/// A track the room ordered, started from the middle of track 200 between
+/// its signals (FAKE_TRACKS): 200 cut at (50, 200), the new track running
+/// south from there, each signal kept on the piece it stood on, by where it
+/// stood on 200 and its construction. `KEPT_A` and `KEPT_B` are the kept
+/// signals of the western and eastern pieces, `KEPT_C` the new track's.
+const CUT_TRACK: &str = "{ BuildTrack = { track = '::/track/standard.street_template', catenary = false, \
+    polyline = { \
+    vertices = { \
+        { pos = { x = 0, y = 200, z = 0 }, resolve = { Node = 'Track' } }, \
+        { pos = { x = 50, y = 200, z = 0 }, resolve = 'New' }, \
+        { pos = { x = 100, y = 200, z = 0 }, resolve = { Node = 'Track' } }, \
+        { pos = { x = 50, y = 150, z = 0 }, resolve = 'New' } }, \
+    links = { \
+        { from = 0, to = 1, tangent0 = { x = 50, y = 0, z = 0 }, tangent1 = { x = 50, y = 0, z = 0 }, \
+          structure = 'Ground', kept = KEPT_A }, \
+        { from = 1, to = 2, tangent0 = { x = 50, y = 0, z = 0 }, tangent1 = { x = 50, y = 0, z = 0 }, \
+          structure = 'Ground', kept = KEPT_B }, \
+        { from = 1, to = 3, tangent0 = { x = 0, y = -50, z = 0 }, tangent1 = { x = 0, y = -50, z = 0 }, \
+          structure = 'Ground', kept = KEPT_C } }, \
+    removals = { { network = 'Track', ends = { a = { x = 0, y = 200, z = 0 }, b = { x = 100, y = 200, z = 0 } } } } \
+    } } }";
+
+const KEPT_300: &str =
+    "{ removal = 0, at = 0.25, model = '::/infrastructure/signal/signal_path_c.con' }";
+const KEPT_301: &str =
+    "{ removal = 0, at = 0.75, model = '::/infrastructure/signal/signal_path_a.con' }";
+
+fn cut_track(a: &str, b: &str) -> String {
+    cut_track_onto(a, b, "{}")
+}
+
+fn cut_track_onto(a: &str, b: &str, c: &str) -> String {
+    CUT_TRACK
+        .replace("KEPT_A", a)
+        .replace("KEPT_B", b)
+        .replace("KEPT_C", c)
+}
+
+/// A game with FAKE_TRACKS and the standard track template, its gate for
+/// signals kept on a cut track `on`.
+fn cut_track_game(on: bool) -> Lua {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(FAKE_STOPS).exec().unwrap();
+    lua.load(FAKE_TRACKS).exec().unwrap();
+    lua.load(format!(
+        r#"
+        local get = api.res.streetTemplateRep.get
+        local find = api.res.streetTemplateRep.find
+        api.res.streetTemplateRep.find = function(name)
+            if name == '::/track/standard.street_template' then return 6 end
+            return find(name)
+        end
+        api.res.streetTemplateRep.get = function(id)
+            if id == 6 then return {{ laneConfigs = {{ 'track lanes' }}, streetStyle = '::/style/track.street_style' }} end
+            return get(id)
+        end
+        ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').splitSignals = {on}
+        -- Each signal's signal list (SIGNAL_LIST): a plain signal unless set.
+        api.type.ComponentType.SIGNAL_LIST = 26
+        api.type.Signal = {{ Type = {{ SIGNAL = 0, ONE_WAY_SIGNAL = 1, WAYPOINT = 2 }} }}
+        SIGNALS = {{}}
+        local component = api.engine.getComponent
+        api.engine.getComponent = function(id, kind)
+            if kind == 26 then
+                if OBJECTS[id] == nil then return nil end
+                return SIGNALS[id] or {{ signals = {{ {{ type = 0 }} }} }}
+            end
+            return component(id, kind)
+        end
+        "#
+    ))
+    .exec()
+    .unwrap();
+    lua
+}
+
+/// Each new edge's objects, as `entity[object:type,...]`, and the edges
+/// removed; or "nothing sent".
+fn cut_track_sent(lua: &Lua) -> String {
+    lua.load(
+        "local c = SENT[1] if c == nil then return 'nothing sent' end \
+         local p = c.proposal.streetProposal local out = {} \
+         for _, e in ipairs(p.edgesToAdd) do \
+             local o = {} for _, x in ipairs(e.comp.objects or {}) do o[#o + 1] = x[1] .. ':' .. x[2] end \
+             out[#out + 1] = e.entity .. '[' .. table.concat(o, ',') .. ']' \
+         end \
+         return table.concat(out, ' ') .. ' | -' .. table.concat(p.edgesToRemove, ',')",
+    )
+    .eval()
+    .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(lua)))
+}
+
+/// A track cut between its signals keeps each signal, under its own entity,
+/// on the piece it stood on, in every game alike: in one whose track runs
+/// the other way too, each signal found by where it stands from the
+/// removal's own end. The accepted case is enabled; the gate-off check below
+/// confirms that it refuses the build when disabled.
+#[test]
+fn every_game_keeps_a_cut_tracks_signals_on_their_pieces() {
+    let build = cut_track(&format!("{{ {KEPT_300} }}"), &format!("{{ {KEPT_301} }}"));
+    let lua = cut_track_game(true);
+    lua.load(format!(
+        "HOOK.batch = {{ {build} }} UPDATE({{}}, STATE, 0.2)"
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert_eq!(
+        cut_track_sent(&lua),
+        "-1[300:2] -2[301:2] -3[] | -200",
+        "{}",
+        hook_log(&lua)
+    );
+    assert!(
+        hook_log(&lua).contains("kept 2 signal(s) on the track's new pieces"),
+        "{}",
+        hook_log(&lua)
+    );
+
+    // Another game, whose track 200 runs from node 21 to node 20.
+    let other = cut_track_game(true);
+    other
+        .load(format!(
+            "EDGES[200].node0, EDGES[200].node1 = 21, 20 \
+             EDGES[200].tangent0, EDGES[200].tangent1 = {{ x = -100, y = 0, z = 0 }}, {{ x = -100, y = 0, z = 0 }} \
+             OBJECTS[300].param, OBJECTS[301].param = 0.75, 0.25 \
+             HOOK.batch = {{ {build} }} UPDATE({{}}, STATE, 0.2)"
+        ))
+        .exec()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&other)));
+    assert_eq!(
+        cut_track_sent(&other),
+        "-1[300:2] -2[301:2] -3[] | -200",
+        "{}",
+        hook_log(&other)
+    );
+
+    // A mod's signal, which every game of the room has.
+    let modded = cut_track_game(true);
+    let mod_301 = KEPT_301
+        .replace("'::/", "'custom_signals_1::/")
+        .replace("signal_path_a", "custom");
+    modded
+        .load(format!(
+            "OBJECTS[301].edgeObjectConstruction = 'custom_signals_1::/infrastructure/signal/custom.con' \
+             HOOK.batch = {{ {} }} UPDATE({{}}, STATE, 0.2)",
+            cut_track(&format!("{{ {KEPT_300} }}"), &format!("{{ {mod_301} }}"))
+        ))
+        .exec()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&modded)));
+    assert_eq!(
+        cut_track_sent(&modded),
+        "-1[300:2] -2[301:2] -3[] | -200",
+        "{}",
+        hook_log(&modded)
+    );
+
+    // With its gate off, no game builds it.
+    let off = cut_track_game(false);
+    off.load(format!(
+        "HOOK.batch = {{ {build} }} UPDATE({{}}, STATE, 0.2)"
+    ))
+    .exec()
+    .unwrap();
+    assert_eq!(cut_track_sent(&off), "nothing sent");
+    assert!(
+        hook_log(&off).contains("splitSignals awaits two-player game acceptance"),
+        "{}",
+        hook_log(&off)
+    );
+}
+
+/// A track started close to node 21 of track 200-21-201 (FAKE_TRACKS): the
+/// tool removes 21 and puts its own node at (70, 200), short of signal 301
+/// (at 75), which it keeps on the piece that took over the track beyond
+/// 21 (refitSignals). That piece neither starts where 200 started nor ends
+/// where it ended, but runs where 301 stood, the same way: every game keeps
+/// it there, and none keeps it on a piece that runs the other way.
+const ACROSS_NODE: &str = "{ BuildTrack = { track = '::/track/standard.street_template', catenary = false,     polyline = {     vertices = {         { pos = { x = 0, y = 200, z = 0 }, resolve = { Node = 'Track' } },         { pos = { x = 70, y = 200, z = 0 }, resolve = 'New' },         { pos = { x = 200, y = 200, z = 0 }, resolve = { Node = 'Track' } } },     links = {         { from = 0, to = 1, tangent0 = { x = 70, y = 0, z = 0 }, tangent1 = { x = 70, y = 0, z = 0 },           structure = 'Ground', kept = { KEPT_300 } },         { from = FROM, to = TO, tangent0 = TANGENT, tangent1 = TANGENT,           structure = 'Ground', kept = { KEPT_301 } } },     removals = { { network = 'Track', ends = { a = { x = 0, y = 200, z = 0 }, b = { x = 100, y = 200, z = 0 } } },                  { network = 'Track', ends = { a = { x = 200, y = 200, z = 0 }, b = { x = 100, y = 200, z = 0 } } } },     removed_nodes = { { network = 'Track', at = { x = 100, y = 200, z = 0 } } }     } } }";
+
+fn across_node(from: u32, to: u32, tangent: &str) -> String {
+    ACROSS_NODE
+        .replace("KEPT_300", KEPT_300)
+        .replace("KEPT_301", KEPT_301)
+        .replace("FROM", &from.to_string())
+        .replace("TO", &to.to_string())
+        .replace("TANGENT", tangent)
+}
+
+#[test]
+fn every_game_keeps_a_signal_put_back_across_a_removed_node() {
+    let lua = cut_track_game(true);
+    lua.load(format!(
+        "HOOK.batch = {{ {} }} UPDATE({{}}, STATE, 0.2)",
+        across_node(1, 2, "{ x = 130, y = 0, z = 0 }")
+    ))
+    .exec()
+    .unwrap_or_else(|error| {
+        panic!(
+            "{error}
+{}",
+            hook_log(&lua)
+        )
+    });
+    assert_eq!(
+        cut_track_sent(&lua),
+        "-1[300:2] -2[301:2] | -200,201",
+        "{}",
+        hook_log(&lua)
+    );
+
+    let back = cut_track_game(true);
+    back.load(format!(
+        "HOOK.batch = {{ {} }} UPDATE({{}}, STATE, 0.2)",
+        across_node(2, 1, "{ x = -130, y = 0, z = 0 }")
+    ))
+    .exec()
+    .unwrap_or_else(|error| {
+        panic!(
+            "{error}
+{}",
+            hook_log(&back)
+        )
+    });
+    assert_eq!(cut_track_sent(&back), "nothing sent");
+    assert!(
+        hook_log(&back).contains("neither goes on from its track nor runs where it stood"),
+        "{}",
+        hook_log(&back)
+    );
+}
+
+/// What a game refuses of a cut track's kept signals, saying why, the same
+/// in every game: a signal kept on the piece it did not stand on, one left
+/// behind, one it cannot find or finds twice, a waypoint or a mod's signal.
+#[test]
+fn a_cut_tracks_signal_a_game_cannot_keep_refuses_the_build() {
+    let refused = |a: &str, b: &str, setup: &str, why: &str| {
+        let lua = cut_track_game(true);
+        lua.load(format!(
+            "{setup} HOOK.batch = {{ {} }} UPDATE({{}}, STATE, 0.2)",
+            cut_track(a, b)
+        ))
+        .exec()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+        assert_eq!(cut_track_sent(&lua), "nothing sent", "{why}");
+        assert!(hook_log(&lua).contains(why), "{why}: {}", hook_log(&lua));
+    };
+    let both = |a: &str, b: &str| (format!("{{ {a} }}"), format!("{{ {b} }}"));
+    // Onto the new track, which does not go on from the cut one.
+    let lua = cut_track_game(true);
+    lua.load(format!(
+        "HOOK.batch = {{ {} }} UPDATE({{}}, STATE, 0.2)",
+        cut_track_onto(
+            &format!("{{ {KEPT_300} }}"),
+            "{}",
+            &format!("{{ {KEPT_301} }}")
+        )
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert_eq!(cut_track_sent(&lua), "nothing sent");
+    assert!(
+        hook_log(&lua).contains("neither goes on from its track nor runs where it stood"),
+        "{}",
+        hook_log(&lua)
+    );
+    // One left behind on the removed track.
+    refused(
+        &format!("{{ {KEPT_300} }}"),
+        "{}",
+        "",
+        "an object no link takes",
+    );
+    // A construction that is not there.
+    let wrong = KEPT_301.replace("signal_path_a", "signal_path_c");
+    let (a, b) = both(KEPT_300, &wrong);
+    refused(&a, &b, "", "where it is kept");
+    // Two signals of one construction where one is kept.
+    let (a, b) = both(KEPT_300, KEPT_301);
+    refused(
+        &a,
+        &b,
+        "OBJECTS[302] = { param = 0.751, edgeObjectConstruction = '::/infrastructure/signal/signal_path_a.con' } \
+         EDGES[200].objects[3] = { 302, 2 }",
+        "two signals where one is kept",
+    );
+    // A waypoint, which lines name, whatever its construction.
+    let (a, b) = both(KEPT_300, KEPT_301);
+    refused(
+        &a,
+        &b,
+        "SIGNALS[301] = { signals = { { type = 2 } } }",
+        "a waypoint",
+    );
+    // The same signal kept twice.
+    let (a, b) = both(KEPT_300, &format!("{KEPT_301}, {KEPT_301}"));
+    refused(&a, &b, "", "where it is kept");
+}
+
+/// Two level crossings, each on two nodes, and a street node above one of
+/// them (a bridge): the crossing types the game offers here, the owners of
+/// the crossings' roads and tracks, and the hook's carrier of a crossing's
+/// type, which the game's build retypes it with.
+const FAKE_CROSSINGS: &str = r#"
+api.type.ComponentType.BASE_NODE = 30
+api.type.ComponentType.RAILROAD_CROSSING = 31
+api.type.ComponentType.PLAYER_OWNED = 32
+api.type.ComponentType.BASE_EDGE = 33
+-- The crossings' segments, by their ends: 900 and 901 meet at the
+-- crossing's nodes and reach out to 650 and 651.
+EDGE_ENDS = { [900] = { node0 = 650, node1 = 701 }, [901] = { node0 = 700, node1 = 651 },
+              [910] = { node0 = 710, node1 = 711 }, [911] = { node0 = 711, node1 = 712 } }
+api.type.SimpleProposal.new = function() return { constructionsToAdd = {}, streetProposal = {} } end
+NODE_AT = { [700] = { x = 18, y = 20, z = 1 }, [701] = { x = 10, y = 20, z = 1 },
+            [710] = { x = 500, y = 0, z = 0 }, [711] = { x = 508, y = 0, z = 0 },
+            [720] = { x = 10, y = 20, z = 9 } }
+CROSSINGS = { [800] = { nodes = { 700, 701 }, edges = { 900, 901 }, typeIndex = 3 },
+              [810] = { nodes = { 710, 711 }, edges = { 910, 911 }, typeIndex = 3 } }
+OWNERS = { [911] = 77 }
+TYPES = { [3] = 'railroad_crossing/era_a_eu.rcr', [5] = 'railroad_crossing/era_c_eu.rcr', [6] = 'hidden.rcr' }
+RETYPES = true
+api.res = api.res or {}
+api.res.railroadCrossingTypeRep = {
+    getName = function(i) return TYPES[i] end,
+    find = function(name) for i, n in pairs(TYPES) do if n == name then return i end end return -1 end,
+    isVisible = function(i) return i ~= 6 end,
+}
+local previous = api.engine.getComponent
+api.engine.getComponent = function(e, kind)
+    if kind == 30 then local p = NODE_AT[e] return p and { position = p } end
+    if kind == 31 then return CROSSINGS[e] end
+    if kind == 32 then local o = OWNERS[e] return o and { player = o } end
+    if kind == 33 then return EDGE_ENDS[e] end
+    if previous then return previous(e, kind) end
+end
+api.engine.system.streetSystem = {
+    getNode2StreetEdgeMap = function() return { [700] = {}, [701] = {}, [710] = {}, [711] = {}, [720] = {} } end,
+    getNode2TrackEdgeMap = function() return { [700] = {}, [701] = {}, [710] = {}, [711] = {} } end,
+}
+api.engine.system.railRoadCrossingSystem = { getRailroadCrossingForNode = function(node)
+    for e, c in pairs(CROSSINGS) do
+        for _, n in ipairs(c.nodes) do if n == node then return e end end
+    end
+    return -1
+end }
+api.type.Proposal = api.type.Proposal or { new = function() return { carrier = true } end }
+-- The hook's carrier (crates/tpf3mp-hook/src/crossings.rs): armed with this
+-- game's crossing and type, filled at the next build's apply, where the
+-- game removes the crossing and adds it anew, of the type, under a new
+-- entity (RETYPES false: the type stays).
+tpf3mp_native.crossing = function(entity, index)
+    if entity == nil then
+        local filled = CARRIER and CARRIER.filled
+        CARRIER = nil
+        return filled
+    end
+    CARRIER = { entity = entity, index = index, filled = false }
+    return true
+end
+local send = api.cmd.sendCommand
+api.cmd.sendCommand = function(command, callback)
+    if CARRIER and not CARRIER.filled and command.proposal and command.proposal.carrier then
+        CARRIER.filled = true
+        local old = CROSSINGS[CARRIER.entity]
+        if old and RETYPES then
+            CROSSINGS[CARRIER.entity] = nil
+            CROSSINGS[CARRIER.entity + 1000] = { nodes = old.nodes, edges = old.edges, typeIndex = CARRIER.index }
+        end
+    end
+    return send(command, callback)
+end
+"#;
+
+/// The level crossing window's change, which the hook read at the click, goes
+/// to the room as the crossing's node places, sorted, and the type's file;
+/// refused (the channel gated pending ordinary-start acceptance, a crossing
+/// gone, the type it has already, or a shape the hook does not carry), the player is told
+/// in the game bar's notice, which the window itself never says.
+#[test]
+fn a_crossing_type_from_its_window_goes_to_the_room_by_its_nodes() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_CROSSINGS).exec().unwrap();
+    // The production gate is off; the fixture turns it on to exercise the
+    // type-only mechanics after checking the default refusal.
+    lua.load(
+        r#"DEFAULT = ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossings
+        ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossings = false
+        HOOK.room = true HOOK.clicks = 0 SCRIPT.guiUpdate({}, nil, nil)
+        HOOK.built[0] = { proposal = { crossingType = true, entity = 800, type = 5 } }
+        HOOK.clicks = 1 SCRIPT.guiUpdate({}, nil, nil)
+        FIRST = HOOK.notes and HOOK.notes['tpf3mp.notice']
+        ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossings = true
+        HOOK.built[1] = { proposal = { crossingType = true, entity = 800, type = 5 } }
+        HOOK.built[2] = { proposal = { crossingType = true, entity = 800, type = 3 } }
+        HOOK.built[3] = { proposal = { crossingType = true, entity = 999, type = 5 } }
+        HOOK.built[4] = { why = "crossing window: a crossing change that rebuilds the crossing's tracks" }
+        HOOK.clicks = 5 SCRIPT.guiUpdate({}, nil, nil)"#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let on: bool = lua.load("return DEFAULT").eval().unwrap();
+    assert!(!on, "crossings is gated off by default");
+    let (first, last, sent): (String, String, String) = lua
+        .load(
+            "local c = HOOK.commands[1].SetCrossingType \
+             local nodes = {} for _, p in ipairs(c.nodes) do nodes[#nodes + 1] = p.x .. ',' .. p.y .. ',' .. p.z end \
+             return FIRST, HOOK.notes['tpf3mp.notice'], \
+                 #HOOK.commands .. ' ' .. table.concat(nodes, ' ') .. ' ' .. c.crossing_type",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        first,
+        "1\tNot in multiplayer yet: changing a level crossing's type \
+         (crossings awaits two-player game acceptance)"
+    );
+    assert_eq!(sent, "1 10,20,1 18,20,1 railroad_crossing/era_c_eu.rcr");
+    assert_eq!(
+        last,
+        "4\tNot in multiplayer yet: changing a level crossing's type \
+         (a crossing change that rebuilds the crossing's tracks)"
+    );
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    for line in [
+        "stopped a build the room cannot carry: the crossing is of that type already [crossing window]",
+        "stopped a build the room cannot carry: the crossing is gone [crossing window]",
+    ] {
+        assert!(logged.iter().any(|l| l == line), "{line}: {logged:?}");
+    }
+}
+
+/// Every game finds the one crossing on exactly the nodes named, checks the
+/// acting company may change it, gives it the type through the game's own
+/// proposal and reads it back; a crossing elsewhere, another company's, an
+/// unknown type or one the game did not take is refused alike.
+#[test]
+fn every_game_gives_the_same_crossing_its_type() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_CROSSINGS).exec().unwrap();
+    lua.load("ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossings = true")
+        .exec()
+        .unwrap();
+    lua.load(
+        r#"local function set(nodes, name) return { SetCrossingType = { nodes = nodes, crossing_type = name } } end
+        local here = { { x = 10, y = 20.0004, z = 1 }, { x = 18, y = 20, z = 1.2 } }
+        local other = { { x = 500, y = 0, z = 0 }, { x = 508, y = 0, z = 0 } }
+        HOOK.room = true UPDATE({}, STATE, 0.2)
+        HOOK.batch = {
+            set(here, 'railroad_crossing/era_c_eu.rcr'),
+            set(here, 'railroad_crossing/era_c_eu.rcr'),
+            set({ { x = 10, y = 20, z = 1 } }, 'railroad_crossing/era_a_eu.rcr'),
+            set(other, 'railroad_crossing/era_c_eu.rcr'),
+            set(here, 'railroad_crossing/nowhere.rcr'),
+            set(here, 'hidden.rcr') }
+        UPDATE({}, STATE, 0.2)
+        RETYPES = false
+        HOOK.batch = { set(here, 'railroad_crossing/era_a_eu.rcr') }
+        UPDATE({}, STATE, 0.2)"#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let done: String = lua
+        .load(
+            "local why = {} for _, a in ipairs(HOOK.applied) do \
+                 why[#why + 1] = tostring(a.ok) .. ':' .. tostring(a.why) end \
+             local built = 0 for _, c in ipairs(SENT) do if c.proposal and c.proposal.carrier then built = built + 1 end end \
+             return CROSSINGS[1800].typeIndex .. ' ' .. CROSSINGS[810].typeIndex .. ' ' .. built \
+                 .. ' | ' .. table.concat(why, ' | ')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        done,
+        "5 3 2 | true:nil | true:nil | false:the crossing is not there \
+         | false:the level crossing's road or track belongs to another company \
+         | false:no crossing type railroad_crossing/nowhere.rcr \
+         | false:crossing type hidden.rcr is not offered here \
+         | false:the game did not change the crossing's type"
+    );
+}
+
+/// What each game reads may differ in the last digits, the owner may not
+/// read, and a build may fail: a crossing's nodes match one to one within
+/// the tolerance whatever order they sort in; an owner that does not read is
+/// refused, not taken for no one's; and the hook is never left armed with a
+/// crossing for a later build of the room's.
+#[test]
+fn a_crossing_is_matched_node_for_node_and_never_left_armed() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_CROSSINGS).exec().unwrap();
+    lua.load("ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossings = true")
+        .exec()
+        .unwrap();
+    lua.load(
+        r#"-- Named at x 10 for both nodes; this game has one at 10.001, so it
+        -- sorts the other first.
+        NODE_AT[730] = { x = 10.001, y = 50, z = 1 }
+        NODE_AT[731] = { x = 10, y = 58, z = 1 }
+        CROSSINGS[820] = { nodes = { 730, 731 }, edges = { 920 }, typeIndex = 3 }
+        local streets, tracks = api.engine.system.streetSystem.getNode2StreetEdgeMap,
+            api.engine.system.streetSystem.getNode2TrackEdgeMap
+        api.engine.system.streetSystem.getNode2StreetEdgeMap = function()
+            local m = streets() m[730] = {} m[731] = {} return m end
+        api.engine.system.streetSystem.getNode2TrackEdgeMap = function()
+            local m = tracks() m[730] = {} m[731] = {} return m end
+        -- An owner whose field does not read.
+        local component = api.engine.getComponent
+        api.engine.getComponent = function(e, kind)
+            if kind == 32 and e == 901 and UNREADABLE then
+                return setmetatable({}, { __index = function() error('no player here') end })
+            end
+            return component(e, kind)
+        end
+        local function set(nodes, name) return { SetCrossingType = { nodes = nodes, crossing_type = name } } end
+        local here = { { x = 10, y = 20, z = 1 }, { x = 18, y = 20, z = 1 } }
+        local shifted = { { x = 10, y = 50, z = 1 }, { x = 10, y = 58, z = 1 } }
+        HOOK.room = true UPDATE({}, STATE, 0.2)
+        HOOK.batch = { set(shifted, 'railroad_crossing/era_c_eu.rcr') }
+        UPDATE({}, STATE, 0.2)
+        UNREADABLE = true
+        HOOK.batch = { set(here, 'railroad_crossing/era_c_eu.rcr') }
+        UPDATE({}, STATE, 0.2)
+        UNREADABLE = false
+        -- The context fails before anything is armed; the build fails once
+        -- armed: either way nothing stays armed, and the next action builds.
+        local new = api.type.Context.new
+        api.type.Context.new = function() error('no context') end
+        HOOK.batch = { set(here, 'railroad_crossing/era_c_eu.rcr') }
+        UPDATE({}, STATE, 0.2)
+        api.type.Context.new = new
+        ARMED_AFTER_CONTEXT = CARRIER ~= nil
+        REFUSE = true
+        HOOK.batch = { set(here, 'railroad_crossing/era_c_eu.rcr') }
+        UPDATE({}, STATE, 0.2)
+        REFUSE = false
+        ARMED_AFTER_REFUSAL = CARRIER ~= nil
+        HOOK.batch = { set(here, 'railroad_crossing/era_c_eu.rcr') }
+        UPDATE({}, STATE, 0.2)"#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let done: String = lua
+        .load(
+            "local why = {} for _, a in ipairs(HOOK.applied) do \
+                 why[#why + 1] = tostring(a.ok) .. ':' .. tostring(a.why) end \
+             return CROSSINGS[1820].typeIndex .. ' ' .. CROSSINGS[1800].typeIndex .. ' ' \
+                 .. tostring(ARMED_AFTER_CONTEXT) .. ' ' .. tostring(ARMED_AFTER_REFUSAL) \
+                 .. ' | ' .. (table.concat(why, ' | '):gsub('[^ |:]+%.rs:%d+:%d+: ', ''))",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        done,
+        "5 5 false false | true:nil \
+         | false:the owner of the level crossing's road or track does not read \
+         | false:no context | false:the proposal collides | true:nil"
+    );
+}
+
+/// A window rebuild includes segment and possibly junction changes that a
+/// type-only replay cannot preserve, so even an otherwise matching crossing
+/// is refused and the player is told why.
+#[test]
+fn the_window_s_rebuild_of_a_crossing_is_refused() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_CROSSINGS).exec().unwrap();
+    lua.load(
+        r#"ug_require('tpf3mp_1::/scripts/tpf3mp/acceptance.lua').crossings = true
+        HOOK.room = true HOOK.clicks = 0 SCRIPT.guiUpdate({}, nil, nil)
+        HOOK.built[0] = { proposal = { crossingType = true, type = 5, nodes = { 701, 700 }, removed = { 900, 901 },
+            junctions = { 650, 701 } } }
+        HOOK.built[1] = { proposal = { crossingType = true, type = 5, nodes = { 700 }, removed = { 900 } } }
+        HOOK.built[2] = { proposal = { crossingType = true, type = 5, nodes = { 700, 701 }, removed = { 911 } } }
+        HOOK.built[3] = { proposal = { crossingType = true, type = 5, nodes = { 700, 710 }, removed = { 900 } } }
+        HOOK.built[4] = { proposal = { crossingType = true, type = 5, nodes = { 700, 701 }, removed = { 900 },
+            junctions = { 651 } } }
+        HOOK.clicks = 5 SCRIPT.guiUpdate({}, nil, nil)"#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let commands: usize = lua
+        .load("return #HOOK.commands")
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(commands, 0);
+    let notice: String = lua
+        .load("return HOOK.notes['tpf3mp.notice']")
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert!(
+        notice.contains("a crossing rebuild also changes segments or junctions"),
+        "{notice}"
+    );
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    let reason = "stopped a build the room cannot carry: a crossing rebuild also changes segments or junctions and is not carried [crossing window]";
+    assert_eq!(
+        logged.iter().filter(|line| line.as_str() == reason).count(),
+        5,
+        "{logged:?}"
+    );
+}
+
+/// Level crossings' types are in the network lane, so two games whose
+/// crossings differ split at the next checkpoint: each crossing by its
+/// nodes' places and its type by its file, whatever the engine numbers them,
+/// whether the engine lists the crossings or they are found from the nodes on
+/// both a street and a track; a tile reads its own crossings only, and each
+/// row is placed in a part, with the junctions.
+#[test]
+fn level_crossings_types_are_in_the_network_lane() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_CROSSINGS).exec().unwrap();
+    let out: Vec<String> = lua
+        .load(
+            r#"local L = ug_require('tpf3mp_1::/scripts/tpf3mp/lanes.lua')
+            local C = ug_require('tpf3mp_1::/scripts/tpf3mp/crossings.lua')
+            -- No edges in this lane but the crossings' rows.
+            api.engine.system.streetSystem.getNode2SegmentMap = function() return {} end
+            -- The engine lists the crossings.
+            api.engine.getEntitiesWithComponent = function(kind)
+                if kind == 31 then local out = {} for e in pairs(CROSSINGS) do out[#out + 1] = e end return out end
+                return {}
+            end
+            local rows = C.rows(api)
+            local listed = C.listed
+            local lane = L.read(api)[L.NETWORK]
+            -- It refuses: found from the nodes instead, the same rows.
+            api.engine.getEntitiesWithComponent = function(kind)
+                if kind == 31 then error('Cannot loop over this component type') end
+                return {}
+            end
+            local byNodes = C.rows(api)
+            local byNodesListed = C.listed
+            -- Another type: another lane.
+            CROSSINGS[800].typeIndex = 5
+            local retyped = L.read(api)[L.NETWORK]
+            CROSSINGS[800].typeIndex = 3
+            -- The same world numbered otherwise: the same lane.
+            local renumbered = {}
+            for e, c in pairs(CROSSINGS) do
+                renumbered[e + 5000] = { nodes = c.nodes, edges = c.edges, typeIndex = c.typeIndex }
+            end
+            local before = CROSSINGS
+            CROSSINGS = renumbered
+            local again = L.read(api)[L.NETWORK]
+            CROSSINGS = before
+            -- A tile's nodes: its crossings only.
+            local tile = C.rows(api, { [700] = true, [999] = true })
+            -- A lookup that fails, or a type with no name, fails the read: never
+            -- a crossing left out, never a type by its index.
+            local lookup = api.engine.system.railRoadCrossingSystem.getRailroadCrossingForNode
+            api.engine.system.railRoadCrossingSystem.getRailroadCrossingForNode = function() error('busy') end
+            local okLookup, whyLookup = pcall(C.rows, api, { [700] = true })
+            api.engine.system.railRoadCrossingSystem.getRailroadCrossingForNode = lookup
+            TYPES[3] = nil
+            local okName, whyName = pcall(C.rows, api, { [700] = true })
+            TYPES[3] = 'railroad_crossing/era_a_eu.rcr'
+            assert(not okLookup and whyLookup == 'the crossing on node 700 does not read', tostring(whyLookup))
+            assert(not okName and whyName == 'the type of level crossing 800 has no name', tostring(whyName))
+            assert(lane ~= 'err' and retyped ~= 'err', tostring(lane))
+            return { table.concat(rows, ' || '), listed, byNodesListed,
+                tostring(table.concat(byNodes, ' || ') == table.concat(rows, ' || ')),
+                tostring(lane ~= retyped), tostring(lane == again), table.concat(tile, ' || '),
+                L.rowKind(L.NETWORK, rows[1]), tostring(L.rowPart(L.NETWORK, rows[1], 10)),
+                tostring(L.rowPart(L.NETWORK, rows[2], 10)) }"#,
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        out[0],
+        "crossing:10000,20000,1000;18000,20000,1000|railroad_crossing/era_a_eu.rcr \
+         || crossing:500000,0,0;508000,0,0|railroad_crossing/era_a_eu.rcr"
+    );
+    assert_eq!(out[1], "listed 2");
+    assert_eq!(out[2], "by nodes 2");
+    assert_eq!(out[3], "true", "both listings give the same rows");
+    assert_eq!(out[4], "true", "a crossing's type is in the lane");
+    assert_eq!(out[5], "true", "no entity id is");
+    assert_eq!(
+        out[6],
+        "crossing:10000,20000,1000;18000,20000,1000|railroad_crossing/era_a_eu.rcr"
+    );
+    assert_eq!(out[7], "junctions");
+    // By the first node's millimetres in cells of 256 m: (0, 0) and (1, 0).
+    assert_eq!(out[8], "0");
+    assert_eq!(out[9], "1");
+}
+
+/// Where the hook reads the parts, it reads their level crossings too; this
+/// Lua names their types (`part`'s `crossingTypes`, `partTexts`' eighth
+/// argument), so two games whose crossing's type differs split there, and a
+/// type with no name stops the check rather than going by its index.
+#[test]
+fn rolling_parts_name_the_level_crossings_the_hook_reads() {
+    let game = |name: &str| {
+        let lua = rolling_game();
+        lua.load(FAKE_PARTS).exec().unwrap();
+        lua.load(format!(
+            r#"PART_CROSSINGS = {{ 3 }}
+            api.res = api.res or {{}}
+            api.res.railroadCrossingTypeRep = {{ getName = function(i)
+                if i == 3 then return {name:?} end
+            end }}"#
+        ))
+        .exec()
+        .unwrap();
+        lua
+    };
+    let read = |lua: &Lua| -> Vec<String> {
+        lua.load(
+            "for s=1,11 do ROLL_STEP(s,false) end local r=ROLL_STEP(12,true) \
+             local out={} for n=0,6 do out[#out+1]=r[n] end return out",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(lua)))
+    };
+    let (a, b) = (read(&game("crossing/a.rcr")), read(&game("crossing/b.rcr")));
+    assert_ne!(a[0], b[0], "the crossing's type is in the network history");
+    assert_eq!(a[1..], b[1..], "and in nothing else");
+    assert_eq!(
+        read(&game("crossing/a.rcr")),
+        a,
+        "the same world, the same history"
+    );
+    // No name: the check stops on the junctions turn (the second update).
+    let nameless = game("");
+    assert!(
+        nameless
+            .load("ROLL_STEP(1,false) ROLL_STEP(2,false)")
+            .exec()
+            .is_err()
     );
 }

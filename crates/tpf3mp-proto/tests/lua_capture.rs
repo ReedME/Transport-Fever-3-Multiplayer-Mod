@@ -18,8 +18,9 @@ use mlua::{Lua, Table, Value};
 use tpf3mp_proto::{
     BoundedVec, Text,
     action::{
-        Action, AssetRef, AssetRemoval, Bulldoze, EdgeEnds, EdgeKind, EdgeRef, Link, Network,
-        NodeRef, Polyline, Pos, Resolve, RoadBuild, Structure, Tangent, TrackBuild, Tram, Vertex,
+        Action, AssetRef, AssetRemoval, Bulldoze, EdgeEnds, EdgeKind, EdgeRef, Fraction, Link,
+        Network, NodeRef, Polyline, Pos, Resolve, RoadBuild, Structure, Tangent, TrackBuild, Tram,
+        Vertex,
     },
     lua::{LuaValue, action_from_lua},
 };
@@ -111,6 +112,9 @@ fn tangent(x: i32, y: i32, z: i32) -> Tangent {
 fn link(from: u16, to: u16, t0: Tangent, t1: Tangent, structure: Structure) -> Link {
     Link {
         precedence: None,
+        position0: None,
+        position1: None,
+        kept: BoundedVec::default(),
 
         from,
         to,
@@ -222,6 +226,7 @@ fn a_captured_road_decodes_as_the_schema_says() {
             network: Network::Street,
             at: pos(450_000, 0, 2_000),
         }])),
+        crossing_type: None,
     });
     assert_eq!(decode(road), expected);
 }
@@ -293,6 +298,7 @@ fn a_captured_track_decodes_as_the_schema_says() {
             )]),
         )
         .unwrap(),
+        crossing_type: None,
     });
     assert_eq!(decode(track), expected);
 }
@@ -421,13 +427,15 @@ fn capture_with(street: &str, call: &str) -> Result<LuaValue, String> {
              -- The track 30-31 runs north at x = 300.
              local NODES = {{ [7] = v(0, 0, 0), [8] = v(50, -40, 0), [9] = v(50, 1, 0), [10] = v(50, 40, 0),
                               [20] = v(120, -30, 0), [21] = v(120, 30, 0), [30] = v(300, -30, 0),
-                              [31] = v(300, 30, 0) }}
-             local TRACKS = {{ [30] = {{ 110 }}, [31] = {{ 110 }} }}
+                              [31] = v(300, 30, 0), [32] = v(300, 90, 0) }}
+             local TRACKS = {{ [30] = {{ 110 }}, [31] = {{ 110, 111 }}, [32] = {{ 111 }} }}
              local STREETS = {{ [7] = {{ 104 }}, [8] = {{ 100 }}, [9] = {{ 100, 101 }}, [10] = {{ 101 }},
                                 [20] = {{ 102 }}, [21] = {{ 102 }} }}
              api = {{
-                 type = {{ enum = {{ BaseEdgeType = {{ NORMAL = 0, BRIDGE = 1, TUNNEL = 2 }} }},
-                          ComponentType = {{ BASE_NODE = 1, CONSTRUCTION = 2 }} }},
+                 type = {{ enum = {{ BaseEdgeType = {{ NORMAL = 0, BRIDGE = 1, TUNNEL = 2 }},
+                                    EdgeObjectType = {{ STOP_LEFT = 0, STOP_RIGHT = 1, SIGNAL = 2 }} }},
+                          ComponentType = {{ BASE_NODE = 1, CONSTRUCTION = 2, EDGE_OBJECT = 3, SIGNAL_LIST = 4 }},
+                          Signal = {{ Type = {{ SIGNAL = 0, ONE_WAY_SIGNAL = 1, WAYPOINT = 2 }} }} }},
                  res = {{ bridgeTypeRep = {{ getName = function(i) if i == 3 then return 'bridge/stone.lua' end end }},
                           edgeDecorationRep = {{ getName = function(i)
                               if i == 3 then return '::/infrastructure/edge_addons/barrier_b.edge' end end }} }},
@@ -437,6 +445,23 @@ fn capture_with(street: &str, call: &str) -> Result<LuaValue, String> {
                          -- 900 a town's house, 901 a station.
                          if kind == 2 and id == 900 then return {{ townBuildings = {{ 1 }} }} end
                          if kind == 2 and id == 901 then return {{ townBuildings = {{}} }} end
+                         -- On the track 30-31: 556 a signal three quarters of the
+                         -- way north, 557 a waypoint a quarter of the way, 558 a
+                         -- signal half way, 559 a mod's signal three quarters.
+                         if kind == 4 and id == 557 then return {{ signals = {{ {{ type = 2 }} }} }} end
+                         if kind == 4 and id >= 556 and id <= 559 then return {{ signals = {{ {{ type = 0 }} }} }} end
+                         if kind == 3 and id == 556 then
+                             return {{ param = 0.75, edgeObjectConstruction = '::/infrastructure/signal/signal_path_a.con' }}
+                         end
+                         if kind == 3 and id == 558 then
+                             return {{ param = 0.5, edgeObjectConstruction = '::/infrastructure/signal/signal_path_a.con' }}
+                         end
+                         if kind == 3 and id == 559 then
+                             return {{ param = 0.75, edgeObjectConstruction = 'custom_signals_1::/infrastructure/signal/custom.con' }}
+                         end
+                         if kind == 3 and id == 557 then
+                             return {{ param = 0.25, edgeObjectConstruction = '::/infrastructure/signal/waypoint.con' }}
+                         end
                      end,
                      system = {{ streetSystem = {{
                          getNodeStreetSegments = function(n) return STREETS[n] or {{}} end,
@@ -542,6 +567,7 @@ fn a_tf3_proposal_travels_as_the_tool_made_it() {
             network: Network::Street,
             at: pos(50_000, 1_000, 0),
         }])),
+        crossing_type: None,
     });
     assert_eq!(
         action, expected,
@@ -653,6 +679,107 @@ fn a_stop_moves_with_a_road_only_on_the_edge_rebuilt_in_place() {
     assert!(why.contains("adds a stop or signal"), "{why}");
 }
 
+/// The bulldozer over a track's stub that ends on the country street 8-9-10
+/// at its node 9 (a level crossing), as build 40420 proposed it in a room
+/// (2026-10-16): the stub 120 (9-32) and its far node 32 go, the crossing
+/// node 9 goes, and its street edges 100 and 101 are joined into one edge
+/// 8-10. `JOIN` names the added edge's ends, `OBJECTS` the objects on the
+/// street edge 100, `TO_REMOVE` the constructions the bulldozer takes.
+const STUB_PROPOSAL: &str = "{ toAdd = {}, toRemove = TO_REMOVE, proposal = {
+    addedNodes = {},
+    addedSegments = {
+        { entity = -1, type = 0, comp = { node0 = 8, node1 = JOIN, tangent0 = v(0, 80, 0), tangent1 = v(0, 80, 0),
+          type = 0, typeIndex = -1, roadTemplate = 'street/country.street_template', roadStyle = '',
+          objects = {} } },
+    },
+    removedSegments = { { entity = 120, type = 1, comp = { node0 = 9, node1 = 32, objects = {} } },
+                        { entity = 100, type = 0, comp = { node0 = 8, node1 = 9, objects = OBJECTS } },
+                        { entity = 101, type = 0, comp = { node0 = 9, node1 = 10, objects = {} } },
+                        EXTRA_REMOVED },
+    removedNodes = { { entity = 9, comp = { position = v(50, 1, 0) } },
+                     { entity = 32, comp = { position = v(10, 1, 0) } } },
+} }";
+
+/// The bulldozer's capture of [`STUB_PROPOSAL`], the stub on node 9.
+fn capture_stub(join: &str, objects: &str, to_remove: &str) -> Result<LuaValue, String> {
+    capture_stub_with_extra(join, objects, to_remove, "")
+}
+
+fn capture_stub_with_extra(
+    join: &str,
+    objects: &str,
+    to_remove: &str,
+    extra_removed: &str,
+) -> Result<LuaValue, String> {
+    let proposal = STUB_PROPOSAL
+        .replace("JOIN", join)
+        .replace("OBJECTS", objects)
+        .replace("TO_REMOVE", to_remove)
+        .replace("EXTRA_REMOVED", extra_removed);
+    capture_with(
+        "nil",
+        &format!(
+            "(function() NODES[32] = v(10, 1, 0) TRACKS[9] = {{ 120 }} TRACKS[32] = {{ 120 }} \
+             return engine.bulldoze({proposal}) end)()"
+        ),
+    )
+}
+
+/// The game's own removal of such a stub joins nothing, and the game
+/// refused it ("Construction Not Possible", a room on build 40420): the
+/// stub travels with the join, as the build the bulldozer proposes, its
+/// stub removed in its own network.
+#[test]
+fn a_stub_bulldozed_off_a_street_travels_with_the_street_joined() {
+    let action = decode(capture_stub("10", "{}", "{}").unwrap());
+    let Action::BuildRoad(road) = action else {
+        panic!("{action:?}")
+    };
+    assert_eq!(road.street.as_str(), "street/country.street_template");
+    let polyline = &road.polyline;
+    assert_eq!(polyline.links.len(), 1);
+    assert_eq!(polyline.vertices.len(), 2);
+    assert!(
+        polyline
+            .vertices
+            .iter()
+            .all(|v| matches!(v.resolve, Resolve::Node(Network::Street)))
+    );
+    let networks: Vec<_> = polyline.removals.iter().map(|r| r.network).collect();
+    assert_eq!(networks, [Network::Track, Network::Street, Network::Street]);
+    let nodes: Vec<_> = polyline.removed_nodes.iter().map(|n| n.network).collect();
+    assert_eq!(nodes, [Network::Street, Network::Track]);
+}
+
+#[test]
+fn a_bulldozer_join_the_room_cannot_account_for_is_refused() {
+    // An added edge that joins no two removed edges at a removed node.
+    let why = capture_stub("32", "{}", "{}").unwrap_err();
+    assert_eq!(why, "a bulldozer proposal that builds");
+    // A signal on a street edge it joins: it would move onto the new edge.
+    let why = capture_stub("10", "{ { 555, 1 } }", "{}").unwrap_err();
+    assert!(
+        why.contains("removes an edge with a stop or signal"),
+        "{why}"
+    );
+    // Town buildings along a street it removes.
+    let why = capture_stub("10", "{}", "{ 900 }").unwrap_err();
+    assert_eq!(
+        why,
+        "removing a street with town buildings where the bulldozer joins the streets left"
+    );
+}
+
+#[test]
+fn a_join_does_not_carry_an_unpaired_removed_edge() {
+    // Edge 102 is a valid, existing street, but it is unrelated to the
+    // 100/101 pair joined at removed node 9. It must not pass through as an
+    // extra action removal.
+    let extra = "{ entity = 102, type = 0, comp = { node0 = 20, node1 = 21, objects = {} } }";
+    let why = capture_stub_with_extra("10", "{}", "{}", extra).unwrap_err();
+    assert_eq!(why, "a bulldozer proposal that builds");
+}
+
 /// A road the tool draws through a town's house: the house goes with the
 /// build, which every game's build clears again; a station in the way does
 /// not.
@@ -709,6 +836,46 @@ fn a_track_modifier_carries_its_type_catenary_and_speed() {
     assert_eq!(track.polyline.removals[0].network, Network::Track);
 }
 
+/// The track tool's proposal for a track laid onto the end of street 104 at
+/// node 7 (0, 0, 0), as build 40420 makes it: the new edge starts 2 m beside
+/// the node, on the street's tram lane, and ends at its new node.
+const TRACK_ONTO_STREET_END: &str = "{
+    addedNodes = { { entity = -1, comp = { position = v(-50, -10, 0) } } },
+    addedSegments = {
+        { entity = -2, type = 1, comp = { node0 = 7, node1 = -1,
+          position0 = v(-0.3146, -1.9752, 0), position1 = v(-50, -10, 0),
+          tangent0 = v(-50, -8, 0), tangent1 = v(-50, -8, 0),
+          type = 0, typeIndex = -1, roadTemplate = 'track/standard.track_template', roadStyle = '' } },
+    },
+    removedSegments = {},
+}";
+
+#[test]
+fn a_track_onto_a_street_end_starts_where_the_tool_put_it() {
+    let action = decode(
+        capture_with(
+            TRACK_ONTO_STREET_END,
+            "engine.captureBuild({ toAdd = {}, toRemove = {}, proposal = street }, 'Track')",
+        )
+        .unwrap(),
+    );
+    let Action::BuildTrack(track) = action else {
+        panic!("{action:?}")
+    };
+    assert_eq!(
+        track.polyline.vertices[0],
+        node(0, 0, 0, Network::Street),
+        "the street's end node"
+    );
+    let link = &track.polyline.links[0];
+    assert_eq!(
+        link.position0,
+        Some(pos(-315, -1975, 0)),
+        "the start on the tram lane, beside its node, rounded to millimetres"
+    );
+    assert_eq!(link.position1, None, "the end is its new node");
+}
+
 #[test]
 fn an_upgrade_is_said_in_one_line_and_another_build_is_not_an_upgrade() {
     let summary = |street: &str, call: &str| match capture_with(street, call).unwrap() {
@@ -739,8 +906,8 @@ fn an_upgrade_is_said_in_one_line_and_another_build_is_not_an_upgrade() {
 
 /// The bridge and tunnel window's type change (`bridge_and_tunnel.tl`,
 /// `createBridgeOrTunnelProposal`), as the window sends it: the track
-/// 30-31 rebuilt in place between the same nodes as a stone bridge
-/// (INFERRED from the API's proposal shape, not yet seen in the game).
+/// 30-31 rebuilt in place between the same nodes as a stone bridge (the
+/// shape the window sent in a two-player game on build 40420, 2026-10-11).
 const BRIDGE_WINDOW_PROPOSAL: &str = "{
     addedNodes = {},
     addedSegments = {
@@ -771,6 +938,12 @@ fn window_build(street: &str, gate: bool) -> Result<LuaValue, String> {
 fn a_bridge_window_rebuild_travels_as_the_track_it_rebuilds() {
     let why = window_build(BRIDGE_WINDOW_PROPOSAL, false).unwrap_err();
     assert!(why.contains("awaits two-player game acceptance"), "{why}");
+    // On by default since the two-player game of 2026-10-11.
+    let default = capture_with(
+        BRIDGE_WINDOW_PROPOSAL,
+        "require('tpf3mp.capture').windowBuild(nil, { toAdd = {}, toRemove = {}, proposal = street })",
+    );
+    assert!(default.is_ok(), "{default:?}");
 
     let action = decode(window_build(BRIDGE_WINDOW_PROPOSAL, true).unwrap());
     let Action::BuildTrack(track) = action else {
@@ -815,6 +988,626 @@ fn a_bridge_window_rebuild_travels_as_the_track_it_rebuilds() {
     assert!(
         why.contains("removes an edge with a stop or signal"),
         "{why}"
+    );
+}
+
+/// The track tool's proposal for a track started from the middle of the
+/// track 30-31, as build 40420 makes it: the new node -1 cuts 30-31 in two,
+/// the signal 556 three quarters of the way north going with the northern
+/// piece (`OBJECTS_S` and `OBJECTS_N` the pieces' objects), and the new
+/// track runs west from -1 to -2.
+const TRACK_SPLIT_PROPOSAL: &str = "{
+    addedNodes = { { entity = -1, comp = { position = v(300, 0, 0) } },
+                   { entity = -2, comp = { position = v(260, 0, 0) } } },
+    addedSegments = {
+        { entity = -3, type = 1, comp = { node0 = 30, node1 = -1, tangent0 = v(0, 30, 0), tangent1 = v(0, 30, 0),
+          type = 0, typeIndex = -1, roadTemplate = 'track/standard.track_template', roadStyle = '',
+          objects = OBJECTS_S } },
+        { entity = -4, type = 1, comp = { node0 = NORTH, tangent0 = TN, tangent1 = TN,
+          type = 0, typeIndex = -1, roadTemplate = 'track/standard.track_template', roadStyle = '',
+          objects = OBJECTS_N } },
+        { entity = -5, type = 1, comp = { node0 = -1, node1 = -2, tangent0 = v(-40, 0, 0), tangent1 = v(-40, 0, 0),
+          type = 0, typeIndex = -1, roadTemplate = 'track/standard.track_template', roadStyle = '',
+          objects = OBJECTS_W } },
+    },
+    removedSegments = { { entity = 110, type = 1, comp = { node0 = 30, node1 = 31,
+                          tangent0 = v(0, 60, 0), tangent1 = v(0, 60, 0), objects = OBJECTS_OLD } } },
+    removedNodes = {},
+}";
+
+fn track_split(old: &str, south: &str, north: &str) -> String {
+    track_split_west(old, south, north, "{}")
+}
+
+/// As [`track_split`], `west` the objects of the new track west of the cut.
+fn track_split_west(old: &str, south: &str, north: &str, west: &str) -> String {
+    TRACK_SPLIT_PROPOSAL
+        .replace("OBJECTS_OLD", old)
+        .replace("OBJECTS_W", west)
+        .replace("OBJECTS_S", south)
+        .replace("OBJECTS_N", north)
+        .replace("NORTH", "-1, node1 = 31")
+        .replace("TN", "v(0, 30, 0)")
+}
+
+fn capture_track(street: &str) -> Result<LuaValue, String> {
+    capture_with(
+        street,
+        "engine.captureBuild({ toAdd = {}, toRemove = {}, proposal = street }, 'Track')",
+    )
+}
+
+/// A track started or ended between a track's signals cuts that track in
+/// two: the signal goes with the piece it stands on, the one the tool put
+/// it on, named by where it stood (playtest 2026-10-17, "a build that moves
+/// a stop or signal"). The accepted case is enabled; the gate-off check below
+/// confirms that it refuses the action when disabled.
+#[test]
+fn a_track_cut_between_its_signals_keeps_each_on_its_piece() {
+    let action = capture_track(&track_split("{ { 556, 2 } }", "{}", "{ { 556, 2 } }")).unwrap();
+    let decoded = decode(action);
+    let Action::BuildTrack(track) = &decoded else {
+        panic!("{decoded:?}")
+    };
+    let links = &track.polyline.links;
+    assert_eq!(links.len(), 3);
+    assert!(links[0].kept.is_empty() && links[2].kept.is_empty());
+    assert_eq!(links[1].kept.len(), 1);
+    let kept = &links[1].kept[0];
+    assert_eq!(kept.removal, 0);
+    assert_eq!(kept.at, Fraction(750_000));
+    assert_eq!(
+        kept.model.as_str(),
+        "::/infrastructure/signal/signal_path_a.con"
+    );
+    assert_eq!(track.polyline.removals.len(), 1);
+
+    // On the piece before the cut, where the tool put it: the tool decides,
+    // and the game places it on that piece (seen on build 40420, 2026-10-17,
+    // a node moved near the cut and the signal past it).
+    let south =
+        decode(capture_track(&track_split("{ { 556, 2 } }", "{ { 556, 2 } }", "{}")).unwrap());
+    let Action::BuildTrack(south) = &south else {
+        panic!("{south:?}")
+    };
+    assert_eq!(south.polyline.links[0].kept.len(), 1);
+    assert!(south.polyline.links[1].kept.is_empty());
+    // A mod's signal, which the room's games all have.
+    let modded =
+        decode(capture_track(&track_split("{ { 559, 2 } }", "{}", "{ { 559, 2 } }")).unwrap());
+    let Action::BuildTrack(modded) = &modded else {
+        panic!("{modded:?}")
+    };
+    assert_eq!(
+        modded.polyline.links[1].kept[0].model.as_str(),
+        "custom_signals_1::/infrastructure/signal/custom.con"
+    );
+
+    // On since its two-player game (2026-10-17); with its gate off, it
+    // waits, on sending and on applying alike.
+    let on = capture_with(
+        &track_split("{ { 556, 2 } }", "{}", "{ { 556, 2 } }"),
+        "(function() local a = engine.captureBuild({ toAdd = {}, toRemove = {}, proposal = street }, 'Track') local ok, why = require('tpf3mp.acceptance').check(a) return ok == false and why or 'let through' end)()",
+    );
+    assert_eq!(on, Ok(LuaValue::String(b"let through".to_vec())));
+    let gate = capture_with(
+        &track_split("{ { 556, 2 } }", "{}", "{ { 556, 2 } }"),
+        "(function() require('tpf3mp.acceptance').splitSignals = false local a = engine.captureBuild({ toAdd = {}, toRemove = {}, proposal = street }, 'Track')          local ok, why = require('tpf3mp.acceptance').check(a) return ok == false and why or 'let through' end)()",
+    );
+    assert_eq!(
+        gate,
+        Ok(LuaValue::String(
+            b"splitSignals awaits two-player game acceptance".to_vec()
+        ))
+    );
+    // A construction's streets keep none (every game's build of them would
+    // refuse it), and the gate covers them too.
+    let connection = capture_with(
+        &track_split("{ { 556, 2 } }", "{}", "{ { 556, 2 } }"),
+        "engine.fromProposal({ toAdd = {}, toRemove = {}, proposal = street }, nil, true)",
+    )
+    .unwrap_err();
+    assert!(
+        connection.contains("moves a stop or signal"),
+        "{connection}"
+    );
+    let gate = capture_with(
+        "{}",
+        "(function() require('tpf3mp.acceptance').splitSignals = false local ok, why = require('tpf3mp.acceptance').check({ BuildConstruction = {          connection = { links = { { kept = { {} } } } } } }) return ok == false and why or 'let through' end)()",
+    );
+    assert_eq!(
+        gate,
+        Ok(LuaValue::String(
+            b"splitSignals awaits two-player game acceptance".to_vec()
+        ))
+    );
+}
+
+#[test]
+fn a_track_cut_that_moves_a_signal_elsewhere_is_refused() {
+    let refused = |old: &str, south: &str, north: &str, why: &str| {
+        let got = capture_track(&track_split(old, south, north)).unwrap_err();
+        assert!(got.contains(why), "{got}");
+    };
+    // Onto the new track west of the cut, which does not go on from it.
+    let west = capture_track(&track_split_west(
+        "{ { 556, 2 } }",
+        "{}",
+        "{}",
+        "{ { 556, 2 } }",
+    ))
+    .unwrap_err();
+    assert!(west.contains("does not go on from its track"), "{west}");
+    // Dropped.
+    refused(
+        "{ { 556, 2 } }",
+        "{}",
+        "{}",
+        "removes an edge with a stop or signal",
+    );
+    // Twice on one piece.
+    refused(
+        "{ { 556, 2 } }",
+        "{}",
+        "{ { 556, 2 }, { 556, 2 } }",
+        "moves a stop or signal",
+    );
+    // A waypoint, which lines name, whatever its construction.
+    refused("{ { 557, 2 } }", "{ { 557, 2 } }", "{}", "moves a waypoint");
+    // A stop, or the signal taken for a stop.
+    refused(
+        "{ { 556, 0 } }",
+        "{}",
+        "{ { 556, 0 } }",
+        "moves a stop or signal",
+    );
+    refused(
+        "{ { 556, 2 } }",
+        "{}",
+        "{ { 556, 0 } }",
+        "moves a stop or signal",
+    );
+    // A new signal with the track.
+    refused(
+        "{ { 556, 2 } }",
+        "{}",
+        "{ { 556, 2 }, { -400000000, 2 } }",
+        "adds a stop or signal",
+    );
+    // The northern piece laid the other way round.
+    let reversed = TRACK_SPLIT_PROPOSAL
+        .replace("OBJECTS_OLD", "{ { 556, 2 } }")
+        .replace("OBJECTS_S", "{}")
+        .replace("OBJECTS_N", "{ { 556, 2 } }")
+        .replace("OBJECTS_W", "{}")
+        .replace("NORTH", "31, node1 = -1")
+        .replace("TN", "v(0, -30, 0)");
+    let why = capture_track(&reversed).unwrap_err();
+    assert!(why.contains("does not go on from its track"), "{why}");
+}
+
+/// A track started close to a node of a track with signals: the tool
+/// removes the node, redraws the track through its own and lists one new
+/// signal (playtest 2026-10-17, run-1017-024110, "a build with a stop or
+/// signal"). The log says what it removes and where each signal goes: the
+/// edges' objects, the objects removed as their EDGE_OBJECT has them, and
+/// whatever of the new record reads, so a game shows whether the tool only
+/// replaces the old signal.
+#[test]
+fn a_refit_signal_is_described_with_what_it_removes() {
+    let refit = track_split("{ { 556, 2 } }", "{}", "{ { -400000000, 2 } }").replace(
+        "removedNodes = {},",
+        "removedNodes = {},
+         edgeObjectsToAdd = { { resultEntity = -400000000, category = 2, left = false, playerEntity = 3892,
+                                name = '', params = { auto_signals_distance = 400 } } },
+         edgeObjectsToRemove = { 556, 999 },",
+    );
+    let described = capture_with(
+        &refit,
+        "engine.describe({ toAdd = {}, toRemove = {}, proposal = street })",
+    )
+    .unwrap();
+    assert_eq!(
+        described,
+        LuaValue::String(
+            "+n-1(300.0,0.0,0.0) +n-2(260.0,0.0,0.0) \
+             +e-3/1:30(300.0,-30.0,0.0)>-1 +e-4/1:-1>31(300.0,30.0,0.0)[-400000000:2] +e-5/1:-1>-2 \
+             -e110:30(300.0,-30.0,0.0)>31(300.0,30.0,0.0)[556:2] \
+             +o{resultEntity=-400000000 category=2 left=false playerEntity=3892 name= \
+             params={auto_signals_distance=400}} \
+             -o556{param=0.75 edgeObjectConstruction=::/infrastructure/signal/signal_path_a.con} \
+             -o999{no edge object}"
+                .as_bytes()
+                .to_vec()
+        )
+    );
+}
+
+/// As [`track_split_west`], with the tool's `edgeObjectsToAdd` and
+/// `edgeObjectsToRemove`.
+fn track_refit(
+    old: &str,
+    south: &str,
+    north: &str,
+    west: &str,
+    adds: &str,
+    removes: &str,
+) -> String {
+    track_split_west(old, south, north, west).replace(
+        "removedNodes = {},",
+        &format!(
+            "removedNodes = {{}}, edgeObjectsToAdd = {adds}, edgeObjectsToRemove = {removes},"
+        ),
+    )
+}
+
+/// As [`capture_track`], with acceptance.lua's refitSignals on.
+fn capture_refit(street: &str) -> Result<LuaValue, String> {
+    capture_with(
+        street,
+        "(function() require('tpf3mp.acceptance').refitSignals = true          return engine.captureBuild({ toAdd = {}, toRemove = {}, proposal = street }, 'Track') end)()",
+    )
+}
+
+/// The track tool's record of a new signal, as build 40420 lists it.
+const NEW_SIGNAL: &str = "{ { resultEntity = -400000000, category = 2, left = false, oneWay = false, playerEntity = 3892, name = '' } }";
+
+/// A track started close to a node of a track with signals: the tool
+/// replaces the signal on the edge whose node it removes with a new one on
+/// the piece that goes on from that edge's other end (run-1017-033551). The
+/// room keeps the old signal there, as for a cut: the same action, the
+/// signal named by where it stood, its construction and settings its own.
+#[test]
+fn a_signal_the_tool_puts_back_is_kept_on_its_piece() {
+    let refit = track_refit(
+        "{ { 556, 2 } }",
+        "{}",
+        "{ { -400000000, 2 } }",
+        "{}",
+        NEW_SIGNAL,
+        "{ 556 }",
+    );
+    let decoded = decode(capture_refit(&refit).unwrap());
+    let kept =
+        decode(capture_track(&track_split("{ { 556, 2 } }", "{}", "{ { 556, 2 } }")).unwrap());
+    assert_eq!(decoded, kept, "the same as the signal kept by its entity");
+    let Action::BuildTrack(track) = &decoded else {
+        panic!("{decoded:?}")
+    };
+    assert_eq!(track.polyline.links[1].kept.len(), 1);
+    assert_eq!(track.polyline.links[1].kept[0].at, Fraction(750_000));
+    // A mod's signal too.
+    let modded = decode(
+        capture_refit(&track_refit(
+            "{ { 559, 2 } }",
+            "{}",
+            "{ { -400000000, 2 } }",
+            "{}",
+            NEW_SIGNAL,
+            "{ 559 }",
+        ))
+        .unwrap(),
+    );
+    let Action::BuildTrack(modded) = &modded else {
+        panic!("{modded:?}")
+    };
+    assert_eq!(
+        modded.polyline.links[1].kept[0].model.as_str(),
+        "custom_signals_1::/infrastructure/signal/custom.con"
+    );
+    // With its gate off: refused, though the room carries a split's kept
+    // signals.
+    let gate = capture_with(
+        &refit,
+        "(function() require('tpf3mp.acceptance').refitSignals = false return engine.captureBuild({ toAdd = {}, toRemove = {}, proposal = street }, 'Track') end)()",
+    )
+    .unwrap_err();
+    assert!(
+        gate.contains("puts back awaits two-player game acceptance"),
+        "{gate}"
+    );
+}
+
+/// As the game proposes it (run-1017-033551): the curved track 30-31, its
+/// signal 558 half way, where the curve bulges 7.5 m east of the straight
+/// line. A track started close to node 31: the tool removes 31, adds its
+/// own node -1 near it and -5 on the old curve, the piece 30>-5 the old
+/// curve up to three quarters (its tangents scaled so), and puts a new
+/// signal on that piece.
+#[test]
+fn a_signal_the_tool_puts_back_on_a_curve_near_a_removed_node_is_kept() {
+    let track = |tangent: &str| {
+        format!(
+            "{{ addedNodes = {{ {{ entity = -1, comp = {{ position = v(301, 31, 0) }} }},
+                              {{ entity = -5, comp = {{ position = v(305.625, 15, 0) }} }},
+                              {{ entity = -2, comp = {{ position = v(340, 31, 0) }} }} }},
+                addedSegments = {{
+                    {{ entity = -3, type = 1, comp = {{ node0 = 30, node1 = -5,
+                        tangent0 = v(22.5, 45, 0), tangent1 = {tangent}, type = 0, typeIndex = -1,
+                        roadTemplate = 'track/standard.track_template', roadStyle = '',
+                        objects = {{ {{ -400000000, 2 }} }} }} }},
+                    {{ entity = -4, type = 1, comp = {{ node0 = -5, node1 = -1,
+                        tangent0 = v(-4.6, 16, 0), tangent1 = v(-4.6, 16, 0), type = 0, typeIndex = -1,
+                        roadTemplate = 'track/standard.track_template', roadStyle = '', objects = {{}} }} }},
+                    {{ entity = -6, type = 1, comp = {{ node0 = -1, node1 = -2,
+                        tangent0 = v(39, 0, 0), tangent1 = v(39, 0, 0), type = 0, typeIndex = -1,
+                        roadTemplate = 'track/standard.track_template', roadStyle = '', objects = {{}} }} }} }},
+                removedSegments = {{ {{ entity = 110, type = 1, comp = {{ node0 = 30, node1 = 31,
+                    tangent0 = v(30, 60, 0), tangent1 = v(-30, 60, 0), objects = {{ {{ 558, 2 }} }} }} }} }},
+                removedNodes = {{ {{ entity = 31, comp = {{ position = v(300, 30, 0) }} }} }},
+                edgeObjectsToAdd = {NEW_SIGNAL}, edgeObjectsToRemove = {{ 558 }} }}"
+        )
+    };
+    let decoded = decode(capture_refit(&track("v(-11.25, 45, 0)")).unwrap());
+    let Action::BuildTrack(built) = &decoded else {
+        panic!("{decoded:?}")
+    };
+    let kept: Vec<_> = built
+        .polyline
+        .links
+        .iter()
+        .flat_map(|link| link.kept.iter())
+        .collect();
+    assert_eq!(kept.len(), 1, "{decoded:?}");
+    assert_eq!(kept[0].removal, 0);
+    assert_eq!(kept[0].at, Fraction(500_000));
+    assert_eq!(
+        kept[0].model.as_str(),
+        "::/infrastructure/signal/signal_path_a.con"
+    );
+    // The piece bent the other way at its far end: it still goes on from
+    // node 30 the same way, but no longer runs where the signal stood.
+    let why = capture_refit(&track("v(30, 45, 0)")).unwrap_err();
+    assert!(why.contains("replaces a signal elsewhere"), "{why}");
+}
+
+/// As the game proposes it (run-1017-pr165-p2, scaled onto track 30-31-32,
+/// one straight line): signal 556 on 30-31, 15 m short of node 31; a track
+/// started close to 31. The tool removes 31 and puts its own node -1 on
+/// 30-31 just past the signal (13.2), so the signal now stands on the
+/// piece -1>32 that took over the track beyond 31, and puts it back there.
+/// Each case `-5` (30>-1) and `-6` (-1>32 or reversed) lists its objects;
+/// `beyond` is the removed track 31-32 as `node0 = .., node1 = ..` with its
+/// tangents.
+fn across_removed_node(on5: &str, six: &str, on6: &str, beyond: &str) -> String {
+    format!(
+        "{{ addedNodes = {{ {{ entity = -1, comp = {{ position = v(300, 13.2, 0) }} }},
+                          {{ entity = -2, comp = {{ position = v(305, 30, 0) }} }} }},
+            addedSegments = {{
+                {{ entity = -3, type = 1, comp = {{ node0 = -1, node1 = -2,
+                    tangent0 = v(0, 17, 0), tangent1 = v(5, 17, 0), type = 0, typeIndex = -1,
+                    roadTemplate = 'track/standard.track_template', roadStyle = '', objects = {{}} }} }},
+                {{ entity = -5, type = 1, comp = {{ node0 = 30, node1 = -1,
+                    tangent0 = v(0, 43.2, 0), tangent1 = v(0, 43.2, 0), type = 0, typeIndex = -1,
+                    roadTemplate = 'track/standard.track_template', roadStyle = '', objects = {on5} }} }},
+                {{ entity = -6, type = 1, comp = {{ {six}, type = 0, typeIndex = -1,
+                    roadTemplate = 'track/standard.track_template', roadStyle = '', objects = {on6} }} }} }},
+            removedSegments = {{
+                {{ entity = 110, type = 1, comp = {{ node0 = 30, node1 = 31,
+                    tangent0 = v(0, 60, 0), tangent1 = v(0, 60, 0), objects = {{ {{ 556, 2 }} }} }} }},
+                {{ entity = 111, type = 1, comp = {{ {beyond}, objects = {{}} }} }} }},
+            removedNodes = {{ {{ entity = 31, comp = {{ position = v(300, 30, 0) }} }} }},
+            edgeObjectsToAdd = {NEW_SIGNAL}, edgeObjectsToRemove = {{ 556 }} }}"
+    )
+}
+
+/// As run-1017-refit, scaled onto track 30-31-32: the tool removes 31 and
+/// sets its own nodes -1 (y 0) before it and -8 (y 50) past it, the piece
+/// -1>-8 between them running where signal 556 stood (y 15), its new
+/// signal listed by `on`; -7 a branch off -1.
+fn across_both_sides(on: &str) -> String {
+    format!(
+        "{{ addedNodes = {{ {{ entity = -1, comp = {{ position = v(300, 0, 0) }} }},
+                          {{ entity = -8, comp = {{ position = v(300, 50, 0) }} }},
+                          {{ entity = -5, comp = {{ position = v(306, 40, 0) }} }} }},
+            addedSegments = {{
+                {{ entity = -3, type = 1, comp = {{ node0 = 30, node1 = -1,
+                    tangent0 = v(0, 30, 0), tangent1 = v(0, 30, 0), type = 0, typeIndex = -1,
+                    roadTemplate = 'track/standard.track_template', roadStyle = '', objects = {{}} }} }},
+                {{ entity = -9, type = 1, comp = {{ node0 = -1, node1 = -8,
+                    tangent0 = v(0, 50, 0), tangent1 = v(0, 50, 0), type = 0, typeIndex = -1,
+                    roadTemplate = 'track/standard.track_template', roadStyle = '', objects = {on} }} }},
+                {{ entity = -10, type = 1, comp = {{ node0 = -8, node1 = 32,
+                    tangent0 = v(0, 40, 0), tangent1 = v(0, 40, 0), type = 0, typeIndex = -1,
+                    roadTemplate = 'track/standard.track_template', roadStyle = '', objects = {{}} }} }},
+                {{ entity = -7, type = 1, comp = {{ node0 = -1, node1 = -5,
+                    tangent0 = v(0, 40, 0), tangent1 = v(6, 40, 0), type = 0, typeIndex = -1,
+                    roadTemplate = 'track/standard.track_template', roadStyle = '', objects = {{}} }} }} }},
+            removedSegments = {{
+                {{ entity = 110, type = 1, comp = {{ node0 = 30, node1 = 31,
+                    tangent0 = v(0, 60, 0), tangent1 = v(0, 60, 0), objects = {{ {{ 556, 2 }} }} }} }},
+                {{ entity = 111, type = 1, comp = {{ {BEYOND_NORTH}, objects = {{}} }} }} }},
+            removedNodes = {{ {{ entity = 31, comp = {{ position = v(300, 30, 0) }} }} }},
+            edgeObjectsToAdd = {NEW_SIGNAL}, edgeObjectsToRemove = {{ 556 }} }}"
+    )
+}
+
+const SIX_NORTH: &str =
+    "node0 = -1, node1 = 32, tangent0 = v(0, 76.8, 0), tangent1 = v(0, 76.8, 0)";
+const BEYOND_NORTH: &str = "node0 = 31, node1 = 32, tangent0 = v(0, 60, 0), tangent1 = v(0, 60, 0)";
+const NEW_ON: &str = "{ { -400000000, 2 } }";
+
+#[test]
+fn a_signal_the_tool_puts_back_across_a_removed_node_is_kept() {
+    let kept = |street: String| {
+        let decoded = decode(capture_refit(&street).unwrap());
+        let Action::BuildTrack(built) = &decoded else {
+            panic!("{decoded:?}")
+        };
+        let kept: Vec<_> = built
+            .polyline
+            .links
+            .iter()
+            .flat_map(|link| link.kept.iter())
+            .collect();
+        assert_eq!(kept.len(), 1, "{decoded:?}");
+        assert_eq!(kept[0].removal, 0, "{decoded:?}");
+        assert_eq!(kept[0].at, Fraction(750_000));
+        assert_eq!(
+            kept[0].model.as_str(),
+            "::/infrastructure/signal/signal_path_a.con"
+        );
+    };
+    kept(across_removed_node("{}", SIX_NORTH, NEW_ON, BEYOND_NORTH));
+    // The removed track beyond the node may run either way round.
+    kept(across_removed_node(
+        "{}",
+        SIX_NORTH,
+        NEW_ON,
+        "node0 = 32, node1 = 31, tangent0 = v(0, -60, 0), tangent1 = v(0, -60, 0)",
+    ));
+    let refused = |street: String, why: &str| {
+        let got = capture_refit(&street).unwrap_err();
+        assert!(got.contains(why), "{why}: {got}");
+    };
+    // As run-1017-refit: the tool sets its own nodes on both sides of the
+    // removed node, -1 on 30-31 and -8 on 31-32, and puts the signal back
+    // on the piece between them, whose ends are no old nodes.
+    kept(across_both_sides(NEW_ON));
+    // A piece from the old track out to another place is no stretch of it.
+    refused(
+        across_both_sides(NEW_ON).replace("v(300, 50, 0) }", "v(303, 50, 0) }"),
+        "replaces a signal elsewhere",
+    );
+    // On the piece before it, which starts 1.8 m past where it stood.
+    refused(
+        across_removed_node(NEW_ON, SIX_NORTH, "{}", BEYOND_NORTH),
+        "replaces a signal elsewhere",
+    );
+    // On the piece beyond the node, drawn the other way: the signal would
+    // face the other way round.
+    refused(
+        across_removed_node(
+            "{}",
+            "node0 = 32, node1 = -1, tangent0 = v(0, -76.8, 0), tangent1 = v(0, -76.8, 0)",
+            NEW_ON,
+            BEYOND_NORTH,
+        ),
+        "replaces a signal elsewhere",
+    );
+}
+
+#[test]
+fn a_signal_the_tool_replaces_otherwise_is_refused() {
+    let refused = |street: String, why: &str| {
+        let got = capture_refit(&street).unwrap_err();
+        assert!(got.contains(why), "{got}");
+    };
+    let north = "{ { -400000000, 2 } }";
+    // A new signal with nothing removed, or one removed with none added.
+    refused(
+        track_refit("{}", "{}", north, "{}", NEW_SIGNAL, "{}"),
+        "a build with a stop or signal",
+    );
+    refused(
+        track_refit("{ { 556, 2 } }", "{}", "{}", "{}", "{}", "{ 556 }"),
+        "a build with a stop or signal",
+    );
+    // A waypoint's or a stop's record.
+    for category in [0, 1] {
+        refused(
+            track_refit(
+                "{ { 556, 2 } }",
+                "{}",
+                north,
+                "{}",
+                &NEW_SIGNAL.replace("category = 2", &format!("category = {category}")),
+                "{ 556 }",
+            ),
+            "a build with a stop or signal",
+        );
+    }
+    // A removed signal on no edge the build removes.
+    refused(
+        track_refit("{}", "{}", north, "{}", NEW_SIGNAL, "{ 558 }"),
+        "a build with a stop or signal",
+    );
+    // The new signal on the new track west of the cut, which does not go on
+    // from the old one.
+    refused(
+        track_refit("{ { 556, 2 } }", "{}", "{}", north, NEW_SIGNAL, "{ 556 }"),
+        "replaces a signal elsewhere",
+    );
+    // The record's signal on no new edge, or listed under another entity.
+    refused(
+        track_refit(
+            "{ { 556, 2 } }",
+            "{}",
+            "{ { -400000001, 2 } }",
+            "{}",
+            NEW_SIGNAL,
+            "{ 556 }",
+        ),
+        "a build with a stop or signal",
+    );
+    // The signal it removes also kept by its entity.
+    refused(
+        track_refit(
+            "{ { 556, 2 } }",
+            "{ { 556, 2 } }",
+            north,
+            "{}",
+            NEW_SIGNAL,
+            "{ 556 }",
+        ),
+        "a build with a stop or signal",
+    );
+    // A waypoint put back: lines name it.
+    refused(
+        track_refit("{ { 557, 2 } }", "{}", north, "{}", NEW_SIGNAL, "{ 557 }"),
+        "moves a waypoint",
+    );
+    // Two signals of one edge for two new ones on one piece: which is which,
+    // the proposal does not say.
+    refused(
+        track_refit(
+            "{ { 556, 2 }, { 558, 2 } }",
+            "{}",
+            "{ { -400000000, 2 }, { -400000001, 2 } }",
+            "{}",
+            "{ { resultEntity = -400000000, category = 2 }, { resultEntity = -400000001, category = 2 } }",
+            "{ 556, 558 }",
+        ),
+        "cannot tell apart",
+    );
+    // On the piece before the cut, which goes on from the old track's end
+    // but not past where the signal stood, three quarters of the way north.
+    refused(
+        track_refit(
+            "{ { 556, 2 } }",
+            "{ { -400000000, 2 } }",
+            "{}",
+            "{}",
+            NEW_SIGNAL,
+            "{ 556 }",
+        ),
+        "replaces a signal elsewhere",
+    );
+    // On the edge rebuilt between the old one's own nodes: a waypoint is
+    // refused before anything else, a signal as not put back on a piece.
+    let in_place = |old: u32| {
+        format!(
+            "{{ addedNodes = {{}},
+                addedSegments = {{ {{ entity = -3, type = 1, comp = {{ node0 = 30, node1 = 31,
+                    tangent0 = v(0, 60, 0), tangent1 = v(0, 60, 0), type = 0, typeIndex = -1,
+                    roadTemplate = 'track/standard.track_template', roadStyle = '',
+                    objects = {{ {{ -400000000, 2 }} }} }} }} }},
+                removedSegments = {{ {{ entity = 110, type = 1, comp = {{ node0 = 30, node1 = 31,
+                    tangent0 = v(0, 60, 0), tangent1 = v(0, 60, 0), objects = {{ {{ {old}, 2 }} }} }} }} }},
+                removedNodes = {{}}, edgeObjectsToAdd = {NEW_SIGNAL}, edgeObjectsToRemove = {{ {old} }} }}"
+        )
+    };
+    refused(in_place(557), "moves a waypoint");
+    refused(in_place(556), "replaces a signal elsewhere");
+    // A construction's streets keep none.
+    let connection = capture_with(
+        &track_refit("{ { 556, 2 } }", "{}", north, "{}", NEW_SIGNAL, "{ 556 }"),
+        "engine.fromProposal({ toAdd = {}, toRemove = {}, proposal = street }, nil, true)",
+    )
+    .unwrap_err();
+    assert!(
+        connection.contains("a build with a stop or signal"),
+        "{connection}"
     );
 }
 

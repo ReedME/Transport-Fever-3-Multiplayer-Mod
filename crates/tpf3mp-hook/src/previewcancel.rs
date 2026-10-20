@@ -19,6 +19,9 @@ type Reset = unsafe extern "C-unwind" fn(usize, u8);
 unsafe extern "C-unwind" fn reset_detour(builder: usize, all: u8) {
     if crate::lua::in_room() {
         crate::previews::withdraw_network();
+        // The build's own reset precedes its Add callback; a later reset
+        // cancels a kept continuation even when the tool remains open.
+        crate::toolchain::proposal_reset(builder);
     }
     // SAFETY: the profile-checked reset's trampoline, with the game's
     // original arguments. Clear first so a new proposal from the reset
@@ -46,6 +49,7 @@ pub unsafe fn install(
     match result {
         Ok(original) => {
             ORIGINAL.store(original, Ordering::Release);
+            crate::toolchain::set_reset_hooked(true);
             "build previews: street and track proposal resets withdraw the player's preview".into()
         }
         Err(why) => format!("build previews: proposal reset withdrawal unavailable: {why}"),
@@ -87,6 +91,9 @@ mod tests {
                 owned: false,
                 lanes: BoundedVec::default(),
                 precedence: None,
+                position0: None,
+                position1: None,
+                kept: BoundedVec::default(),
             }])
             .unwrap(),
             BoundedVec::default(),
@@ -98,6 +105,7 @@ mod tests {
                 style: None,
                 catenary: false,
                 polyline,
+                crossing_type: None,
             })
         } else {
             Action::BuildRoad(RoadBuild {
@@ -106,6 +114,7 @@ mod tests {
                 bus_lane: false,
                 tram: Tram::None,
                 polyline,
+                crossing_type: None,
             })
         };
         action.to_payload().unwrap()

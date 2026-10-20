@@ -4382,7 +4382,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tpf3mp-agent"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4393,6 +4393,7 @@ dependencies = [
  "proptest",
  "quinn",
  "ring",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
@@ -4415,7 +4416,7 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-bigmap"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "clap",
  "mlua",
@@ -4427,8 +4428,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tpf3mp-bigmap-plugin"
+version = "1.3.2-reedme.2"
+dependencies = [
+ "mlua",
+ "serde_json",
+ "tpf3mp-hook",
+ "tpf3mp-hookcore",
+ "tpf3mp-nativemods",
+ "tpf3mp-plugin-abi",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "tpf3mp-bridge"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "postcard",
  "proptest",
@@ -4440,14 +4454,14 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-buildinfo"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "embed-resource",
 ]
 
 [[package]]
 name = "tpf3mp-canon"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "mlua",
  "proptest",
@@ -4455,7 +4469,7 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-hook"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "ctor",
  "iced-x86",
@@ -4464,18 +4478,20 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "tpf3mp-bridge",
  "tpf3mp-buildinfo",
  "tpf3mp-hookcore",
  "tpf3mp-ipc",
  "tpf3mp-nativemods",
+ "tpf3mp-plugin-abi",
  "tpf3mp-proto",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "tpf3mp-hookcore"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "iced-x86",
  "libc",
@@ -4488,7 +4504,7 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-ipc"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "libc",
  "thiserror 2.0.20",
@@ -4497,7 +4513,7 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-launch"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "tempfile",
  "thiserror 2.0.20",
@@ -4507,7 +4523,7 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-launcher"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4542,7 +4558,7 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-modscan"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "clap",
  "serde",
@@ -4553,21 +4569,23 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-nativemods"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "base64 0.23.1",
+ "postcard",
  "ring",
  "semver",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "tpf3mp-plugin-abi",
  "ureq",
 ]
 
 [[package]]
 name = "tpf3mp-net"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4589,8 +4607,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tpf3mp-plugin-abi"
+version = "1.3.2-reedme.2"
+
+[[package]]
 name = "tpf3mp-proto"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "getrandom 0.4.3",
  "mlua",
@@ -4605,7 +4627,7 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-server"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4623,6 +4645,7 @@ dependencies = [
  "tokio-tungstenite",
  "tpf3mp-agent",
  "tpf3mp-buildinfo",
+ "tpf3mp-nativemods",
  "tpf3mp-net",
  "tpf3mp-proto",
  "tpf3mp-snapshot",
@@ -4632,7 +4655,7 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-snapshot"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "blake3",
  "fastcdc",
@@ -4646,7 +4669,7 @@ dependencies = [
 
 [[package]]
 name = "tpf3mp-testkit"
-version = "1.3.2-reedme.1"
+version = "1.3.2-reedme.2"
 dependencies = [
  "anyhow",
  "clap",

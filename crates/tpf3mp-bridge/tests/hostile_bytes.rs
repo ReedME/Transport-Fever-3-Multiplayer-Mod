@@ -44,6 +44,7 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
         ToHook::Hello { version: 2 },
         ToHook::Begin {
             room: tpf3mp_proto::RoomId(tpf3mp_proto::FixedBytes([1; 16])),
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             rules: Text::new("native").unwrap(),
             steps_per_second: 10,
             checkpoint_interval: 50,

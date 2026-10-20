@@ -383,6 +383,7 @@ async fn a_reconnecting_player_resumes_exactly() {
     bob.executed = executed;
     bob.client()
         .join_room(JoinRoom {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             invite,
             password: None,
             resume,
@@ -440,6 +441,7 @@ async fn resuming_from_the_future_is_refused() {
     let error = bob
         .client
         .join_room(JoinRoom {
+            scan_plan: tpf3mp_proto::ScanPlan::DEFAULT,
             invite,
             password: None,
             resume: Some(Resume {

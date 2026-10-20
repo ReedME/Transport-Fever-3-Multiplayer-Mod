@@ -36,8 +36,8 @@ use tpf3mp_bridge::{
 };
 use tpf3mp_modscan::{Class, roots, save::SaveMod};
 use tpf3mp_proto::{
-    BoundedVec, ContentDiff, ContentManifest, ModInfo, ModParams, ModRef, RoomConfig,
-    RoomDeclaration, RoomMod, RoomMods, Text,
+    BoundedVec, ContentDiff, ContentManifest, ModId, ModInfo, ModParams, ModRef, NATIVE_PREFIX,
+    NativeMod, RoomConfig, RoomDeclaration, RoomMod, RoomMods, Text,
 };
 
 /// Longest reason kept for a mod, in bytes.
@@ -233,6 +233,9 @@ struct Room {
     /// told it), not pieced together from what the room said this game
     /// lacks ([`Mods::learn`]).
     whole: bool,
+    /// The room's native mods with their settings, as told
+    /// (docs/NATIVE_MODS.md); the owner's are their game's.
+    native: Vec<NativeMod>,
 }
 
 /// What players are told of TPF3-MP's own mod.
@@ -255,6 +258,9 @@ pub struct Mods {
     room: Option<Room>,
     /// Whether they are this player's own, as the room's owner.
     owner: bool,
+    /// The native mods that change the simulation which this player's game
+    /// runs, as the launcher started it ([`Mods::set_native`]).
+    native: Vec<NativeMod>,
 }
 
 impl Mods {
@@ -273,6 +279,7 @@ impl Mods {
             carried_personal,
             room: None,
             owner: false,
+            native: Vec::new(),
         };
         for id in chosen {
             let _ = mods.choose(&id, true);
@@ -282,6 +289,29 @@ impl Mods {
 
     pub fn installed(&self) -> &[Installed] {
         &self.installed
+    }
+
+    /// The native mods that change the simulation which this player's game
+    /// runs now: what it declares beside its mods, and as the room's owner
+    /// the room's. Returns whether they changed.
+    pub fn set_native(&mut self, native: Vec<NativeMod>) -> bool {
+        let changed = self.native != native;
+        self.native = native;
+        if self.owner
+            && let Some(room) = &mut self.room
+        {
+            room.native = self.native.clone();
+        }
+        changed
+    }
+
+    /// The room's native mods with their settings, when the room told its
+    /// whole list.
+    pub fn room_native(&self) -> Option<&[NativeMod]> {
+        self.room
+            .as_ref()
+            .filter(|room| room.whole)
+            .map(|room| room.native.as_slice())
     }
 
     /// Takes in the mods found again (after a Mod Hub download, say),
@@ -396,6 +426,7 @@ impl Mods {
             mods,
             params: Vec::new(),
             whole: true,
+            native: self.native.clone(),
         });
         self.owner = true;
         self.declaration().map(drop).inspect_err(|_| {
@@ -454,6 +485,7 @@ impl Mods {
             mods,
             params,
             whole: true,
+            native: self.native.clone(),
         });
         next.owner = true;
         next.declaration()?;
@@ -482,6 +514,7 @@ impl Mods {
             mods: told.mods.clone(),
             params: told.params.clone(),
             whole: true,
+            native: told.native.clone(),
         });
         let changed = self.room != room;
         self.room = room;
@@ -503,7 +536,9 @@ impl Mods {
             modio: None,
         };
         let mut room = self.room.clone().map(|room| room.mods).unwrap_or_default();
-        for missing in &diff.missing {
+        // Native mods are not mods a world loads: the launcher gets them.
+        let native = |id: &ModId| id.as_str().starts_with(NATIVE_PREFIX);
+        for missing in diff.missing.iter().filter(|m| !native(&m.id)) {
             if !room.iter().any(|m| m.id == missing.id) {
                 room.push(RoomMod {
                     id: missing.id.clone(),
@@ -512,7 +547,7 @@ impl Mods {
                 });
             }
         }
-        for change in &diff.changed {
+        for change in diff.changed.iter().filter(|c| !native(&c.id)) {
             match room.iter_mut().find(|m| m.id == change.id) {
                 Some(m) => m.version = change.room.clone(),
                 None => room.push(RoomMod {
@@ -528,6 +563,7 @@ impl Mods {
             mods: room,
             params: Vec::new(),
             whole: false,
+            native: Vec::new(),
         });
         let changed = self.room != room;
         self.room = room;
@@ -568,6 +604,7 @@ impl Mods {
             });
         }
         ContentManifest::new(self.build.clone(), mods)
+            .with_native(self.native.iter().map(NativeMod::term).collect())
     }
 
     /// What this player declares: as the room's owner with the room's whole
@@ -594,6 +631,7 @@ impl Mods {
             room: RoomConfig {
                 info,
                 params: room.params.clone(),
+                native: self.native.clone(),
             },
         };
         declaration
@@ -928,6 +966,53 @@ mod tests {
         assert!(owner.adopt(Some(&theirs), false));
         assert!(!owner.is_owner());
         assert_eq!(owner.lists().unwrap().params, theirs.params);
+    }
+
+    /// The owner's game's native mods are the room's, told with their
+    /// settings; a guest's are declared beside their mods, and a native mod
+    /// the room says they lack is never taken for a mod a world loads.
+    #[test]
+    fn native_mods_go_with_the_room_but_never_into_a_worlds_mods() {
+        let big_maps = |version: &str| NativeMod {
+            id: Text::lossy("bigmap"),
+            version: Text::lossy(&format!("{}{}", version, "a".repeat(64))),
+            name: Text::lossy("Big Maps"),
+            settings: vec![tpf3mp_proto::NativeSetting {
+                key: Text::lossy("depth"),
+                value: tpf3mp_proto::NativeValue::Int(12),
+            }],
+        };
+        let mut owner = Mods::new(Text::lossy("40408"), catalog(), [], false);
+        owner.own_start(&save(&["tpf3mp_1"])).unwrap();
+        assert!(owner.set_native(vec![big_maps("0.3.0+0123456789")]));
+        assert!(!owner.set_native(vec![big_maps("0.3.0+0123456789")]));
+        let declared = owner.declaration().unwrap();
+        assert_eq!(declared.manifest().native.len(), 1);
+        let room = told(declared);
+        assert_eq!(room.native, [big_maps("0.3.0+0123456789")]);
+        assert_eq!(room.manifest(), owner.manifest());
+
+        let mut guest = Mods::new(Text::lossy("40408"), catalog(), [], false);
+        assert!(guest.adopt(Some(&room), false));
+        assert_eq!(guest.room_native(), Some(&room.native[..]));
+        // Without them, the guest differs by the native mod alone.
+        let diff = room.manifest().compare(&guest.manifest()).unwrap();
+        assert_eq!(diff.missing_total, 1);
+        guest.set_native(room.native.clone());
+        assert_eq!(room.manifest().compare(&guest.manifest()), None);
+
+        // A room that told no list: learning leaves the native mod out of
+        // the mods.
+        let mut learner = Mods::new(Text::lossy("40408"), catalog(), [], false);
+        let diff = room.manifest().compare(&learner.manifest()).unwrap();
+        learner.learn(&diff);
+        assert!(
+            learner
+                .manifest()
+                .mods
+                .iter()
+                .all(|m| !m.id.as_str().starts_with(NATIVE_PREFIX))
+        );
     }
 
     /// A list pieced together from what the room said this game lacks is

@@ -65,6 +65,12 @@ fn integers(memory: &dyn Memory, raw: &[u8], at: usize, max: usize) -> Result<Lu
 }
 
 fn crosswalks(memory: &dyn Memory, raw: &[u8]) -> Result<LuaValue, String> {
+    Ok(array(crosswalk_ids(memory, raw)?.into_iter().map(integer)))
+}
+
+/// The crosswalk set of the `BaseNodeConfig` in `raw`: its edges, in the
+/// order its slots hold them, the order the game's Lua lists them in.
+pub(crate) fn crosswalk_ids(memory: &dyn Memory, raw: &[u8]) -> Result<Vec<i32>, String> {
     // phmap::flat_hash_set<int>, not std::vector<int>. The move/copy at
     // 0x1eda20/0x1fe1e0 and iteration at 0xa49f1a establish the layout:
     // control bytes, int slots, size, capacity. The remaining words are
@@ -82,7 +88,7 @@ fn crosswalks(memory: &dyn Memory, raw: &[u8]) -> Result<LuaValue, String> {
         return Err("crosswalk set exceeds its bounds".into());
     }
     if capacity == 0 {
-        return Ok(array([]));
+        return Ok(Vec::new());
     }
     if !(capacity + 1).is_power_of_two() || control == 0 || slots == 0 {
         return Err("invalid crosswalk set storage".into());
@@ -101,7 +107,7 @@ fn crosswalks(memory: &dyn Memory, raw: &[u8]) -> Result<LuaValue, String> {
                 if id < 0 || !seen.insert(id) {
                     return Err("invalid or duplicate crosswalk edge".into());
                 }
-                entries.push(integer(id));
+                entries.push(id);
             }
             0x80 | 0xfe => (), // empty or deleted
             _ => return Err("invalid crosswalk control byte".into()),
@@ -110,7 +116,7 @@ fn crosswalks(memory: &dyn Memory, raw: &[u8]) -> Result<LuaValue, String> {
     if entries.len() != count {
         return Err("crosswalk set size does not match its occupied slots".into());
     }
-    Ok(array(entries))
+    Ok(entries)
 }
 
 fn config(memory: &dyn Memory, address: usize) -> Result<LuaValue, String> {

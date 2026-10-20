@@ -734,6 +734,13 @@ end
 -- (build 40408: a rail station on open ground proposes its platform track,
 -- 24 edges through 25 new nodes); the construction builds those itself, and
 -- built beside it they block it ("Construction Not Possible").
+--
+-- The junction settings the tool proposed on those own tracks go with them
+-- (2026-10-07: a rail station snapped to a track end was refused in every
+-- game, "the junction no longer exists"): their nodes are in no game's
+-- build, and the construction gives its own junctions the game's own
+-- settings, alike in every game. So a setting at a node left out, or whose
+-- turns name an edge left out, is left out too (junctions.without).
 local function joinedOnly(part)
 	local parent = {}
 	local function find(x)
@@ -763,9 +770,22 @@ local function joinedOnly(part)
 			used[e.node0], used[e.node1] = true, true
 		end
 	end
-	local nodes = {}
+	local nodes, at = {}, {}
 	for _, n in ipairs(part.nodes) do
 		if used[n.id] then nodes[#nodes + 1] = n end
+		at[n.id] = { x = n.pos[1], y = n.pos[2], z = n.pos[3] }
+	end
+	local ownNodes, ownEdges = {}, {}
+	for _, e in ipairs(part.edges) do
+		if not joined[find(e.node0)] and at[e.node0] and at[e.node1] then
+			ownEdges[#ownEdges + 1] = { network = e.network, ends = { a = at[e.node0], b = at[e.node1] } }
+			for _, n in ipairs({ e.node0, e.node1 }) do
+				ownNodes[#ownNodes + 1] = { network = e.network, at = at[n] }
+			end
+		end
+	end
+	if #ownEdges > 0 and #(part.junctions or {}) > 0 then
+		part.junctions = module("junctions").without(part.junctions, ownNodes, ownEdges)
 	end
 	part.edges, part.nodes = edges, nodes
 end
@@ -799,6 +819,10 @@ function capture.connection(proposal, con)
 	local action, why = module("roads").capture(part, engine.world())
 	if not action then return nil, why end
 	local build = action.BuildRoad or action.BuildTrack
+	-- The construction creates its own switches; those settings are not
+	-- separate network edits and may exceed the action's junction limit.
+	local kept = module("apply").ownJunctions(build.polyline)
+	build.polyline.junctions = kept
 	return build.polyline
 end
 
@@ -893,6 +917,111 @@ function capture.terraform(built)
 	return actions
 end
 
+-- A Paint action (tpf3mp_proto action::TerrainPaint, as the hook made it
+-- from the painter's stroke) in one line for the log: its texels, how many
+-- it paints (255 leaves one as it is), and its mask.
+function capture.paintSummary(t)
+	local m = type(t) == "table" and t.materials
+	if type(m) ~= "table" or type(m.runs) ~= "table" then return "an unreadable paint stroke" end
+	local painted = 0
+	for _, r in ipairs(m.runs) do
+		if r.value ~= 255 then painted = painted + r.count end
+	end
+	local mask = "no mask"
+	if type(t.mask) == "table" and type(t.mask.runs) == "table" then
+		local set = 0
+		for _, r in ipairs(t.mask.runs) do
+			if r.value ~= 0 then set = set + r.count end
+		end
+		mask = string.format("a mask with %d set", set)
+	end
+	return string.format("%d by %d texels from (%d, %d), %d painted, %s",
+		m.columns, m.rows, m.x0, m.y0, painted, mask)
+end
+
+-- Most assets one PlantAssets action carries: about 40 bytes each, well
+-- inside the room's 48 KiB payload. A stroke of more goes in several, each
+-- a run of whole groups.
+capture.STROKE_ASSETS = 800
+-- Most groups one PlantAssets action adds (action::MAX_STROKE_GROUPS), and
+-- most assets one group holds (action::MAX_GROUP_ASSETS).
+capture.STROKE_GROUPS = 256
+capture.GROUP_ASSETS = 512
+
+-- An asset brush stroke, as the hook read it at the click (tpf3mp_native.built:
+-- `{ assets = { removed = { entity, ... }, groups = { { { model =, m = { 16
+-- numbers } }, ... }, ... } } }`, crates/tpf3mp-hook/src/terrain.rs), as
+-- PlantAssets actions (tpf3mp_proto action::AssetStroke): each group the
+-- stroke replaces named by its first asset and how many it holds, as the
+-- asset bulldozer names one (the groups still stand: the click was stopped),
+-- and each group it builds, every asset its model's index in the action's
+-- models and its matrix. The replaced groups go with the first action.
+-- Returns the list of actions, or nil and why.
+function capture.assetStroke(assets)
+	if type(assets) ~= "table" or type(assets.groups) ~= "table" or type(assets.removed) ~= "table" then
+		return nil, "an asset stroke it cannot read"
+	end
+	local engine = module("engine")
+	local removed = {}
+	for _, id in ipairs(assets.removed) do
+		local ok, list = pcall(engine.assetsOf, id)
+		if not ok then return nil, "a group the stroke replaces does not read: " .. tostring(list) end
+		local first = list[1]
+		if first == nil then return nil, "a group the stroke replaces holds nothing" end
+		removed[#removed + 1] = { first = { model = first.model, at = { x = first.x, y = first.y, z = first.z } },
+			count = #list }
+	end
+	local actions, current, assetsIn = {}, nil, 0
+	local function open()
+		current = { models = {}, removed = #actions == 0 and removed or {}, groups = {}, index = {} }
+		actions[#actions + 1] = current
+		assetsIn = 0
+	end
+	for g, group in ipairs(assets.groups) do
+		if type(group) ~= "table" or #group == 0 then return nil, "group " .. g .. " of the stroke holds nothing" end
+		if #group > capture.GROUP_ASSETS then
+			return nil, "a group of " .. #group .. " assets, more than the room carries (" .. capture.GROUP_ASSETS .. ")"
+		end
+		if current == nil or assetsIn + #group > capture.STROKE_ASSETS or #current.groups >= capture.STROKE_GROUPS then
+			open()
+		end
+		local placed = {}
+		for _, a in ipairs(group) do
+			local file = engine.modelFile(a.model)
+			if file == nil then return nil, "an asset of no model in group " .. g end
+			local index = current.index[file]
+			if index == nil then
+				if #current.models >= 64 then return nil, "a stroke of more than 64 kinds of asset" end
+				current.models[#current.models + 1] = file
+				index = #current.models - 1
+				current.index[file] = index
+			end
+			local ok, transform = pcall(capture.transform, a.m)
+			if not ok then return nil, "an asset whose matrix does not read: " .. tostring(transform) end
+			placed[#placed + 1] = { model = index, transform = transform }
+		end
+		current.groups[#current.groups + 1] = placed
+		assetsIn = assetsIn + #group
+	end
+	if #actions == 0 then
+		if #removed == 0 then return nil, "an asset stroke that changes nothing" end
+		open()
+	end
+	local out = {}
+	for i, a in ipairs(actions) do
+		out[i] = { PlantAssets = { models = a.models, removed = a.removed, groups = a.groups } }
+	end
+	return out
+end
+
+-- A PlantAssets action in one line for the log.
+function capture.assetSummary(t)
+	if type(t) ~= "table" or type(t.groups) ~= "table" then return "an unreadable asset stroke" end
+	local n = 0
+	for _, g in ipairs(t.groups) do n = n + #g end
+	return string.format("%d group(s) of %d asset(s), replacing %d group(s)", #t.groups, n, #(t.removed or {}))
+end
+
 -- A Terraform action in one line for the log.
 function capture.terraformSummary(t)
 	if type(t) ~= "table" or type(t.cells) ~= "table" or type(t.columns) ~= "number" or t.columns < 1 then
@@ -983,7 +1112,7 @@ function capture.paramsNote(name, params, read)
 	for _, p in ipairs(flat) do
 		local v = p.value
 		local text
-		if v.Int ~= nil then text = "i" .. string.format("%d", v.Int)
+		if v.Int ~= nil then text = "i" .. string.format("%.0f", v.Int)
 		elseif v.Fixed ~= nil then text = "f" .. string.format("%.17g", v.Fixed)
 		else text = "b" .. (v.Bool and "1" or "0") end
 		parts[#parts + 1] = p.key .. "=" .. text
@@ -1006,7 +1135,7 @@ function capture.readParamsNote(note, name)
 	if count == nil or count ~= #parts - 3 then return nil, "the tool's settings were cut short" end
 	local out = {}
 	for i = 4, #parts do
-		local key, kind, text = parts[i]:match("^([%a_][%w_]*)=([ifb])(.*)$")
+		local key, kind, text = parts[i]:match("^([%a_][%w_%.]*)=([ifb])(.*)$")
 		local value
 		if kind == "i" and text:match("^%-?%d+$") then value = { Int = tonumber(text) }
 		elseif kind == "f" and tonumber(text) ~= nil then value = { Fixed = tonumber(text) }
@@ -1088,9 +1217,10 @@ end
 -- of one it replaces): the bridge and tunnel window's type
 -- (gui/entity_window/bridge_and_tunnel.tl, api.engine.util.proposal
 -- .createBridgeOrTunnelProposal, build 40408) makes one. It is carried as
--- the road and track modifiers' rebuild is (capture.modify), once
--- acceptance.lua's `bridges` is on: until a two-player game shows the
--- window's proposal reads as the modifiers' does, it is refused, saying so.
+-- the road and track modifiers' rebuild is (capture.modify) while
+-- acceptance.lua's `bridges` is on (since a two-player game on build 40420,
+-- 2026-10-11, showed the window's proposal reads as the modifiers' does);
+-- with it off, it is refused, saying so.
 function capture.inPlace(proposal)
 	local p = get(proposal, "proposal")
 	if p == nil or (length(get(proposal, "toAdd")) or 0) > 0 or (length(get(proposal, "toRemove")) or 0) > 0 then

@@ -592,6 +592,93 @@ mod tests {
         assert_eq!(tail.poll(now + Duration::from_secs(60)).lines, ["more"]);
     }
 
+    /// A legacy-sized route burst can exceed D10's hook budget. The hook
+    /// puts optional path rows first, so the tail still uploads every base
+    /// vehicle row and the summary from the newest 192 KiB.
+    #[test]
+    fn an_oversized_route_burst_keeps_the_vehicle_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.log");
+        fs::write(&path, "").unwrap();
+        let mut sources = Sources::new(path.clone(), Vec::new());
+        let recorder = Recorder::new();
+        let mut burst = String::new();
+        for edge in 0..2048 {
+            burst.push_str(&format!(
+                "lane 3 step 13000 vehicle-0/path-{edge:04} route_index={edge} geometry={}\n",
+                "x".repeat(120)
+            ));
+        }
+        for vehicle in 0..13 {
+            burst.push_str(&format!(
+                "lane 3 step 13000 vehicle-{vehicle} state=2 pos={vehicle} speed=5 row=2:0:3~10.20\n"
+            ));
+        }
+        burst.push_str("lane 3 step 13000 summary 13:unchanged\n");
+        append(&path, &burst);
+        let skipped = sources.record(&recorder, Instant::now(), false);
+        assert!(skipped[0] > 0, "fixture must exceed the hook budget");
+        let waiting = recorder.waiting();
+        for vehicle in 0..13 {
+            assert!(
+                waiting.iter().any(|line| line
+                    .text
+                    .as_str()
+                    .contains(&format!("lane 3 step 13000 vehicle-{vehicle} state="))),
+                "vehicle {vehicle}'s base entry must reach diagnostics"
+            );
+        }
+        assert!(
+            waiting
+                .iter()
+                .any(|line| line.text.as_str().contains("summary 13:unchanged"))
+        );
+    }
+
+    #[test]
+    fn optional_routes_cannot_evict_another_lanes_base_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.log");
+        fs::write(&path, "").unwrap();
+        let mut sources = Sources::new(path.clone(), Vec::new());
+        let recorder = Recorder::new();
+        let mut burst = String::new();
+        for edge in 0..600 {
+            burst.push_str(&format!(
+                "lane 3 step 13000 vehicle-0/path-{edge:04} geometry={}\n",
+                "x".repeat(100)
+            ));
+        }
+        for edge in 0..1300 {
+            burst.push_str(&format!(
+                "lane 0 step 13000 edge-{edge:04} geometry={}\n",
+                "y".repeat(80)
+            ));
+        }
+        burst.push_str("lane 0 step 13000 summary 1300:unchanged\n");
+        for vehicle in 0..300 {
+            burst.push_str(&format!(
+                "lane 3 step 13000 vehicle-{vehicle} state=2 pos=5 speed=5 row={}\n",
+                "z".repeat(50)
+            ));
+        }
+        burst.push_str("lane 3 step 13000 summary 300:unchanged\n");
+        assert!(burst.len() as u64 > HOOK_PER_MINUTE);
+        append(&path, &burst);
+        assert!(sources.record(&recorder, Instant::now(), false)[0] > 0);
+        let waiting = recorder.waiting();
+        assert!(
+            waiting
+                .iter()
+                .any(|line| line.text.as_str().contains("edge-0000"))
+        );
+        assert!(
+            waiting
+                .iter()
+                .any(|line| line.text.as_str().contains("vehicle-299 state="))
+        );
+    }
+
     /// Error reports written since the run began are read once for each
     /// change, but not the game's log, minidumps or anything that looks
     /// like a key.

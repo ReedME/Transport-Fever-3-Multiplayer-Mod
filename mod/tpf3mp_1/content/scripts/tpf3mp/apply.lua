@@ -76,6 +76,15 @@ local function params(list)
 	return out
 end
 
+-- A stop's or signal's parameters, from engine.flatParams' list: flat keys,
+-- each taken whole. A mod's key may hold a dot (Signal Distance's
+-- "signal_distance.local"), which is no path here.
+local function objectParams(list)
+	local out = {}
+	for _, param in ipairs(list) do out[param.key] = paramValue(param.value) end
+	return out
+end
+
 -- Whether a handler runs dry (apply.proposalOf): it makes the proposal its
 -- action would build and stops there, sending nothing and saying nothing.
 local dry = false
@@ -98,6 +107,67 @@ local function seq(list)
 	return out
 end
 
+-- What the action running now costs, by part, for the log only (apply.run,
+-- apply.proposalOf): os.clock around the engine's calls that can take long
+-- in a big world, the elapsed time on Windows and the process's CPU time on
+-- Linux and macOS (the C library's clock). Nothing read from it reaches
+-- the world. Each part is
+-- { n = calls, s = seconds, items = what the calls went through }, in
+-- `order` by first use; nil while no action runs.
+local costs = nil
+
+local function clock()
+	local ok, t = pcall(function() return os.clock() end)
+	if ok and type(t) == "number" then return t end
+	return nil
+end
+
+local function spend(part, t0, items)
+	if costs == nil or t0 == nil then return end
+	local t1 = clock()
+	if t1 == nil then return end
+	local c = costs.parts[part]
+	if c == nil then
+		c = { n = 0, s = 0, items = 0 }
+		costs.parts[part] = c
+		costs.order[#costs.order + 1] = part
+	end
+	c.n, c.s, c.items = c.n + 1, c.s + (t1 - t0), c.items + (items or 0)
+end
+
+-- The parts of a cost as one line: "nodes Street 1x 180.2 ms (41022), ...".
+function apply.costText(cost)
+	if type(cost) ~= "table" or type(cost.order) ~= "table" then return "" end
+	local out = {}
+	for _, part in ipairs(cost.order) do
+		local c = cost.parts[part]
+		out[#out + 1] = string.format("%s %dx %.1f ms", part, c.n, c.s * 1000)
+			.. (c.items > 0 and (" (" .. c.items .. ")") or "")
+	end
+	return table.concat(out, ", ")
+end
+
+-- The last action's cost (apply.run, apply.proposalOf): { kind =, ms =,
+-- parts =, order = }, or nil where the clock cannot say.
+apply.lastCost = nil
+-- Actions that took at least this long are said in the log, with their parts.
+apply.SLOW_MS = 20
+
+local function costStart(kind)
+	costs = { kind = kind, parts = {}, order = {}, t0 = clock() }
+	apply.lastCost = nil
+end
+
+local function costEnd()
+	local c = costs
+	costs = nil
+	local t1 = clock()
+	if c == nil or c.t0 == nil or t1 == nil then return nil end
+	c.ms = (t1 - c.t0) * 1000
+	apply.lastCost = c
+	return c
+end
+
 -- Whether this Lua state's game takes a command's callback here; the game
 -- runs game scripts on a pool of states, so each learns on its own.
 local callbacks = true
@@ -105,8 +175,7 @@ local callbacks = true
 -- Sends `command`, which runs at once, and returns what the game answered,
 -- its command data and result entities (nil, where it answers nothing
 -- here). A command the game refuses raises, and apply.run reports it.
-local function send(command)
-	if dry then error({ dry = "a command that is not a build" }, 0) end
+local function sendNow(command)
 	if callbacks then
 		local heard, went, data, entities = false, nil, nil, nil
 		local sent, err = pcall(api.cmd.sendCommand, command, function(d, success, e)
@@ -124,6 +193,14 @@ local function send(command)
 	end
 	api.cmd.sendCommand(command)
 	return nil, nil
+end
+
+local function send(command)
+	if dry then error({ dry = "a command that is not a build" }, 0) end
+	local t0 = costs and clock()
+	local data, entities = sendNow(command)
+	spend("commands", t0)
+	return data, entities
 end
 
 local function run(command)
@@ -154,6 +231,227 @@ local function mine(entity, what)
 	if not ok then error(why, 0) end
 end
 
+-- Change-time diagnostics read only a handful of components for the action
+-- being replayed. These reads are optional: a missing component is `none`,
+-- and a getter which the game cannot read is `unavailable`. Diagnostic
+-- failures never decide whether the ordered action applies.
+local function diagnosticField(value, key)
+	if value == nil then return nil, "none" end
+	local ok, result = pcall(function() return value[key] end)
+	if not ok then return nil, "unavailable" end
+	if result == nil then return nil, "none" end
+	return result, "value"
+end
+
+local function diagnosticComponent(entity, name)
+	if type(entity) ~= "number" or entity < 0 then return nil, "none" end
+	local okType, componentType = pcall(function()
+		local types = api.type and api.type.ComponentType
+		return types and types[name]
+	end)
+	if not okType or componentType == nil then return nil, "unavailable" end
+	local ok, component = pcall(function() return api.engine.getComponent(entity, componentType) end)
+	if not ok then return nil, "unavailable" end
+	if component == nil then return nil, "none" end
+	return component, "value"
+end
+
+local function diagnosticToken(value)
+	local text = type(value) == "string" and value or tostring(value)
+	return (text:gsub("[^%w_./:%-]", "?"):sub(1, 128))
+end
+
+local function diagnosticEntity(value)
+	if type(value) ~= "number" or value < 0 or value ~= value or value == math.huge or value == -math.huge then
+		return "unavailable"
+	end
+	return string.format("%.0f", value)
+end
+
+local function diagnosticCompany(roster, entity)
+	if type(entity) ~= "number" or entity < 0 then return "none" end
+	local ok, companies = pcall(require_companies)
+	if not ok or type(companies) ~= "table" or type(companies.byEntity) ~= "function" then
+		return "unavailable"
+	end
+	local read, c = pcall(companies.byEntity, roster, entity)
+	if not read then return "unavailable" end
+	if c == nil then return "unmapped/entity-" .. diagnosticEntity(entity) end
+	return "company-" .. diagnosticEntity(c.id) .. "/entity-" .. diagnosticEntity(entity)
+end
+
+local function diagnosticActor(roster, player)
+	if player == nil then return "none" end
+	local ok, companies = pcall(require_companies)
+	if not ok or type(companies) ~= "table" or type(companies.of) ~= "function" then
+		return "unavailable"
+	end
+	local read, c = pcall(companies.of, roster, player)
+	if not read then return "unavailable" end
+	if c == nil then return "none" end
+	return "company-" .. diagnosticEntity(c.id) .. "/entity-" .. diagnosticEntity(c.entity)
+end
+
+local function diagnosticLocal(roster)
+	local ok, selected = pcall(function() return api.engine.util.getPlayer() end)
+	if not ok then return "unavailable" end
+	if selected == nil or (type(selected) == "number" and selected < 0) then return "none" end
+	if type(selected) ~= "number" or selected ~= selected or selected == math.huge or selected == -math.huge then
+		return "unavailable"
+	end
+	return diagnosticCompany(roster, selected)
+end
+
+local function diagnosticOwner(entity, roster)
+	local component, status = diagnosticComponent(entity, "PLAYER_OWNED")
+	if status ~= "value" then return status end
+	local owner, ownerStatus = diagnosticField(component, "player")
+	if ownerStatus == "none" then return "none" end
+	if ownerStatus ~= "value" or type(owner) ~= "number" or owner < 0 then return "unavailable" end
+	return diagnosticCompany(roster, owner)
+end
+
+local function diagnosticActionIndex(ctx)
+	local step, status = diagnosticField(ctx, "actionIndex")
+	if status ~= "value" or type(step) ~= "number" or step < 0 or step ~= math.floor(step) then return "none" end
+	return string.format("%.0f", step)
+end
+
+local function diagnosticSignedInteger(value)
+	if type(value) ~= "number" or value ~= math.floor(value) or value ~= value
+			or value == math.huge or value == -math.huge then
+		return "unavailable"
+	end
+	return string.format("%.0f", value)
+end
+
+local function diagnosticSequenceLength(value)
+	local ok, length = pcall(function() return #value end)
+	if not ok or type(length) ~= "number" or length < 0 or length > 256 then return nil end
+	return length
+end
+
+local function diagnosticModelName(modelId)
+	if type(modelId) ~= "number" or modelId < 0 then return "none" end
+	local ok, name = pcall(function() return api.res.modelRep.getName(modelId) end)
+	if not ok then return "unavailable" end
+	if type(name) ~= "string" or name == "" then return "none" end
+	return diagnosticToken(name)
+end
+
+local function diagnosticVehicleModels(entity)
+	local vehicle, status = diagnosticComponent(entity, "TRANSPORT_VEHICLE")
+	if status ~= "value" then return status, status end
+	local config, configStatus = diagnosticField(vehicle, "transportVehicleConfig")
+	if configStatus ~= "value" then return configStatus, configStatus end
+	local parts, partsStatus = diagnosticField(config, "vehicles")
+	if partsStatus ~= "value" then return partsStatus, partsStatus end
+	local length = diagnosticSequenceLength(parts)
+	if length == nil then return "unavailable", "unavailable" end
+	if length == 0 then return "none", "none" end
+	local names, carriers, failed = {}, {}, false
+	local count = math.min(length, 8)
+	for i = 1, count do
+		local entry, entryStatus = diagnosticField(parts, i)
+		local part, partStatus = diagnosticField(entry, "part")
+		local modelId, modelStatus = diagnosticField(part, "modelId")
+		local name = "unavailable"
+		if entryStatus == "value" and partStatus == "value" and modelStatus == "value" then
+			name = diagnosticModelName(modelId)
+		elseif entryStatus == "value" and partStatus == "value" and modelStatus == "none" then
+			name = "none"
+		end
+		names[#names + 1] = name
+		if name == "unavailable" then
+			failed = true
+		else
+			local carrier = name:match("^vehicle/([%w_-]+)/")
+			if carrier then carriers[carrier] = true end
+		end
+	end
+	if length > count then names[#names + 1] = "+" .. tostring(length - count) end
+	local carrierNames = {}
+	for carrier in pairs(carriers) do carrierNames[#carrierNames + 1] = carrier end
+	table.sort(carrierNames)
+	local carrier = "none"
+	if failed then
+		carrier = "unavailable"
+	elseif #carrierNames == 1 then
+		carrier = diagnosticToken(carrierNames[1])
+	elseif #carrierNames > 1 then
+		carrier = "mixed"
+	end
+	return carrier, table.concat(names, ",")
+end
+
+local function diagnosticLineModes(entity)
+	local line, status = diagnosticComponent(entity, "LINE")
+	if status ~= "value" then return status end
+	local info, infoStatus = diagnosticField(line, "vehicleInfo")
+	if infoStatus ~= "value" then return infoStatus end
+	local modes, modesStatus = diagnosticField(info, "transportModes")
+	if modesStatus ~= "value" then return modesStatus end
+	local selected = {}
+	for mode = 0, 15 do
+		local ok, on = pcall(function() return modes[mode] end)
+		if not ok then return "unavailable" end
+		if on == true then selected[#selected + 1] = tostring(mode) end
+	end
+	return #selected > 0 and table.concat(selected, ",") or "none"
+end
+
+local function diagnosticVehicleAssignment(ctx, vehicleId, vehicle, lineId, line, first, outcome)
+	local carrier, models = "unavailable", "unavailable"
+	local read, foundCarrier, foundModels = pcall(diagnosticVehicleModels, vehicle)
+	if read then carrier, models = foundCarrier, foundModels end
+	local mode = "unavailable"
+	local modeRead, foundMode = pcall(diagnosticLineModes, line)
+	if modeRead then mode = foundMode end
+	local owner = "unavailable"
+	local ownerRead, foundOwner = pcall(diagnosticOwner, vehicle, ctx and ctx.roster)
+	if ownerRead then owner = foundOwner end
+	local lineOwner = "unavailable"
+	local lineOwnerRead, foundLineOwner = pcall(diagnosticOwner, line, ctx and ctx.roster)
+	if lineOwnerRead then lineOwner = foundLineOwner end
+	log("assign-vehicle action_index=" .. diagnosticActionIndex(ctx)
+		.. " vehicle=" .. diagnosticEntity(vehicleId) .. " native="
+		.. (vehicle == nil and "none" or diagnosticEntity(vehicle))
+		.. " line=" .. diagnosticEntity(lineId) .. " native_line="
+		.. (line == nil and "none" or diagnosticEntity(line))
+		.. " first=" .. diagnosticSignedInteger(first) .. " carrier=" .. carrier .. " models=" .. models
+		.. " mode=" .. mode .. " owner=" .. owner .. " line_owner=" .. lineOwner
+		.. " outcome=" .. outcome)
+end
+
+local function diagnosticConstruction(ref, entity, component, roster)
+	local file, fileStatus = diagnosticField(ref, "file")
+	local at, atStatus = diagnosticField(ref, "at")
+	local x, xs = diagnosticField(at, "x")
+	local y, ys = diagnosticField(at, "y")
+	local z, zs = diagnosticField(at, "z")
+	local function point(a, as, b, bs, c, cs)
+		if as ~= "value" or bs ~= "value" or cs ~= "value" or type(a) ~= "number" or type(b) ~= "number"
+				or type(c) ~= "number" or a ~= a or b ~= b or c ~= c or a == math.huge or b == math.huge
+				or c == math.huge or a == -math.huge or b == -math.huge or c == -math.huge then
+			return "unavailable"
+		end
+		return string.format("%.1f,%.1f,%.1f", a, b, c)
+	end
+	local requested = fileStatus == "value" and diagnosticToken(file) or fileStatus
+	local transf, transfStatus = diagnosticField(component, "transf")
+	local ax, axs = diagnosticField(transf, 13)
+	local ay, ays = diagnosticField(transf, 14)
+	local az, azs = diagnosticField(transf, 15)
+	local actual = transfStatus == "value" and point(ax, axs, ay, ays, az, azs) or transfStatus
+	local refPoint = atStatus == "value" and point(x, xs, y, ys, z, zs) or atStatus
+	local owner = "unavailable"
+	local ownerRead, foundOwner = pcall(diagnosticOwner, entity, roster)
+	if ownerRead then owner = foundOwner end
+	log("bulldoze-construction action_index=" .. diagnosticActionIndex(acting)
+		.. " ref=" .. requested .. "@(" .. refPoint .. ") native=" .. diagnosticEntity(entity)
+		.. " actual=(" .. actual .. ") owner=" .. owner)
+end
+
 -- The entity a command made: its data's field `field`, else the first of
 -- its result entities; nil when the game did not say.
 local function madeBy(field, data, entities)
@@ -165,6 +463,22 @@ local function madeBy(field, data, entities)
 	return nil
 end
 
+-- The game's verdict on `proposal`: the reasons it refuses it, or nil when
+-- it would build it (and its warnings logged).
+local function refusal(proposal, context)
+	local proposals = api.engine.util.proposal
+	if not (proposals and proposals.makeProposalData) then return nil end
+	local t0 = costs and clock()
+	local data = proposals.makeProposalData(proposal, context)
+	spend("verdict", t0)
+	local state = data and data.errorState
+	local messages = {}
+	for _, m in ipairs(state and state.messages or {}) do messages[#messages + 1] = tostring(m) end
+	if state and state.critical then return "the game refuses the build: " .. table.concat(messages, "; ") end
+	if #messages > 0 then log("the game warns of the build: " .. table.concat(messages, "; ")) end
+	return nil
+end
+
 -- Builds `proposal` as the player's own build. The game's verdict first, as
 -- its tools ask it: a build it would refuse (a collision, too steep, not
 -- enough money) fails here with its reasons, the same in every game, and is
@@ -173,17 +487,8 @@ local function buildProposal(proposal, context)
 	-- Dry: the proposal is what was asked for; the game's verdict and the
 	-- build are not.
 	if dry then error({ dry = true, proposal = proposal, context = context }, 0) end
-	local proposals = api.engine.util.proposal
-	if proposals and proposals.makeProposalData then
-		local data = proposals.makeProposalData(proposal, context)
-		local state = data and data.errorState
-		local messages = {}
-		for _, m in ipairs(state and state.messages or {}) do messages[#messages + 1] = tostring(m) end
-		if state and state.critical then
-			error("the game refuses the build: " .. table.concat(messages, "; "), 0)
-		end
-		if #messages > 0 then log("the game warns of the build: " .. table.concat(messages, "; ")) end
-	end
+	local refused = refusal(proposal, context)
+	if refused then error(refused, 0) end
 	-- What is not critical the tool builds through once the player clicks,
 	-- town buildings in the way included: ignoreErrors, as the player's own
 	-- build (with it false the game drops such a build unseen).
@@ -194,6 +499,9 @@ local HANDLERS = {}
 
 -- Fills a SimpleProposal's street proposal from a polyline ("roads", below).
 local networkInto
+-- Builds a construction whose own tracks end on existing track ends
+-- ("roads", below).
+local rejoinConstruction
 -- The construction of a file at a place ("vehicles and lines", below).
 local constructionAt
 -- Removes a stop from its edge ("stops", below).
@@ -305,7 +613,9 @@ end
 -- proposals only ("SimpleProposal expected, got Proposal", build 40408): a
 -- refresh the game refuses fails in the command's own answer instead (run).
 local function refreshOf(con)
+	local t0 = costs and clock()
 	local refresh = api.engine.util.proposal.refreshConstruction(con)
+	spend("refresh", t0)
 	local street, shape = refresh.proposal, {}
 	for i = 1, #street.addedSegments do
 		local s = street.addedSegments[i]
@@ -402,7 +712,9 @@ local function railReplacement(build, old, entity)
 	if not util or not util.createProposalReplaceConstruction then
 		error("the game cannot regenerate the rail station edit", 0)
 	end
+	local t0 = costs and clock()
 	local full = util.createProposalReplaceConstruction(old, entity.params)
+	spend("regenerate", t0)
 	if full == nil then error("the game could not regenerate the rail station edit", 0) end
 	if #full.toRemove ~= 1 or full.toRemove[1] ~= old or #full.toAdd ~= 1 then
 		error("the game regenerated a different rail station edit", 0)
@@ -506,7 +818,27 @@ function HANDLERS.BuildConstruction(build)
 	context.player = company()
 	context.gatherBuildings = true
 	context.gatherFields = true
-	local built = buildProposal(proposal, context)
+	-- The construction alone, as the tool's street part leaves it; where the
+	-- game refuses that and the tool joined its own tracks onto track ends
+	-- that exist, joined to them as the tool joined it (rejoinConstruction).
+	local built
+	if dry or build.connection == nil then
+		built = buildProposal(proposal, context)
+	else
+		local refused = refusal(proposal, context)
+		if refused then
+			-- The fallback removes existing track before a separate re-lay
+			-- command. Until an atomic or guaranteed recovery path is shown,
+			-- refuse before sending either command. This mod-local gate is part
+			-- of the room's fingerprint, never a per-player setting.
+			if acceptance.rejoinConstruction ~= true then
+				error(refused .. " (snapped track-end rejoin awaits a safe build)", 0)
+			end
+			built = rejoinConstruction(build, entity, context, refused)
+		else
+			built = run(api.cmd.makeWorldBuildProposalCmd(proposal, context, true, true))
+		end
+	end
 	-- A station's group by the name the tool gave the construction, where
 	-- the game left it unnamed (nameStationGroups).
 	pcall(function()
@@ -546,7 +878,7 @@ end
 -- (mission/tasks/auto_builder/track_builder.tl): new nodes and edges with
 -- negative ids, existing nodes by their own. A vertex resolves as the
 -- originator's tool resolved it: New; the existing node of its network
--- within 1.5 m horizontally, the nearest; or a split of the existing edge
+-- within 1.5 m horizontally and 0.5 m in height, the nearest; or a split of the existing edge
 -- between the nodes at its ends, cut in two at the vertex into halves that
 -- keep the edge's own component, their tangents scaled to the part of the
 -- curve each covers. The edges and nodes a build removes are found the same
@@ -572,6 +904,11 @@ local NODE_TOLERANCE = 1.5
 -- How near its node each end of a named edge is: the ends are the node's own
 -- positions, rounded to the millimetre.
 local END_TOLERANCE = 0.5
+-- How far above or below its node a vertex or an end naming it is. Each is
+-- the node's own position, rounded to the millimetre, so its height is the
+-- node's; a track or road stacked over another stands metres apart from it,
+-- and without the height a bulldoze of the upper one removed the lower.
+local HEIGHT_TOLERANCE = 0.5
 
 local function arr(v) return { v.x or v[1], v.y or v[2], v.z or v[3] } end
 local function vec(p) return api.type.Vec3f.new(p[1], p[2], p[3]) end
@@ -596,6 +933,7 @@ end
 -- Held while it is read (on TPF2 a pairs() straight off the call let the
 -- GC free the map mid-loop).
 local function readNodes(network)
+	local t0 = costs and clock()
 	local streets = api.engine.system.streetSystem
 	local map
 	if network == "Track" then map = streets.getNode2TrackEdgeMap() else map = streets.getNode2StreetEdgeMap() end
@@ -604,21 +942,133 @@ local function readNodes(network)
 		local c = api.engine.getComponent(node, api.type.ComponentType.BASE_NODE)
 		if c and c.position then nodes[#nodes + 1] = { id = node, pos = arr(c.position) } end
 	end
+	spend("nodes " .. tostring(network), t0, #nodes)
 	return nodes
 end
 
--- The node of `nodes` nearest `p` horizontally within `tol`, the lower id
--- on a tie; nil when none is.
-local function nearest(nodes, p, tol)
-	local best, bestD
-	for _, n in ipairs(nodes) do
-		local dx, dy = n.pos[1] - p[1], n.pos[2] - p[2]
-		local d = dx * dx + dy * dy
-		if d <= tol * tol and (bestD == nil or d < bestD or (d == bestD and n.id < best.id)) then
-			best, bestD = n, d
+-- How far past a search's distance the octree is asked (nodesNear): the
+-- float rounding of the edges' boxes.
+local NEAR_MARGIN = 2
+
+-- The existing edges whose boxes reach within `reach` of `p` horizontally,
+-- at any height, as the engine's octree holds them: their ids, each once;
+-- nil where this game has no octree to ask or it did not answer. Only ids
+-- are collected in the engine's callback (tpf3mp/lanes.lua, spatial): a
+-- Lua error there is fatal.
+local function edgesNear(p, reach)
+	local octree = api.engine.system and api.engine.system.octreeSystem
+	if not (octree and octree.findIntersectingEntities and api.type.Box3) then return nil end
+	local found = {}
+	local ok, out = pcall(function()
+		local box = api.type.Box3.new(api.type.Vec3f.new(p[1] - reach, p[2] - reach, -1000000),
+			api.type.Vec3f.new(p[1] + reach, p[2] + reach, 1000000))
+		octree.findIntersectingEntities(box, function(e) found[#found + 1] = e end)
+		local edges, seen = {}, {}
+		for _, e in ipairs(found) do
+			if not seen[e] then
+				seen[e] = true
+				if api.engine.getComponent(e, api.type.ComponentType.BASE_EDGE) then edges[#edges + 1] = e end
+			end
+		end
+		return edges
+	end)
+	if not ok then return nil end
+	return out
+end
+
+-- The nodes of `network` within `tol` of `p` horizontally, as readNodes
+-- gives them, found through the engine's octree instead of every node of
+-- the network (2026-10-16: a late game's street network took 130-150 ms to
+-- read whole in the GUI, once for each preview of another player's road,
+-- several a second). Every node of the network has an edge of it, which
+-- runs through the node's position, so the edges the octree finds there
+-- (edgesNear) name such nodes at one of their ends; each is then read
+-- afresh, as readNodes reads it, and kept where it is near enough. Nil
+-- where the octree cannot say: then the caller reads them all. For
+-- previews only (nodesOfNetwork).
+local function nodesNear(network, p, tol)
+	local t0 = costs and clock()
+	local ids = edgesNear(p, tol + NEAR_MARGIN)
+	if ids == nil then return nil end
+	local ok, nodes = pcall(function()
+		local C = api.type.ComponentType
+		local streets = api.engine.system.streetSystem
+		local seen, out = {}, {}
+		for _, e in ipairs(ids) do
+			local edge = api.engine.getComponent(e, C.BASE_EDGE)
+			for _, node in ipairs(edge and { edge.node0, edge.node1 } or {}) do
+				if not seen[node] then
+					seen[node] = true
+					local segments
+					if network == "Track" then segments = streets.getNodeTrackSegments(node)
+					else segments = streets.getNodeStreetSegments(node) end
+					local c = segments and #segments > 0 and api.engine.getComponent(node, C.BASE_NODE)
+					if c and c.position then
+						local pos = arr(c.position)
+						local dx, dy = pos[1] - p[1], pos[2] - p[2]
+						if dx * dx + dy * dy <= tol * tol then out[#out + 1] = { id = node, pos = pos } end
+					end
+				end
+			end
+		end
+		return out
+	end)
+	spend("near " .. tostring(network), t0, #ids)
+	if not ok then return nil end
+	return nodes
+end
+
+-- A network's nodes for one action of the kinds a preview shows, as
+-- nearest and edgeBetween take them: a function of a place `p`, a distance
+-- `tol` and `whole`, which answers a list of the network's nodes. An action the room
+-- applies reads every node of the network (readNodes, once an action), as
+-- it always did: the octree is not known to hold every edge, nor one built
+-- earlier in the same update, and an edge it missed could make one game
+-- choose another node, or pass a node it should refuse, than another game
+-- (2026-10-16, Codex). A preview (dry), which nothing of reaches the world,
+-- takes the nodes the octree finds near `p` (nodesNear) and reads them all
+-- only where it finds none near enough (`whole`): a whole read cost
+-- 130-150 ms of each preview of another player's road in the GUI.
+local function nodesOfNetwork(network)
+	local all
+	return function(p, tol, whole)
+		if dry and not whole then
+			local near = nodesNear(network, p, tol)
+			if near ~= nil then return near end
+		end
+		if all == nil then all = readNodes(network) end
+		return all
+	end
+end
+
+-- The node of `list` within `tol` horizontally and HEIGHT_TOLERANCE
+-- vertically, nearest in three dimensions. Refuse a tie rather than choose
+-- using this game's entity ids (D8).
+local function nearestIn(list, p, tol)
+	local best, bestD, tie
+	for _, n in ipairs(list) do
+		local dx, dy, dz = n.pos[1] - p[1], n.pos[2] - p[2], n.pos[3] - p[3]
+		local horizontal = dx * dx + dy * dy
+		if horizontal <= tol * tol and math.abs(dz) <= HEIGHT_TOLERANCE then
+			local d = horizontal + dz * dz
+			if bestD == nil or d < bestD then
+				best, bestD, tie = n, d, false
+			elseif d == bestD then
+				tie = true
+			end
 		end
 	end
+	if tie then
+		error(string.format("two nodes as near (%.3f, %.3f, %.3f)", p[1], p[2], p[3]), 0)
+	end
 	return best
+end
+
+-- `nodes` may be a list or a network's preview search. Applied builds pass
+-- the complete list so a missing octree edge cannot change their outcome.
+local function nearest(nodes, p, tol)
+	if type(nodes) ~= "function" then return nearestIn(nodes, p, tol) end
+	return nearestIn(nodes(p, tol), p, tol) or nearestIn(nodes(p, tol, true), p, tol)
 end
 
 -- The existing edge of `network` between the nodes at `a` and `b`: its id,
@@ -721,34 +1171,363 @@ function apply.ownStreets(polyline)
 	return links, skipped
 end
 
+-- Leave the construction's own street and track junctions to its build.
+-- Both capture and replay use this rule, so the originator does not send
+-- settings for nodes and edges that no replica builds separately.
+function apply.ownJunctions(polyline)
+	local links, skipped = apply.ownStreets(polyline)
+	local keep, ownEdges, ownNodes = {}, {}, {}
+	for _, link in ipairs(links) do keep[link] = true end
+	local function place(i)
+		local p = arr(polyline.vertices[i + 1].pos)
+		return { x = p[1], y = p[2], z = p[3] }
+	end
+	for _, link in ipairs(polyline.links) do
+		if not keep[link] then
+			local net = link.kind and link.kind.network
+			ownEdges[#ownEdges + 1] = { network = net, ends = { a = place(link.from), b = place(link.to) } }
+			for _, i in ipairs({ link.from, link.to }) do
+				if skipped[i + 1] then ownNodes[#ownNodes + 1] = { network = net, at = place(i) } end
+			end
+		end
+	end
+	return junctions.without(polyline.junctions, ownNodes, ownEdges)
+end
+
+-- A construction whose own tracks the tool joined onto the ends of tracks
+-- that exist (2026-10-10: an underpass mod's eight tracks onto eight track
+-- ends beside a station, refused in every game though its tool built it,
+-- "Construction Not Possible"). Built alone, as every game builds a
+-- construction, its tracks end where those ends are, and only the tool
+-- welds a construction's track ends onto existing nodes. So, when the game
+-- refuses the construction alone (`refused`, its words) and the action's
+-- connection is the construction's own track, joined only at existing
+-- track nodes, every game takes the track pieces at those nodes away and
+-- builds the construction in one proposal, then lays the pieces again at
+-- once, each ending on the construction's own track end where its old end
+-- was: joined, as the tool joined them. A piece keeps its form, kind,
+-- lanes, decorations and owner, all read before anything changes (the
+-- game's component of a removed edge is not to be read afterwards). A
+-- piece with a stop or signal on it, a bridge or tunnel, another company's
+-- piece, or a junction at its far end set by hand (its turns, its lights or
+-- a double slip), and the build is refused as the game refused it; the
+-- settings at a far end are the game's own otherwise, and go with the
+-- pieces. Where the construction has no track end at such a place, the
+-- piece comes back to a node of its own there, unjoined. The pieces are
+-- laid again for free, as the game's refresh of a construction is: they
+-- were the player's already; what still fails is logged with the places,
+-- the same in every game, and the construction stands. Returns what the
+-- build's command answered.
+function rejoinConstruction(build, entity, context, refused)
+	local polyline = build.connection
+	local kept = apply.ownStreets(polyline)
+	if #kept > 0 or #(polyline.removals or {}) > 0 or #(polyline.removed_nodes or {}) > 0 then
+		error(refused, 0)
+	end
+	local C = api.type.ComponentType
+	local streets = api.engine.system.streetSystem
+	local engine = module("engine")
+	local function count(ids) return ids and #ids or 0 end
+	-- The existing track nodes the connection joins, in its order.
+	local before = readNodes("Track")
+	local anchors, anchorAt = {}, {}
+	for i, v in ipairs(polyline.vertices) do
+		local r = v.resolve
+		if type(r) == "table" and (r.Split or (r.Node and r.Node ~= "Track")) then error(refused, 0) end
+		if type(r) == "table" and r.Node then
+			-- At its own level: a track's node right above or below (an
+			-- overpass) is another place.
+			local at = arr(v.pos)
+			local level = {}
+			for _, n in ipairs(before) do
+				if math.abs(n.pos[3] - at[3]) <= 2 then level[#level + 1] = n end
+			end
+			local n = nearest(level, at, NODE_TOLERANCE)
+			if n == nil then error("no Track node at vertex " .. i, 0) end
+			if count(streets.getNodeStreetSegments(n.id)) > 0 then error(refused, 0) end
+			if not anchorAt[n.id] then
+				anchorAt[n.id] = n.pos
+				anchors[#anchors + 1] = n.id
+			end
+		end
+	end
+	if #anchors == 0 then error(refused, 0) end
+	-- The pieces at those nodes, by id, each read whole now.
+	local pieces, taken = {}, {}
+	for _, node in ipairs(anchors) do
+		local ids = streets.getNodeTrackSegments(node)
+		for i = 1, count(ids) do
+			local id = ids[i]
+			if not taken[id] then
+				taken[id] = true
+				pieces[#pieces + 1] = { id = id }
+			end
+		end
+	end
+	table.sort(pieces, function(a, b) return a.id < b.id end)
+	for _, p in ipairs(pieces) do
+		mine(p.id, "track")
+		local c = api.engine.getComponent(p.id, C.BASE_EDGE)
+		if c == nil then error("no edge component on " .. tostring(p.id), 0) end
+		if #(c.objects or {}) > 0 then error(refused .. " (a stop or signal on a track it joins)", 0) end
+		if c.type ~= enum("BaseEdgeType").NORMAL then error(refused .. " (a bridge or tunnel it joins)", 0) end
+		p.owner = require_companies().ownerOf(api, p.id)
+		p.n0, p.n1 = c.node0, c.node1
+		p.t0, p.t1 = arr(c.tangent0), arr(c.tangent1)
+		p.template, p.style = c.roadTemplate, c.roadStyle
+		p.locked = c.roadDevelopmentLocked == true
+		p.lanes = engine.lanesOf(c)
+		p.decorations = engine.decorationsOf(c)
+		for k, node in ipairs({ p.n0, p.n1 }) do
+			local n = api.engine.getComponent(node, C.BASE_NODE)
+			if n == nil then error("no node component on " .. tostring(node), 0) end
+			p["at" .. (k - 1)] = arr(n.position)
+		end
+	end
+	-- The nodes that go: those, and a far end left with no edge; the
+	-- settings at a far end that stays go too, as they name the pieces,
+	-- unless the player set them.
+	local gone, goneList = {}, {}
+	for _, node in ipairs(anchors) do
+		gone[node] = true
+		goneList[#goneList + 1] = node
+	end
+	local auto = enum("TrafficLightPreference").AUTO
+	local orphan, configs, seen = {}, {}, {}
+	for _, p in ipairs(pieces) do
+		for _, node in ipairs({ p.n0, p.n1 }) do
+			if not gone[node] and not seen[node] then
+				seen[node] = true
+				local ids, left = streets.getNodeTrackSegments(node), count(streets.getNodeStreetSegments(node))
+				for i = 1, count(ids) do if not taken[ids[i]] then left = left + 1 end end
+				if left == 0 then
+					orphan[node] = true
+					gone[node] = true
+					goneList[#goneList + 1] = node
+				else
+					local c = api.engine.getComponent(node, C.BASE_NODE_CONFIG)
+					if c ~= nil then
+						local set = {}
+						pcall(function()
+							set = { c.userModifiedLaneConnections == true, c.userModifiedTrafficLightStates == true,
+								c.doubleSlipSwitch == true, c.trafficLightPreference ~= auto }
+						end)
+						for _, by in ipairs(set) do
+							if by then error(refused .. " (a junction set by hand where it joins)", 0) end
+						end
+						configs[#configs + 1] = node
+					end
+				end
+			end
+		end
+	end
+	table.sort(configs)
+
+	-- The pieces away and the construction built, as one build.
+	local first = api.type.SimpleProposal.new()
+	first.constructionsToAdd = { entity }
+	local removed = {}
+	for i, p in ipairs(pieces) do removed[i] = p.id end
+	first.streetProposal.edgesToRemove = removed
+	first.streetProposal.nodesToRemove = goneList
+	if #configs > 0 then first.streetProposal.nodeConfigsToRemove = configs end
+	if refusal(first, context) then error(refused, 0) end
+	log("joining " .. tostring(build.file) .. " onto track ends " .. table.concat(anchors, ",")
+		.. ": its track pieces " .. table.concat(removed, ",") .. " laid again on it")
+	local built = run(api.cmd.makeWorldBuildProposalCmd(first, context, true, true))
+
+	-- The pieces again, as a track build lays them. An end that was one of
+	-- those nodes ends on the construction's own new track node there, by
+	-- its entity: the one track node within a few centimetres, height
+	-- included, that did not exist before. A far end that stays is itself;
+	-- one that went comes back as a node of its own. The construction
+	-- stands, in every game alike, whatever comes of this.
+	local vertices = {}
+	local laid, why = pcall(function()
+		local existed = {}
+		for _, n in ipairs(before) do existed[n.id] = true end
+		local after = readNodes("Track")
+		local index, unjoined = {}, {}
+		local function vertex(old, at)
+			if index[old] then return index[old] end
+			local resolve = "New"
+			if anchorAt[old] then
+				local found
+				for _, n in ipairs(after) do
+					if not existed[n.id] and math.abs(n.pos[1] - at[1]) <= 0.05 and math.abs(n.pos[2] - at[2]) <= 0.05
+						and math.abs(n.pos[3] - at[3]) <= 0.5 then
+						if found then error("two track ends of the new construction where track " .. old .. " ended", 0) end
+						found = n.id
+					end
+				end
+				if found then resolve = { Entity = found } else unjoined[#unjoined + 1] = tostring(old) end
+			elseif not orphan[old] then
+				resolve = { Entity = old }
+			end
+			vertices[#vertices + 1] = { pos = { x = at[1], y = at[2], z = at[3] }, resolve = resolve }
+			index[old] = #vertices - 1
+			return index[old]
+		end
+		local links = {}
+		for _, p in ipairs(pieces) do
+			local function t(a) return { x = a[1], y = a[2], z = a[3] } end
+			links[#links + 1] = { from = vertex(p.n0, p.at0), to = vertex(p.n1, p.at1),
+				tangent0 = t(p.t0), tangent1 = t(p.t1), structure = "Ground", decorations = p.decorations,
+				locked = p.locked, owned = p.owner ~= nil, lanes = p.lanes,
+				kind = { network = "Track", template = p.template, style = p.style } }
+		end
+		if #unjoined > 0 then
+			log("the new " .. tostring(build.file) .. " has no track end where track " .. table.concat(unjoined, ",")
+				.. " ended: laid again there unjoined")
+		end
+		local second = api.type.SimpleProposal.new()
+		networkInto(second, "Track", nil, nil, { vertices = vertices, links = links, removals = {},
+			removed_nodes = {}, junctions = {} })
+		-- For free, as the game's refresh of a construction is: the pieces
+		-- were the player's already, and the tool only joined onto them.
+		local refused2 = refusal(second, nil)
+		if refused2 then error(refused2, 0) end
+		run(api.cmd.makeWorldBuildProposalCmd(second, nil, true, false))
+	end)
+	if not laid then
+		local places = {}
+		for i, v in ipairs(vertices) do
+			places[i] = string.format("%s(%.1f,%.1f,%.1f)", type(v.resolve) == "table" and "node" or "new",
+				v.pos.x, v.pos.y, v.pos.z)
+		end
+		log("the track pieces at the new " .. tostring(build.file) .. " could not be laid again: " .. tostring(why)
+			.. " [" .. table.concat(places, " ") .. "]")
+	end
+	return built
+end
+
+-- How near where a kept signal stood, along its track, the signal of its
+-- construction there is (as a PlaceSignals' removed one).
+local KEPT_TOLERANCE = 0.25
+
+-- An edge's length along its curve, in metres (its Hermite curve in 32
+-- steps).
+local function edgeLength(e)
+	local length, last = 0, e.a
+	for i = 1, 32 do
+		local p = geom.hermitePos(e.a, e.ta, e.b, e.tb, i / 32)
+		local dx, dy, dz = p[1] - last[1], p[2] - last[2], (p[3] or 0) - (last[3] or 0)
+		length = length + math.sqrt(dx * dx + dy * dy + dz * dz)
+		last = p
+	end
+	return length
+end
+
+-- The signals the polyline's links keep from the edges it removes
+-- (action::KeptSignal), each found on its removal's edge as the world
+-- stands, one for one, and each checked as the capture checked it: a track
+-- signal, no waypoint (its signal list says, as tpf3mp/engine.lua's capture
+-- reads it), the acting company's or no company's, on a link of track that
+-- goes on from one of its old track's ends, the same way, or runs where it
+-- stood, the same way (geom.keepsSignal, as the capture asks).
+-- Anything missing or ambiguous refuses the whole build, in every game
+-- alike. Returns { link, entity, kind, pos } for each.
+local function keptSignals(polyline, removalEdges, network, at, dangling)
+	local out, seen = {}, {}
+	local any = false
+	for _, link in ipairs(polyline.links) do
+		if link.kept and #link.kept > 0 then any = true end
+	end
+	if not any then return out end
+	if dangling then error("a construction's streets keep no signals", 0) end
+	local C = api.type.ComponentType
+	local SIGNAL = enum("EdgeObjectType").SIGNAL
+	local lengths = {}
+	for j, link in ipairs(polyline.links) do
+		for n, kept in ipairs(link.kept or {}) do
+			local what = "link " .. j .. "'s signal " .. n
+			local r = polyline.removals[kept.removal + 1]
+			local e = removalEdges[kept.removal + 1]
+			if r == nil or e == nil then error(what .. ": no such removal", 0) end
+			local own = link.kind and link.kind.network or network
+			if r.network ~= "Track" or own ~= "Track" then error(what .. ": not on track", 0) end
+			-- The place is from the removal's `a` end; this game's edge may
+			-- run from its `b`.
+			local ea = arr(r.ends.a)
+			local dx, dy = e.a[1] - ea[1], e.a[2] - ea[2]
+			local flipped = dx * dx + dy * dy > END_TOLERANCE * END_TOLERANCE
+			local want = kept.at
+			if flipped then want = 1 - want end
+			lengths[e.id] = lengths[e.id] or edgeLength(e)
+			local best, bestComp
+			for _, o in ipairs(e.comp.objects or {}) do
+				local c = o[2] == SIGNAL and not seen[o[1]] and api.engine.getComponent(o[1], C.EDGE_OBJECT)
+				if c and c.edgeObjectConstruction == kept.model
+					and math.abs(c.param - want) * lengths[e.id] <= KEPT_TOLERANCE then
+					if best ~= nil then error(what .. ": two signals where one is kept", 0) end
+					best, bestComp = o[1], c
+				end
+			end
+			if best == nil then error(what .. ": no " .. tostring(kept.model) .. " where it is kept", 0) end
+			local list = api.engine.getComponent(best, C.SIGNAL_LIST)
+			local signals = list and list.signals or {}
+			if #signals == 0 then error(what .. ": a signal with no signal list", 0) end
+			for i = 1, #signals do
+				local kind = signals[i].type
+				if type(kind) ~= "number" or kind == api.type.Signal.Type.WAYPOINT then
+					error(what .. ": a waypoint, which lines name, kept on another edge", 0)
+				end
+			end
+			mine(e.id, "track")
+			mine(best, "signal")
+			-- Checked along the removal as the room names it, from its `a`
+			-- end, so every game decides alike whichever way its own edge
+			-- runs.
+			local from = e
+			if flipped then from = { a = e.b, b = e.a, ta = scaled(e.tb, -1), tb = scaled(e.ta, -1) } end
+			local to = { a = at[link.from + 1], b = at[link.to + 1], ta = arr(link.tangent0), tb = arr(link.tangent1) }
+			local ok, why = geom.keepsSignal(from, kept.at, to)
+			if not ok then error(what .. ": " .. why, 0) end
+			seen[best] = true
+			local pos
+			local t = bestComp.transf
+			if t and type(t[13]) == "number" then pos = { t[13], t[14], t[15] } end
+			out[#out + 1] = { link = j, entity = best, kind = SIGNAL, pos = pos }
+		end
+	end
+	return out
+end
+
+-- After the build, each kept signal is still there, where it stood: the
+-- game moves a signal onto the piece of track that takes it. One gone is a
+-- world this mod cannot account for, so the room's replay stops
+-- (replayFatal); one moved is said in the log.
+local function settleKept(carried)
+	local C = api.type.ComponentType
+	local farthest
+	for _, c in ipairs(carried) do
+		local ok, comp = pcall(function() return api.engine.getComponent(c.entity, C.EDGE_OBJECT) end)
+		if not ok or comp == nil then
+			error({ replayFatal = "kept signal " .. tostring(c.entity) .. " is gone after the build" }, 0)
+		end
+		local t = comp.transf
+		if c.pos and t and type(t[13]) == "number" then
+			local dx, dy, dz = t[13] - c.pos[1], t[14] - c.pos[2], t[15] - c.pos[3]
+			local moved = math.sqrt(dx * dx + dy * dy + dz * dz)
+			if moved > 0.5 then
+				log(string.format("kept signal %d moved %.2f m in the build", c.entity, moved))
+			end
+			if farthest == nil or moved > farthest then farthest = moved end
+		end
+	end
+	if #carried > 0 then
+		log("kept " .. #carried .. " signal(s) on the track's new pieces"
+			.. (farthest and string.format(", the farthest moved %.2f m", farthest) or ", where they stand unread"))
+	end
+end
+
 function networkInto(proposal, network, templateName, style, polyline, dangling, gone)
 	local links, skipped = polyline.links, {}
 	local settings = polyline.junctions
 	if dangling then
 		links, skipped = apply.ownStreets(polyline)
-		-- The tool's settings at the construction's own street's nodes, or
-		-- naming its own edges (the entrance at the junction it joins), go
-		-- with that street: they name what this build does not make
-		-- (2026-10-02: a street station refused in every game, "the
-		-- junction no longer exists"). The construction and its refresh
-		-- give those junctions the game's own, alike in every game.
-		local keep, ownEdges, ownNodes = {}, {}, {}
-		for _, link in ipairs(links) do keep[link] = true end
-		local function place(i)
-			local p = arr(polyline.vertices[i + 1].pos)
-			return { x = p[1], y = p[2], z = p[3] }
-		end
-		for _, link in ipairs(polyline.links) do
-			if not keep[link] then
-				local net = link.kind and link.kind.network
-				ownEdges[#ownEdges + 1] = { network = net, ends = { a = place(link.from), b = place(link.to) } }
-				for _, i in ipairs({ link.from, link.to }) do
-					if skipped[i + 1] then ownNodes[#ownNodes + 1] = { network = net, at = place(i) } end
-				end
-			end
-		end
 		local left
-		settings, left = junctions.without(settings, ownNodes, ownEdges)
+		settings, left = apply.ownJunctions(polyline)
 		if #left > 0 then
 			local ok, text = pcall(junctions.summary, { EditJunctions = { changes = left } })
 			log("left to the construction: " .. (ok and text or (#left .. " junction(s)")))
@@ -759,7 +1538,7 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 		removed_nodes = polyline.removed_nodes, junctions = settings }
 	local nodesOf = {}
 	local function nodes(n)
-		if nodesOf[n] == nil then nodesOf[n] = readNodes(n) end
+		if nodesOf[n] == nil then nodesOf[n] = nodesOfNetwork(n) end
 		return nodesOf[n]
 	end
 	local templates = {}
@@ -780,6 +1559,20 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 	local nextEdge, nextNode = -1, -(#polyline.links + 2 * splits) - 1
 
 	local nodesToAdd, edgesToAdd, edgesToRemove = {}, {}, {}
+	-- Per vertex, the networks its edges are in and the existing nodes they
+	-- join it to: a vertex on both a street and a track is where a level
+	-- crossing may be laid, read back after the build (buildNetwork).
+	local touch = {}
+	local function touches(i, net, anchor)
+		if net ~= "Street" and net ~= "Track" then return end
+		local t = touch[i]
+		if t == nil then
+			t = { nets = {}, anchors = {} }
+			touch[i] = t
+		end
+		t.nets[net] = true
+		if type(anchor) == "number" and anchor >= 0 then t.anchors[#t.anchors + 1] = { node = anchor, network = net } end
+	end
 	-- The nodes at the ends of the edges removed, in order: their lane
 	-- configurations name those edges, and go with them (below).
 	local ends, endSeen = {}, {}
@@ -821,8 +1614,12 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 	for k, link in ipairs(polyline.links) do
 		local own = link.kind and link.kind.network or network
 		if own == nil then error("link " .. k .. " names no kind", 0) end
-		links[k] = addEdge(kindOf(own), 0, 0, at[link.from + 1], at[link.to + 1],
-			arr(link.tangent0), arr(link.tangent1))
+		-- Each end where the tool put it: its vertex, or beside it (a track
+		-- laid onto a street's end starts on the street's tram lane, and the
+		-- game joins the two there only; schema 27).
+		local p0 = link.position0 and arr(link.position0) or at[link.from + 1]
+		local p1 = link.position1 and arr(link.position1) or at[link.to + 1]
+		links[k] = addEdge(kindOf(own), 0, 0, p0, p1, arr(link.tangent0), arr(link.tangent1))
 	end
 
 	for i, v in ipairs(polyline.vertices) do
@@ -831,10 +1628,15 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 			-- Left out, with its link.
 		elseif r == "New" then
 			ids[i] = addNode(p)
+		elseif type(r) == "table" and r.Entity then
+			-- A node by its entity: this game's own replay found it
+			-- (rejoinConstruction); never in an action.
+			ids[i] = r.Entity
 		elseif type(r) == "table" and r.Node then
 			local n = nearest(nodes(r.Node), p, NODE_TOLERANCE)
 			if n == nil then error("no " .. r.Node .. " node at vertex " .. i) end
 			ids[i] = n.id
+			touches(i, r.Node)
 		elseif type(r) == "table" and r.Split then
 			local s = r.Split
 			local e = edgeBetween(nodes(s.network), s.network, arr(s.ends.a), arr(s.ends.b))
@@ -854,6 +1656,8 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 			local tm = geom.hermiteTangent(e.a, e.ta, e.b, e.tb, u)
 			local mid = addNode(p)
 			ids[i] = mid
+			touches(i, s.network, e.node0)
+			touches(i, s.network, e.node1)
 			removeEdge(e)
 			-- Each half the split edge's own component, read afresh, as the
 			-- game's electrify task rebuilds an edge (electrify.tl).
@@ -870,6 +1674,9 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 	for k, link in ipairs(polyline.links) do
 		local s = links[k]
 		s.comp.node0, s.comp.node1 = ids[link.from + 1], ids[link.to + 1]
+		local net = link.kind and link.kind.network or network
+		touches(link.from + 1, net, ids[link.to + 1])
+		touches(link.to + 1, net, ids[link.from + 1])
 		local structure, name = link.structure, "Ground"
 		if type(structure) == "table" then name = next(structure) end
 		s.comp.type = edgeType[STRUCTURE[name] or error("a link of structure " .. tostring(name))]
@@ -927,9 +1734,10 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 	-- nowhere: on TPF2 that crashed every game at the same step
 	-- (docs/BUILDING.md). So one with any is removed only where a link
 	-- rebuilds it in place, between the same places in the same direction,
-	-- which takes its objects under their own entities (as the capture
-	-- demands, tpf3mp/engine.lua keptInPlace).
-	local taken = {}
+	-- which takes its objects under their own entities, or where links keep
+	-- every one of its signals (`kept`: a track cut between its signals); as
+	-- the capture demands, tpf3mp/engine.lua keptInPlace.
+	local taken, removalEdges, removedIds = {}, {}, {}
 	local function sameAt(a, b)
 		return math.abs(a[1] - b[1]) < 0.05 and math.abs(a[2] - b[2]) < 0.05 and math.abs(a[3] - b[3]) < 0.05
 	end
@@ -937,9 +1745,28 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 		local e = edgeBetween(nodes(r.network), r.network, arr(r.ends.a), arr(r.ends.b))
 		if e == nil then error("no " .. r.network .. " edge to remove (" .. k .. ")") end
 		if gone and gone[e.id] then error("removal " .. k .. " is the old construction's own edge", 0) end
+		if removedIds[e.id] then error("removal " .. k .. " names an edge another removal names", 0) end
+		removedIds[e.id] = true
 		if dangling then mine(e.id, "road or track") end
+		removalEdges[k] = e
+	end
+	local objectsFor, claimed = {}, {}
+	local function give(j, o)
+		objectsFor[j] = objectsFor[j] or {}
+		objectsFor[j][#objectsFor[j] + 1] = { o[1], o[2] }
+	end
+	local carried = keptSignals(polyline, removalEdges, network, at, dangling)
+	for _, c in ipairs(carried) do
+		claimed[c.entity] = true
+		give(c.link, { c.entity, c.kind })
+	end
+	for k, e in ipairs(removalEdges) do
 		local objects = e.comp.objects or {}
-		if #objects > 0 then
+		local kept = 0
+		for _, o in ipairs(objects) do if claimed[o[1]] then kept = kept + 1 end end
+		if kept > 0 and kept < #objects then
+			error("removal " .. k .. " has a signal a link keeps and an object no link takes", 0)
+		elseif kept == 0 and #objects > 0 then
 			local into
 			for j, link in ipairs(polyline.links) do
 				if not taken[j] and sameAt(at[link.from + 1], e.a) and sameAt(at[link.to + 1], e.b) then
@@ -949,12 +1776,11 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 			end
 			if into == nil then error("removal " .. k .. " has a stop or signal on it and no link rebuilds it") end
 			taken[into] = true
-			local kept = {}
-			for i, o in ipairs(objects) do kept[i] = { o[1], o[2] } end
-			links[into].comp.objects = kept
+			for _, o in ipairs(objects) do give(into, o) end
 		end
 		removeEdge(e)
 	end
+	for j, objects in pairs(objectsFor) do links[j].comp.objects = objects end
 
 	local nodesToRemove, removedNode = {}, {}
 	for k, n in ipairs(polyline.removed_nodes or {}) do
@@ -988,7 +1814,9 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 	-- they draw nothing, and a snapped build's may name a node only its
 	-- originator's tool has.
 	if not dry then
+		local t0 = costs and clock()
 		local left = junctions.into(proposal, polyline.junctions, ends, mine, gone)
+		spend("junctions", t0)
 		if left and #left > 0 then
 			log("left to the construction: the settings of " .. #left .. " junction(s) at its old edges")
 		end
@@ -1007,28 +1835,150 @@ function networkInto(proposal, network, templateName, style, polyline, dangling,
 	end
 	shape[#shape + 1] = "-e" .. table.concat(edgesToRemove, ",") .. " -n" .. table.concat(nodesToRemove, ",")
 		.. " -c" .. table.concat(configsToRemove, ",")
+	-- The junction settings put in, each node's lanes and how many a tram's.
+	for _, n in ipairs(proposal.streetProposal.nodeConfigsToAdd or {}) do
+		local turns, trams = 0, 0
+		pcall(function()
+			local lanes = n.comp.laneConnections
+			for i = 1, #lanes do
+				turns = turns + 1
+				if lanes[i].withTram then trams = trams + 1 end
+			end
+		end)
+		shape[#shape + 1] = "+j" .. tostring(n.entity) .. "{lanes " .. turns .. " tram " .. trams .. "}"
+	end
 	log("building " .. table.concat(shape, " "))
+	-- Second, the vertices' node ids, in this proposal's numbering, and the
+	-- vertices on both networks: for the level crossings it lays
+	-- (buildNetwork).
+	local crossings = {}
+	for i = 1, #polyline.vertices do
+		local t = touch[i]
+		if t and t.nets.Street and t.nets.Track and ids[i] ~= nil then
+			crossings[#crossings + 1] = { vertex = i, at = at[i], id = ids[i], anchors = t.anchors }
+		end
+	end
+	return carried, { ids = ids, vertices = #polyline.vertices, crossings = crossings }
 end
 
-local function buildNetwork(network, templateName, style, polyline)
+-- The level crossings at a vertex on both networks (`c`, as networkInto
+-- noted it), each once: on its own node when it is an existing one, and on
+-- the nodes the existing nodes next to it reach within CROSSING_REACH of
+-- it, each through an edge of its network. The game lays a crossing as
+-- half, connector, half (docs/BUILDING.md, "Level crossings"), so a new
+-- crossing's node may sit a few metres off the vertex, and only an edge
+-- laid to the vertex reaches one there.
+local CROSSING_REACH, CROSSING_RISE = 10, 3
+local function crossingsAt(c)
+	local streets = api.engine.system.streetSystem
+	local system = api.engine.system.railRoadCrossingSystem
+	local near, found, seen = {}, {}, {}
+	if c.id >= 0 then near[1] = c.id end
+	for _, a in ipairs(c.anchors) do
+		local segments = (a.network == "Track" and streets.getNodeTrackSegments or streets.getNodeStreetSegments)(a.node)
+		for j = 1, (segments and #segments or 0) do
+			local e = api.engine.getComponent(segments[j], api.type.ComponentType.BASE_EDGE)
+			local other = e and ((e.node0 == a.node and e.node1) or (e.node1 == a.node and e.node0))
+			local b = other and api.engine.getComponent(other, api.type.ComponentType.BASE_NODE)
+			local p = b and arr(b.position)
+			if p then
+				local dx, dy = p[1] - c.at[1], p[2] - c.at[2]
+				if dx * dx + dy * dy <= CROSSING_REACH * CROSSING_REACH and math.abs(p[3] - c.at[3]) <= CROSSING_RISE then
+					near[#near + 1] = other
+				end
+			end
+		end
+	end
+	for _, node in ipairs(near) do
+		local crossing = system.getRailroadCrossingForNode(node)
+		if type(crossing) == "number" and crossing >= 0 and not seen[crossing] then
+			seen[crossing] = true
+			found[#found + 1] = crossing
+		end
+	end
+	return found
+end
+
+local function buildNetwork(network, templateName, style, polyline, crossingType)
+	-- A type this game does not offer is refused before anything is laid.
+	local crossingIndex = crossingType ~= nil and module("crossings").typeIndex(crossingType) or nil
 	local proposal = api.type.SimpleProposal.new()
-	networkInto(proposal, network, templateName, style, polyline)
+	local carried, laid = networkInto(proposal, network, templateName, style, polyline)
+	-- The level crossing type the player's toolbar picked (docs/HOOKS.md,
+	-- "Level crossing types"), as the tool maps it: each node of the build's
+	-- own polyline to -2 - type, the type "preferred", so a crossing that
+	-- is there already keeps its own, and every crossing laid anew takes it.
+	-- The tool maps only the polyline's crossing nodes; a vertex that joins
+	-- no crossing is never looked up.
+	if crossingIndex ~= nil then
+		local map = {}
+		for i = 1, laid.vertices do
+			if laid.ids[i] ~= nil then map[laid.ids[i]] = -2 - crossingIndex end
+		end
+		proposal.streetProposal.node2rcType = map
+		log("level crossings laid as " .. crossingType)
+	end
 	-- Paid by the player, as the tool builds; the town buildings in the way
 	-- cleared, as the tool clears them (the capture lets only those through).
 	local context = api.type.Context.new()
 	context.player = company()
 	context.gatherBuildings = true
-	return buildProposal(proposal, context)
+	-- The crossings at the build's vertices on both networks before it, by
+	-- their nodes: one the build extends keeps its type (preferred).
+	local before, readBefore
+	if crossingIndex ~= nil and not dry and #laid.crossings > 0 then
+		local crossings = module("crossings")
+		readBefore, before = pcall(function()
+			local types = {}
+			for _, c in ipairs(laid.crossings) do
+				for _, crossing in ipairs(crossingsAt(c)) do
+					local comp = crossings.component(crossing)
+					for _, node in ipairs(crossings.nodes(comp)) do types[node] = comp.typeIndex end
+				end
+			end
+			return types
+		end)
+		if not readBefore then log("the level crossings there do not read: " .. tostring(before)) end
+	end
+	local built = buildProposal(proposal, context)
+	settleKept(carried)
+	-- Each crossing at those vertices, read back: one laid anew of another
+	-- type than the toolbar's, or one extended that lost its own, is said.
+	-- Only said, since the build went and nothing here may fail it; the
+	-- room's world checks read every crossing's type (tpf3mp/lanes.lua), so
+	-- games that laid different ones are found there.
+	if built == true and readBefore then
+		local crossings = module("crossings")
+		local read, why = pcall(function()
+			for _, c in ipairs(laid.crossings) do
+				local found = crossingsAt(c)
+				if #found == 0 then log("no level crossing at vertex " .. c.vertex) end
+				for _, crossing in ipairs(found) do
+					local comp = crossings.component(crossing)
+					local expected = crossingIndex
+					for _, node in ipairs(crossings.nodes(comp)) do
+						if before[node] ~= nil then expected = before[node] break end
+					end
+					if comp == nil or comp.typeIndex ~= expected then
+						log("level crossing " .. crossing .. " at vertex " .. c.vertex .. " took type "
+							.. tostring(comp and comp.typeIndex) .. ", not " .. tostring(expected)
+							.. " (the toolbar's " .. crossingType .. " is " .. crossingIndex .. ")")
+					end
+				end
+			end
+		end)
+		if not read then log("the level crossings laid do not read back: " .. tostring(why)) end
+	end
+	return built
 end
 
 function HANDLERS.BuildRoad(road)
-	return buildNetwork("Street", road.street, road.style, road.polyline)
+	return buildNetwork("Street", road.street, road.style, road.polyline, road.crossing_type)
 end
 
 function HANDLERS.EditJunctions(edit)
-	junctions.requireEnabled()
 	local proposal = api.type.SimpleProposal.new()
-	junctions.into(proposal, edit.changes, {}, mine)
+	junctions.into(proposal, edit.changes, {}, mine, nil, junctions.requireNarrow)
 	local context = api.type.Context.new()
 	context.player = company()
 	return buildProposal(proposal, context)
@@ -1180,6 +2130,69 @@ local function removeAssets(a, context)
 	return true
 end
 
+-- An asset brush stroke (action::AssetStroke): every group it replaces found
+-- here as the asset bulldozer finds one, the one group that holds exactly
+-- that many assets with its first one where it stood; then one build that
+-- removes them and adds the stroke's groups, each as the tool builds one
+-- (construction_builder_util::CreateProposalAddAsset, as removeAssets
+-- rebuilds a group): a construction entity at the world's origin whose desc
+-- is autoRemovable and whose one subconstruction lists the group's assets,
+-- each its model's file and its world matrix. Owned by the player's company
+-- and paid by it, as the player's own build. A replaced group missing or
+-- ambiguous here refuses the stroke, in every game.
+function HANDLERS.PlantAssets(t)
+	local P = api.type.Proposal
+	local removed = {}
+	for i, r in ipairs(t.removed or {}) do
+		local found = {}
+		for _, g in ipairs(assetGroupsAt(r.first.model, r.first.at.x, r.first.at.y, r.first.at.z)) do
+			if #g.assets == r.count then found[#found + 1] = g.entity end
+		end
+		if #found ~= 1 then
+			error(string.format("%s asset group of %d assets with %s at %.2f, %.2f here (group %d the stroke replaces)",
+				#found == 0 and "no" or "more than one", r.count, tostring(r.first.model), r.first.at.x, r.first.at.y, i), 0)
+		end
+		removed[#removed + 1] = found[1]
+	end
+	local identity = matrix({ basis = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }, origin = { x = 0, y = 0, z = 0 } })
+	local added, count = {}, 0
+	for g, group in ipairs(t.groups or {}) do
+		local models = {}
+		for _, a in ipairs(group) do
+			local file = t.models[a.model + 1]
+			if file == nil then error("group " .. g .. " names a model the stroke does not", 0) end
+			local tm = P.TransformedModel.new()
+			tm.id = file
+			tm.transf = matrix(a.transform)
+			models[#models + 1] = tm
+		end
+		local sub = P.Subconstruction.new()
+		sub.models = models
+		local ce = P.ConstructionEntity.new()
+		local desc = ce.desc
+		if desc == nil then error("this game makes no construction desc for an asset group", 0) end
+		desc.autoRemovable = true
+		ce.desc = desc
+		local con = ce.construction
+		if con == nil then error("this game makes no construction for an asset group", 0) end
+		con.subconstructions = { sub }
+		ce.construction = con
+		ce.transf = identity
+		ce.playerEntity = company()
+		added[#added + 1] = ce
+		count = count + #models
+	end
+	local proposal = P.new()
+	proposal.toRemove = removed
+	proposal.toAdd = added
+	local context = api.type.Context.new()
+	context.player = company()
+	run(api.cmd.makeWorldBuildProposalCmd(proposal, context, true, true))
+	log(string.format("asset brush applied: %d group(s) of %d asset(s), replacing %d group(s)", #added, count,
+		#removed))
+	return true
+end
+
 local function townBuildingsRemoved(proposal, named)
 	local ok, removed = pcall(function()
 		local l, out = proposal.toRemove, {}
@@ -1216,6 +2229,52 @@ local function townBuildingsRemoved(proposal, named)
 	return table.concat(ids, ",")
 end
 
+-- The signals on the tracks a removal takes away go with them, in its
+-- edgeObjectsToRemove: an edge removed with objects still on it leaves them
+-- pointing nowhere (on TPF2 that crashed every game; docs/BUILDING.md).
+-- makeSegmentsRemoveProposal answers a whole Proposal, its street part in
+-- `proposal` (as the bulldozer's own). Its list may name them already; one
+-- that names anything else refuses the removal, and one that leaves any
+-- out is given them, and must then read back exactly those, else the
+-- removal is refused too.
+local function withSignalsRemoved(proposal, signals)
+	local want, unique = {}, {}
+	for _, id in ipairs(signals) do
+		if not want[id] then unique[#unique + 1] = id end
+		want[id] = true
+	end
+	signals = unique
+	table.sort(signals)
+	local function listed()
+		local ok, out = pcall(function()
+			local l, out = proposal.proposal.edgeObjectsToRemove, {}
+			for i = 1, (l and #l or 0) do out[i] = l[i] end
+			return out
+		end)
+		if not ok or type(out) ~= "table" then
+			error("the game's removal does not say which signals it takes", 0)
+		end
+		return out
+	end
+	-- Exactly the signals, each once; or false, and raises for anything else.
+	local function exactly(l)
+		local seen = {}
+		for _, id in ipairs(l) do
+			if not want[id] then
+				error("the game would remove an edge object " .. tostring(id) .. " the bulldozer did not", 0)
+			end
+			if seen[id] then error("the game's removal names signal " .. tostring(id) .. " twice", 0) end
+			seen[id] = true
+		end
+		return #l == #signals
+	end
+	if not exactly(listed()) then
+		pcall(function() proposal.proposal.edgeObjectsToRemove = signals end)
+		if not exactly(listed()) then error("the game's removal will not take the signals on the tracks", 0) end
+	end
+	log("removing signals " .. table.concat(signals, ",") .. " with their tracks")
+end
+
 -- The bulldozer's removals, as the game makes them itself: a construction
 -- with what is its own (createProposalRemove: its entrance edge and node, as
 -- the bulldozer proposed them on build 40408; a town building alone), or
@@ -1231,7 +2290,8 @@ function HANDLERS.Bulldoze(b)
 	local proposals = api.engine.util.proposal
 	local proposal
 	if b.Construction then
-		local con = constructionAt(b.Construction)
+		local con, construction = constructionAt(b.Construction)
+		pcall(diagnosticConstruction, b.Construction, con, construction, acting and acting.roster)
 		mine(con, "construction")
 		proposal = proposals.createProposalRemove(con, context)
 		if proposal == nil then error("the game will not remove the " .. tostring(b.Construction.file), 0) end
@@ -1239,21 +2299,32 @@ function HANDLERS.Bulldoze(b)
 	elseif b.Edges then
 		local network = b.Edges.network
 		local nodes = readNodes(network)
-		local ids = {}
+		local ids, signals = {}, {}
 		for k, ends in ipairs(b.Edges.edges) do
 			local e = edgeBetween(nodes, network, arr(ends.a), arr(ends.b))
 			if e == nil then error("no " .. network .. " edge to remove (" .. k .. ")", 0) end
-			if #(e.comp.objects or {}) > 0 then error("edge " .. k .. " has a stop or signal on it", 0) end
+			-- A track's signals go with it, as the bulldozer removes them; a
+			-- stop, or any object on a street, refuses it.
+			for _, o in ipairs(e.comp.objects or {}) do
+				if network ~= "Track" or o[2] ~= enum("EdgeObjectType").SIGNAL then
+					error("edge " .. k .. " has a stop on it", 0)
+				end
+				mine(o[1], "signal")
+				signals[#signals + 1] = o[1]
+			end
 			mine(e.id, "road or track")
 			ids[#ids + 1] = e.id
 		end
 		proposal = proposals.makeSegmentsRemoveProposal(ids)
+		if #signals > 0 then withSignalsRemoved(proposal, signals) end
 		local gone = townBuildingsRemoved(proposal, b.Edges.buildings or {})
 		log("removing " .. network .. " edges " .. table.concat(ids, ",")
 			.. (gone ~= "" and (" and town buildings " .. gone) or ""))
 	elseif b.EdgeObject then
 		-- A simple proposal: the game's verdict first (buildProposal).
-		return removeEdgeObject(b.EdgeObject, context)
+		return removeEdgeObject(b.EdgeObject.edge, { b.EdgeObject }, context, false)
+	elseif b.EdgeObjects then
+		return removeEdgeObject(b.EdgeObjects.edge, b.EdgeObjects.objects, context, true)
 	elseif b.Assets then
 		return removeAssets(b.Assets, context)
 	else
@@ -1265,7 +2336,7 @@ function HANDLERS.Bulldoze(b)
 end
 
 function HANDLERS.BuildTrack(track)
-	return buildNetwork("Track", track.track, track.style, track.polyline)
+	return buildNetwork("Track", track.track, track.style, track.polyline, track.crossing_type)
 end
 
 -- An upgrade tool's build, said in the log once every game built it
@@ -1326,6 +2397,27 @@ function HANDLERS.Terraform(t)
 	return true
 end
 
+-- A terrain painter's stroke, as the grids the hook read (action::TerrainPaint,
+-- the hook made it, crates/tpf3mp-hook/src/terrain.rs): as a terraform, the
+-- stroke goes to the hook (apply.terrain) and an empty proposal, the carrier,
+-- is sent as the player's build; the hook fills the carrier's materials and
+-- mask grids at its apply. The action fails unless the carrier was filled.
+function HANDLERS.Paint(t)
+	if type(apply.terrain) ~= "function" then error("this hook cannot apply paint", 0) end
+	local armed, why = apply.terrain(t)
+	if armed ~= true then error("the hook would not take the paint: " .. tostring(why), 0) end
+	local context = api.type.Context.new()
+	context.player = company()
+	local sent, err = pcall(function()
+		return run(api.cmd.makeWorldBuildProposalCmd(api.type.Proposal.new(), context, true, true))
+	end)
+	local filled = apply.terrain(nil)
+	if not sent then error(err, 0) end
+	if filled ~= true then error("the hook filled no build with the paint", 0) end
+	log("paint applied: " .. module("capture").paintSummary(t))
+	return true
+end
+
 -- ---------------------------------------------------------------- stops
 --
 -- A stop is placed, or removed, as the stop tool and the bulldozer propose
@@ -1341,7 +2433,7 @@ end
 
 -- The existing edge a stop action names, as edgeBetween finds it.
 local function stopEdge(ref)
-	local e = edgeBetween(readNodes(ref.network), ref.network, arr(ref.ends.a), arr(ref.ends.b))
+	local e = edgeBetween(nodesOfNetwork(ref.network), ref.network, arr(ref.ends.a), arr(ref.ends.b))
 	if e == nil then error("no " .. ref.network .. " edge for the stop", 0) end
 	return e
 end
@@ -1557,7 +2649,7 @@ function HANDLERS.PlaceStop(stop)
 		-- defaults (SimpleStreetProposal.EdgeObject.params: not in the
 		-- game's API reference, but a member on build 40408, and the signal
 		-- it builds keeps them, 2026-10-06).
-		if stop.params and #stop.params > 0 then eo.params = params(stop.params) end
+		if stop.params and #stop.params > 0 then eo.params = objectParams(stop.params) end
 		added[k] = eo
 	end
 	local proposal = rebuildWith(e, network, objects)
@@ -1572,32 +2664,113 @@ function HANDLERS.PlaceStop(stop)
 	return built
 end
 
--- A stop the bulldozer removes: the object of that construction on the
--- edge, nearest where it stood, within 2 m.
-function removeEdgeObject(ref, context)
-	local network = ref.edge.network
-	local e = stopEdge(ref.edge)
-	local best, bestD
+-- The stops the bulldozer removes from one edge (one, or both of a
+-- two-sided stop): for each, the object of its construction on the edge
+-- nearest where it stood, within 2 m, each a different one; the edge
+-- rebuilt once without them.
+function removeEdgeObject(edge, removed, context, twoSided)
+	if type(removed) ~= "table" then error("the bulldozer has no edge-object list", 0) end
+	local count = 0
+	for k in pairs(removed) do
+		if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > 2 then
+			error("the bulldozer has a malformed edge-object list", 0)
+		end
+		count = count + 1
+	end
+	local expected = twoSided and 2 or 1
+	if count ~= expected or #removed ~= count then
+		if twoSided then error("a two-sided stop removal must name both objects", 0) end
+		error("a stop removal must name one object", 0)
+	end
+	if twoSided and removed[1].model ~= removed[2].model then
+		error("a two-sided stop removal must name one construction", 0)
+	end
+	local network = edge.network
+	local e = stopEdge(edge)
+	local taken, gone, names = {}, {}, {}
+	local edgeKinds = {}
 	for _, o in ipairs(e.comp.objects or {}) do
-		local c = api.engine.getComponent(o[1], api.type.ComponentType.EDGE_OBJECT)
-		local t = c and c.transf
-		if c and c.edgeObjectConstruction == ref.model and t then
-			local dx, dy, dz = t[13] - ref.at.x, t[14] - ref.at.y, t[15] - ref.at.z
-			local dist = dx * dx + dy * dy + dz * dz
-			if dist <= 4 and (bestD == nil or dist < bestD or (dist == bestD and o[1] < best)) then
-				best, bestD = o[1], dist
+		local id, kind = o[1], o[2]
+		if type(id) ~= "number" or id ~= math.floor(id) or id < 0 or kind == nil or edgeKinds[id] ~= nil then
+			error("the edge has an unreadable or repeated object", 0)
+		end
+		edgeKinds[id] = kind
+	end
+	local resolved = {}
+	for _, ref in ipairs(removed) do
+		local best, bestD, bestKind, bestAt
+		for _, o in ipairs(e.comp.objects or {}) do
+			local c = not taken[o[1]] and api.engine.getComponent(o[1], api.type.ComponentType.EDGE_OBJECT)
+			local t = c and c.transf
+			if c and c.edgeObjectConstruction == ref.model and t then
+				local dx, dy, dz = t[13] - ref.at.x, t[14] - ref.at.y, t[15] - ref.at.z
+				local dist = dx * dx + dy * dy + dz * dz
+				if dist <= 4 then
+					if bestD == nil or dist < bestD then
+						best, bestD, bestKind, bestAt = o[1], dist, edgeKinds[o[1]], { t[13], t[14], t[15] }
+					elseif dist == bestD then
+						error("two " .. tostring(ref.model) .. " objects equally near", 0)
+					end
+				end
 			end
 		end
+		if best == nil then error("no " .. tostring(ref.model) .. " there", 0) end
+		if bestKind == nil then error("an edge object with no stop or signal type", 0) end
+		mine(best, "stop")
+		taken[best] = true
+		gone[#gone + 1] = best
+		names[#names + 1] = tostring(ref.model) .. " " .. tostring(best)
+		resolved[#resolved + 1] = { entity = best, kind = bestKind, at = bestAt }
 	end
-	if best == nil then error("no " .. tostring(ref.model) .. " there", 0) end
-	mine(best, "stop")
+	if twoSided then
+		local types = enum("EdgeObjectType")
+		if resolved[1].kind ~= types.STOP_LEFT and resolved[1].kind ~= types.STOP_RIGHT then
+			error("a two-sided stop removal resolved to a signal or waypoint", 0)
+		end
+		if resolved[2].kind ~= types.STOP_LEFT and resolved[2].kind ~= types.STOP_RIGHT then
+			error("a two-sided stop removal resolved to a signal or waypoint", 0)
+		end
+		if resolved[1].kind == resolved[2].kind or resolved[1].entity == resolved[2].entity then
+			error("a two-sided stop removal needs opposite sides", 0)
+		end
+		local function stationGroup(entity)
+			local ok, group = pcall(function()
+				return api.engine.system.stationGroupSystem.getStationGroup(entity)
+			end)
+			if not ok or type(group) ~= "number" or group < 0 then
+				error("a two-sided stop without a readable station group", 0)
+			end
+			local componentType = api.type.ComponentType.STATION_GROUP
+			if type(componentType) ~= "number" then error("the station group component cannot be read", 0) end
+			local component = api.engine.getComponent(group, componentType)
+			if component == nil then error("a two-sided stop with no station group component", 0) end
+			local listed = 0
+			for _, member in ipairs(seq(component.stations or {})) do
+				if member == entity then listed = listed + 1 end
+			end
+			if listed ~= 1 then error("a two-sided stop not listed once in its station group", 0) end
+			return group
+		end
+		if stationGroup(resolved[1].entity) ~= stationGroup(resolved[2].entity) then
+			error("the two stops are not one two-sided stop", 0)
+		end
+		local function center(at)
+			local u = geom.parameterAt(e.a, e.ta, e.b, e.tb, at[1], at[2])
+			return geom.hermitePos(e.a, e.ta, e.b, e.tb, u)
+		end
+		local a, b = center(resolved[1].at), center(resolved[2].at)
+		local dx, dy, dz = a[1] - b[1], a[2] - b[2], a[3] - b[3]
+		if dx * dx + dy * dy + dz * dz > 0.25 then
+			error("the two stops are at different places on the edge", 0)
+		end
+	end
 	local objects = {}
 	for _, o in ipairs(e.comp.objects) do
-		if o[1] ~= best then objects[#objects + 1] = { o[1], o[2] } end
+		if not taken[o[1]] then objects[#objects + 1] = { o[1], o[2] } end
 	end
 	local proposal = rebuildWith(e, network, objects)
-	proposal.streetProposal.edgeObjectsToRemove = { best }
-	log("removing " .. tostring(ref.model) .. " " .. tostring(best) .. " from " .. network .. " edge " .. e.id)
+	proposal.streetProposal.edgeObjectsToRemove = gone
+	log("removing " .. table.concat(names, ", ") .. " from " .. network .. " edge " .. e.id)
 	return buildProposal(proposal, context)
 end
 
@@ -1741,7 +2914,7 @@ function HANDLERS.PlaceSignals(sig)
 			-- Named, as a stop the room places is, so the engine gives it
 			-- its owner (docs/BUILDING.md).
 			eo.name = PROVISIONAL_STOP_NAME
-			if sig.params and #sig.params > 0 then eo.params = params(sig.params) end
+			if sig.params and #sig.params > 0 then eo.params = objectParams(sig.params) end
 			added[k] = eo
 		end
 		local s = api.type.SegmentAndEntity.new()
@@ -1802,6 +2975,7 @@ end
 -- The construction of `ref.file` whose origin is within 2 m of `ref.at`, the
 -- nearest, the lower entity on a tie.
 function constructionAt(ref)
+	local t0 = costs and clock()
 	local CONSTRUCTION = api.type.ComponentType.CONSTRUCTION
 	local list = api.engine.getEntitiesWithComponent(CONSTRUCTION)
 	local best, bestD
@@ -1815,6 +2989,7 @@ function constructionAt(ref)
 			if d <= 4 and (bestD == nil or d < bestD or (d == bestD and e < best)) then best, bestD = e, d end
 		end
 	end
+	spend("constructionAt", t0, #list)
 	if best == nil then error("no " .. tostring(ref.file) .. " there", 0) end
 	return best, api.engine.getComponent(best, CONSTRUCTION)
 end
@@ -1940,7 +3115,7 @@ function HANDLERS.BuyVehicle(buy)
 		local facts = {}
 		pcall(function()
 			local account = api.engine.getComponent(company(), api.type.ComponentType.ACCOUNT)
-			facts[#facts + 1] = "the company has " .. string.format("%d", account.balance)
+			facts[#facts + 1] = "the company has " .. string.format("%.0f", account.balance)
 		end)
 		for i, p in ipairs(buy.consist) do
 			pcall(function()
@@ -1970,7 +3145,13 @@ end
 local function isVehicle(e)
 	if type(e) ~= "number" or e < 0 then return false end
 	local ok, c = pcall(api.engine.getComponent, e, api.type.ComponentType.TRANSPORT_VEHICLE)
-	return ok and c ~= nil
+	if not ok then
+		-- The replacement command already ran. Treat an unreadable result
+		-- as uncertain, so replay holds before the registry could assign a
+		-- new canonical id to the vehicle.
+		error({ replayFatal = "replacement vehicle " .. tostring(e) .. " could not be read: " .. tostring(c) }, 0)
+	end
+	return c ~= nil
 end
 
 -- A vehicle's consist replaced, as the store's HandleVehicleChanges sends it
@@ -2032,42 +3213,38 @@ function HANDLERS.SellVehicle(sell, ctx)
 	return run(api.cmd.makeVehicleSellCmd(vehicles))
 end
 
--- Small before/after records at the action boundary, not a per-tick scan.
--- A new train diverged immediately after BuyVehicle/AssignLine; these show
--- whether movement already differed before the engine chose its route.
-local function vehicleActionState(entity, canonical, phase, line, first)
-	local ok, why = pcall(function()
-		local c = api.type.ComponentType
-		local v = api.engine.getComponent(entity, c.TRANSPORT_VEHICLE)
-		local p = api.engine.getComponent(entity, c.MOVE_PATH)
-		local d = p and p.dyn
-		local pos = d and d.pathPos
-		log("vehicle-action " .. phase .. " vehicle-" .. tostring(canonical)
-			.. " line-" .. tostring(line) .. " first=" .. tostring(first)
-			.. " time=" .. tostring(now()) .. " entity=" .. tostring(entity)
-			.. " state=" .. tostring(v and v.state) .. " stop=" .. tostring(v and v.stopIndex)
-			.. " edge=" .. tostring(pos and pos.edgeIndex) .. " pos=" .. tostring(pos and pos.pos)
-			.. " speed=" .. tostring(d and d.speed))
-	end)
-	if not ok then
-		log("vehicle-action " .. phase .. " vehicle-" .. tostring(canonical)
-			.. " unavailable: " .. tostring(why))
-	end
-end
-
 function HANDLERS.AssignLine(assign, ctx)
 	if assign.line == nil then
 		return false, "this version of the mod does not take vehicles off their line yet"
 	end
-	local line = ownOf(ctx, "lines", assign.line)
 	-- No first stop: the game's choice, the next stop each can reach (-1).
 	local first = assign.first_stop
 	if first == nil then first = -1 end
+	local lineOk, line = pcall(ownOf, ctx, "lines", assign.line)
+	if not lineOk then
+		local lineRead, nativeLine = pcall(entityOf, ctx, "lines", assign.line)
+		if not lineRead then nativeLine = nil end
+		for _, vehicleId in ipairs(assign.vehicles) do
+			local vehicleRead, nativeVehicle = pcall(entityOf, ctx, "vehicles", vehicleId)
+			if not vehicleRead then nativeVehicle = nil end
+			pcall(diagnosticVehicleAssignment, ctx, vehicleId, nativeVehicle, assign.line, nativeLine, first, "refused")
+		end
+		error(line, 0)
+	end
 	for _, v in ipairs(assign.vehicles) do
-		local entity = ownOf(ctx, "vehicles", v)
-		vehicleActionState(entity, v, "before-assign", assign.line, first)
-		run(api.cmd.makeVehicleSetLineCmd(entity, line, first))
-		vehicleActionState(entity, v, "after-assign", assign.line, first)
+		local vehicleOk, entity = pcall(ownOf, ctx, "vehicles", v)
+		if not vehicleOk then
+			local vehicleRead, nativeVehicle = pcall(entityOf, ctx, "vehicles", v)
+			if not vehicleRead then nativeVehicle = nil end
+			pcall(diagnosticVehicleAssignment, ctx, v, nativeVehicle, assign.line, line, first, "refused")
+			error(entity, 0)
+		end
+		local sent, result = pcall(function()
+			return run(api.cmd.makeVehicleSetLineCmd(entity, line, first))
+		end)
+		pcall(diagnosticVehicleAssignment, ctx, v, entity, assign.line, line, first,
+			sent and result == true and "applied" or "refused")
+		if not sent then error(result, 0) end
 	end
 	return true
 end
@@ -2298,7 +3475,7 @@ function HANDLERS.Subsidy(op, ctx)
 		local ok, why = companiesModule.acceptSubsidy(roster, mine.id, op.Accept, state,
 			event("onAccept", op.Accept), send, api)
 		if not ok then return false, why end
-		log("subsidy " .. string.format("%d", op.Accept.uid) .. " (" .. tostring(op.Accept.kind) .. ") taken by "
+		log("subsidy " .. string.format("%.0f", op.Accept.uid) .. " (" .. tostring(op.Accept.kind) .. ") taken by "
 			.. tostring(mine.name))
 		return true
 	elseif op.Decline then
@@ -2420,6 +3597,84 @@ function HANDLERS.Preserve(p)
 	return run(api.cmd.makeTownBuildingSetBlockedDevelopmentCmd(building, p.preserved == true))
 end
 
+-- A level crossing's type, from its window (tpf3mp/crossings.lua): the one
+-- crossing whose nodes are exactly where the action names them, if the
+-- acting company may change it (its own or no one's: the crossing and every
+-- road and track of it, an owner that does not read refused), takes the type
+-- as the window gives it: an empty build the hook fills with the crossing
+-- and type (crates/tpf3mp-hook/src/crossings.rs). The type is read back:
+-- unchanged, the game did not take it (the same in every game); anything
+-- else, or no crossing left, stops the replay, as the worlds may differ.
+function HANDLERS.SetCrossingType(change)
+	local crossings = module("crossings")
+	local entity, c = crossings.resolve(change.nodes)
+	local index = crossings.typeIndex(change.crossing_type)
+	local PLAYER_OWNED = api.type.ComponentType.PLAYER_OWNED
+	local function may(e, what)
+		local read = pcall(function()
+			local owned = api.engine.getComponent(e, PLAYER_OWNED)
+			return owned and owned.player
+		end)
+		if not read then error("the owner of the " .. what .. " does not read", 0) end
+		mine(e, what)
+	end
+	may(entity, "level crossing")
+	local edges = c.edges
+	for i = 1, (edges and #edges or 0) do may(edges[i], "level crossing's road or track") end
+	local before = c.typeIndex
+	if before == index then
+		log("crossing " .. tostring(entity) .. " is of type " .. tostring(change.crossing_type) .. " already")
+		return true
+	end
+	local _, nodes = crossings.places(c)
+	-- The game's script API reaches only node2rcType, which types the
+	-- crossings a proposal lays anew; the window retypes one in place
+	-- through a map of its own (crossing -> type), which the hook fills in
+	-- an empty build here, as the window's own (docs/HOOKS.md, "Level
+	-- crossing types").
+	if type(apply.crossing) ~= "function" then error("this hook cannot set a crossing's type", 0) end
+	local context = api.type.Context.new()
+	context.player = company()
+	-- What the change cost the company, for the log: the same in every game.
+	local function balance()
+		local ok, account = pcall(api.engine.getComponent, context.player, api.type.ComponentType.ACCOUNT)
+		local value = ok and account and account.balance
+		return type(value) == "number" and value or nil
+	end
+	local paidFrom = balance()
+	local command = api.cmd.makeWorldBuildProposalCmd(api.type.Proposal.new(), context, true, true)
+	-- Armed for this one build only: disarmed whatever becomes of it, so no
+	-- later build of the room's is filled with it.
+	local armed, why = apply.crossing(entity, index)
+	if armed ~= true then
+		apply.crossing(nil)
+		error("the hook would not take the crossing: " .. tostring(why), 0)
+	end
+	local sent, err = pcall(run, command)
+	local filled = apply.crossing(nil)
+	if not sent then error(err, 0) end
+	if filled ~= true then error("the hook filled no build with the crossing", 0) end
+	-- What the game made of it: the crossing on the same nodes, which the
+	-- game makes anew (it removes the old one and adds one of the type).
+	local okAfter, after = pcall(api.engine.system.railRoadCrossingSystem.getRailroadCrossingForNode, nodes[1])
+	local now = okAfter and crossings.component(after)
+	if not now then
+		error({ replayFatal = "level crossing " .. tostring(entity) .. " is gone after its type change" }, 0)
+	end
+	if now.typeIndex == before then
+		error("the game did not change the crossing's type", 0)
+	end
+	if now.typeIndex ~= index then
+		error({ replayFatal = "level crossing " .. tostring(entity) .. " took type " .. tostring(now.typeIndex)
+			.. ", not " .. tostring(change.crossing_type) }, 0)
+	end
+	local paidTo = balance()
+	local paid = (paidFrom and paidTo) and string.format("%.0f", paidFrom - paidTo) or "?"
+	log("crossing " .. tostring(entity) .. " (now " .. tostring(after) .. ") set to type "
+		.. tostring(change.crossing_type) .. ", the company paid " .. paid)
+	return true
+end
+
 -- The room's companies (tpf3mp/companies.lua): the acting player founds,
 -- joins, renames, recolours or dissolves one, and its head locks it, sends a
 -- player out or shares its stations, in `ctx.roster`; `ctx.seal` is the
@@ -2465,13 +3720,78 @@ function HANDLERS.ApplyRank(r, ctx)
 	return run(event())
 end
 
+local COMPANY_OPERATIONS = {
+	"Create", "Join", "Rename", "Recolor", "Delete", "Lock", "Unlock", "Dismiss",
+	"ShareStations", "StationAccess",
+}
+
+local function diagnosticCompanyOperation(op)
+	for _, name in ipairs(COMPANY_OPERATIONS) do
+		local _, status = diagnosticField(op, name)
+		if status == "value" then return name end
+	end
+	return "other"
+end
+
+local function diagnosticOrderedModels(buy)
+	local consist, status = diagnosticField(buy, "consist")
+	if status ~= "value" then return status end
+	local length = diagnosticSequenceLength(consist)
+	if length == nil then return "unavailable" end
+	if length == 0 then return "none" end
+	local names = {}
+	local count = math.min(length, 8)
+	for i = 1, count do
+		local part, partStatus = diagnosticField(consist, i)
+		local model, modelStatus = diagnosticField(part, "model")
+		if partStatus ~= "value" then
+			names[#names + 1] = partStatus
+		elseif modelStatus == "value" and type(model) == "string" and model ~= "" then
+			names[#names + 1] = diagnosticToken(model)
+		else
+			names[#names + 1] = modelStatus
+		end
+	end
+	if length > count then names[#names + 1] = "+" .. tostring(length - count) end
+	return table.concat(names, ",")
+end
+
+-- Called by the simulation after the registry has seen the command result.
+-- Only the ordered resource names and native/canonical result IDs are kept;
+-- the action, consist configuration, and command result are never serialized.
+function apply.vehicleBuyDiagnostic(buy, applied, entity, canonical, canonicalStatus, actionIndex)
+	local outcome = applied == true and "applied" or "refused"
+	local native = entity == nil and "none" or diagnosticEntity(entity)
+	local canonicalText = "unavailable"
+	if canonicalStatus == "none" then
+		canonicalText = "none"
+	elseif canonicalStatus == "value" then
+		canonicalText = diagnosticEntity(canonical)
+	end
+	return "buy-vehicle action_index=" .. diagnosticEntity(actionIndex)
+		.. " outcome=" .. outcome .. " models=" .. diagnosticOrderedModels(buy)
+		.. " native=" .. native .. " canonical=" .. canonicalText
+end
+
+local function diagnosticOutcome(ok, applied)
+	if not ok and type(applied) == "table" and applied.replayFatal then return "uncertain" end
+	if ok and applied == true then return "applied" end
+	return "refused"
+end
+
+local function diagnosticLog(line)
+	pcall(log, line)
+end
+
 -- Runs one action. `ctx` is { registry = } (tpf3mp/registry.lua), for the
 -- actions that name vehicles, lines and station groups; with companies, also
 -- `roster`, `player` (who sent it) and `company` (their company's player
 -- entity), which the action is booked to, and `progression`, the companies'
 -- ranks (tpf3mp/progression.lua). Returns true, nil
 -- and the entity it made or changed (for the kinds in CREATES and KEEPS,
--- where the game said), or false and why not; never raises.
+-- where the game said), or false and why not; never raises. A fourth true
+-- marks a post-command read failure: the caller must stop ordered replay
+-- before persisting any inferred registry mapping.
 function apply.run(action, ctx)
 	if type(action) ~= "table" then return false, "an action is a table" end
 	local allowed, why = acceptance.check(action)
@@ -2484,9 +3804,42 @@ function apply.run(action, ctx)
 	if handler == nil then
 		return false, "this version of the mod does not apply " .. tostring(kind) .. " yet"
 	end
+	local actorBefore, localBefore = "unavailable", "unavailable"
+	if kind == "CompanyOp" then
+		local readActor, valueActor = pcall(diagnosticActor, ctx and ctx.roster, ctx and ctx.player)
+		local readLocal, valueLocal = pcall(diagnosticLocal, ctx and ctx.roster)
+		if readActor then actorBefore = valueActor end
+		if readLocal then localBefore = valueLocal end
+	end
 	acting = ctx
+	costStart(kind)
 	local ok, applied, detail = pcall(handler, body, ctx)
+	local cost = costEnd()
 	acting = nil
+	if cost and cost.ms >= apply.SLOW_MS then
+		local parts = apply.costText(cost)
+		log(string.format("applying %s took %.1f ms", kind, cost.ms) .. (parts ~= "" and (": " .. parts) or ""))
+	end
+	local outcome = diagnosticOutcome(ok, applied)
+	if kind == "CompanyOp" then
+		local actorAfter, localAfter = "unavailable", "unavailable"
+		local readActor, valueActor = pcall(diagnosticActor, ctx and ctx.roster, ctx and ctx.player)
+		local readLocal, valueLocal = pcall(diagnosticLocal, ctx and ctx.roster)
+		if readActor then actorAfter = valueActor end
+		if readLocal then localAfter = valueLocal end
+		local readOp, operation = pcall(diagnosticCompanyOperation, body)
+		if not readOp then operation = "other" end
+		diagnosticLog("company-event action_index=" .. diagnosticActionIndex(ctx) .. " op=" .. operation
+			.. " actor_before=" .. actorBefore .. " actor_after=" .. actorAfter
+			.. " local_before=" .. localBefore .. " local_after=" .. localAfter
+			.. " outcome=" .. outcome)
+	elseif kind == "AssignLine" or kind == "Bulldoze" then
+		diagnosticLog("action-event action_index=" .. diagnosticActionIndex(ctx) .. " kind=" .. kind
+			.. " outcome=" .. outcome)
+	end
+	if not ok and type(applied) == "table" and applied.replayFatal then
+		return false, applied.replayFatal, nil, true
+	end
 	if not ok then return false, tostring(applied) end
 	if applied == true then return true, nil, detail end
 	return false, detail
@@ -2510,7 +3863,9 @@ function apply.proposalOf(action, ctx)
 	local allowed, why = acceptance.check(action)
 	if not allowed then return nil, why end
 	dry, acting = true, ctx
+	costStart(kind)
 	local ok, stopped = pcall(HANDLERS[kind], body, ctx)
+	costEnd()
 	dry, acting = false, nil
 	if not ok and type(stopped) == "table" and stopped.proposal ~= nil then
 		return stopped.proposal, stopped.context

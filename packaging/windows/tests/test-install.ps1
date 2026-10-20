@@ -38,9 +38,12 @@ function New-Setup([string]$Name) {
     $game = Join-Path $library 'steamapps\common\Transport Fever 3'
     Write-File (Join-Path $game 'TransportFever3.exe') 'exe'
     $escaped = $library.Replace('\', '\\')
-    # Steam still lists a library on a drive that is gone, before the game's.
+    # Steam still lists a library on a drive that is gone and one on a
+    # network share that cannot be reached (.invalid never resolves),
+    # before the game's.
     $gone = [string](@([char[]]'ZYXWVUTSRQPONMLKJIHGFE' | Where-Object { -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue) })[0]) + ':\\SteamLibrary'
-    Write-File (Join-Path $steam 'steamapps\libraryfolders.vdf') "`"libraryfolders`"`n{`n`t`"0`"`n`t{`n`t`t`"path`"`t`t`"$gone`"`n`t}`n`t`"1`"`n`t{`n`t`t`"path`"`t`t`"$escaped`"`n`t}`n}`n"
+    $offline = '\\\\tpf3mp-offline.invalid\\SteamLibrary'
+    Write-File (Join-Path $steam 'steamapps\libraryfolders.vdf') "`"libraryfolders`"`n{`n`t`"0`"`n`t{`n`t`t`"path`"`t`t`"$gone`"`n`t}`n`t`"1`"`n`t{`n`t`t`"path`"`t`t`"$offline`"`n`t}`n`t`"2`"`n`t{`n`t`t`"path`"`t`t`"$escaped`"`n`t}`n}`n"
     Write-File (Join-Path $library 'steamapps\appmanifest_3493540.acf') "`"AppState`"`n{`n`t`"appid`"`t`t`"3493540`"`n`t`"installdir`"`t`t`"Transport Fever 3`"`n}`n"
     $mods = Join-Path $steam 'userdata\12345\3493540\local\staging_area'
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $mods) | Out-Null
@@ -160,6 +163,38 @@ Test 'converts extended UNC paths without dropping the server or share' {
     Check ((Convert-InstallerPath 'C:\Steam\staging_area') -eq 'C:\Steam\staging_area') 'ordinary drive unchanged'
 }
 
+Test 'removes a folder whose file another program holds for a moment' {
+    # Load just the helper, as an antivirus scanning a fresh copy would
+    # hold one of its files open for a second.
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$tokens, [ref]$parseErrors)
+    $helper = $ast.Find({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Remove-Retrying'
+    }, $true)
+    . ([scriptblock]::Create($helper.Extent.Text))
+    $dir = Join-Path $Root 'held'
+    Write-File "$dir\a.lua" 'a'
+    Write-File "$dir\res\b.lua" 'b'
+    $ready = "$dir.ready"
+    $holder = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @(
+        '-NoProfile', '-Command',
+        "`$h = [IO.File]::Open('$dir\res\b.lua', 'Open', 'Read', 'Read'); [IO.File]::WriteAllText('$ready', ''); Start-Sleep -Milliseconds 1500; `$h.Dispose()")
+    try {
+        $deadline = (Get-Date).AddSeconds(30)
+        while (-not (Test-Path $ready)) {
+            Check ((Get-Date) -lt $deadline) 'the holder started'
+            Start-Sleep -Milliseconds 100
+        }
+        Remove-Retrying $dir
+        Check (-not (Test-Path $dir)) 'the folder removed once the file is free'
+    }
+    finally {
+        Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Test 'refuses a record that names anything but the mod' {
     $s = New-Setup 'record'
     Assert-Code (Invoke-Installer $s @()) 0
@@ -168,6 +203,39 @@ Test 'refuses a record that names anything but the mod' {
         Assert-Code (Invoke-Installer $s @('-Uninstall')) 1
         Assert-Code (Invoke-Installer $s @()) 1
         Check ((Read-File "$($s.Mods)\tpf3mp_1\mod.lua") -eq '-- mod') "the mod untouched with $bad"
+    }
+}
+
+Test "installs into a mods folder given when Steam's folder is on a share that cannot be reached" {
+    $s = New-Setup 'offline steam'
+    $s.Steam = '\\tpf3mp-offline.invalid\Steam'
+    Assert-Code (Invoke-Installer $s @($s.Mods)) 0
+    Check ((Read-File "$($s.Mods)\tpf3mp_1\res\x.lua") -eq '-- x') 'the mod installed'
+}
+
+Test 'does not treat an unexpected Steam path inspection error as a missing path' {
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$tokens, [ref]$parseErrors)
+    $helper = $ast.Find({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Test-LibraryPath'
+    }, $true)
+    . ([scriptblock]::Create($helper.Extent.Text))
+
+    $oldFunction = Get-Item Function:\Test-Path -ErrorAction SilentlyContinue
+    Set-Item Function:\Test-Path -Value {
+        throw [System.IO.IOException]::new('Inspection failed.', [System.ComponentModel.Win32Exception]::new(5))
+    }
+    try {
+        $propagated = $false
+        try { $null = Test-LibraryPath 'C:\private\Steam' Container }
+        catch [System.IO.IOException] { $propagated = $true }
+        Check $propagated 'an unexpected path inspection error propagates'
+    }
+    finally {
+        if ($oldFunction) { Set-Item Function:\Test-Path -Value $oldFunction.ScriptBlock }
+        else { Remove-Item Function:\Test-Path -ErrorAction SilentlyContinue }
     }
 }
 
@@ -190,6 +258,92 @@ Test 'puts everything back when a step fails' {
     Assert-Code (Invoke-Installer $s @()) 1
     Check ((Read-File "$($s.Mods)\tpf3mp_1\mod.lua") -eq '-- mod') 'the installed mod put back'
     Check (@(Get-ChildItem $s.Mods -Force).Count -eq 1) 'nothing left over'
+}
+
+# Updates and uninstalls with a file of the installed mod held open, the way
+# an editor or a console standing in its folder holds it, then without.
+function Assert-OpenFileRefused($Setup) {
+    Assert-Code (Invoke-Installer $Setup @()) 0
+    Write-File "$($Setup.Package)\mod\tpf3mp_1\mod.lua" '-- new'
+    $open = [IO.File]::Open("$($Setup.Mods)\tpf3mp_1\res\x.lua", 'Open', 'Read', 'Read')
+    $backupRoot = Join-Path $Setup.Data 'TPF3-MP\backups'
+    $backupRootExistedBefore = Test-Path -LiteralPath $backupRoot -PathType Container
+    $backupNamesBefore = @()
+    if ($backupRootExistedBefore) {
+        $backupNamesBefore = @(Get-ChildItem -LiteralPath $backupRoot -Directory | Select-Object -ExpandProperty Name)
+    }
+    try {
+        foreach ($uninstall in @($false, $true)) {
+            $result = Invoke-Installer $Setup @(if ($uninstall) { '-Uninstall' })
+            Assert-Code $result 1
+            Check ($result.Output -match 'close it, then try again') "says to close what has it open: $($result.Output)"
+            Check ($result.Output -match 'Nothing was changed') "says nothing was changed: $($result.Output)"
+            Check ((Read-File "$($Setup.Mods)\tpf3mp_1\mod.lua") -eq '-- mod') "the installed mod untouched (uninstall: $uninstall)"
+            Check (Test-Path "$($Setup.Mods)\tpf3mp_1\res\x.lua") "the open file still there (uninstall: $uninstall)"
+            Check (Test-Path $Setup.Record) 'the record kept'
+            Check ((Test-Path -LiteralPath $backupRoot -PathType Container) -eq $backupRootExistedBefore) "backup folder existence unchanged (uninstall: $uninstall)"
+            $backupNamesAfter = @()
+            if ($backupRootExistedBefore) {
+                $backupNamesAfter = @(Get-ChildItem -LiteralPath $backupRoot -Directory | Select-Object -ExpandProperty Name)
+            }
+            Check (($backupNamesAfter -join '|') -eq ($backupNamesBefore -join '|')) "no backup directory left by the refused move (uninstall: $uninstall)"
+        }
+    }
+    finally {
+        $open.Dispose()
+    }
+    Check (@(Get-ChildItem $Setup.Mods -Force).Count -eq 1) 'nothing left over in the mods folder'
+    Assert-Code (Invoke-Installer $Setup @()) 0
+    Check ((Read-File "$($Setup.Mods)\tpf3mp_1\mod.lua") -eq '-- new') 'updated once the file is closed'
+    Check (@(Get-ChildItem -Recurse -Filter 'mod.lua' "$($Setup.Data)\TPF3-MP\backups" | Where-Object { (Read-File $_.FullName) -eq '-- mod' }).Count -eq 1) 'the old mod in the backups'
+    Check (@(Get-ChildItem $Setup.Mods -Force).Count -eq 1) 'nothing left over after the update'
+}
+
+Test 'changes nothing while a file in the installed mod is open' {
+    Assert-OpenFileRefused (New-Setup 'open file')
+}
+
+Test 'changes nothing while a file in the installed mod is open, on another drive than the backups' {
+    $s = New-Setup 'other drive'
+    # A drive letter of its own for the Steam folder, so moving into the
+    # backups crosses drives and has to copy.
+    $letter = [string](@([char[]]'ZYXWVUTSRQPONMLKJIHGFE' | Where-Object { -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue) })[0]) + ':'
+    subst $letter (Split-Path -Parent $s.Steam)
+    Check ($LASTEXITCODE -eq 0) "subst $letter"
+    try {
+        $s.Steam = "$letter\Steam"
+        $s.Mods ="$letter\Steam\userdata\12345\3493540\local\staging_area"
+        Assert-OpenFileRefused $s
+    }
+    finally {
+        subst $letter /D
+    }
+}
+
+Test 'changes nothing while a file in the installed mod is open, with the backups on another volume behind a junction' {
+    # A rename does not cross volumes even where the drive letters match,
+    # as with an AppData moved to another disk. Needs a folder on another
+    # volume: TPF3MP_TEST_OTHER_VOLUME, or the CI runner's own temp folder.
+    $other = $env:TPF3MP_TEST_OTHER_VOLUME
+    if (-not $other -and $env:RUNNER_TEMP -and [IO.Path]::GetPathRoot($env:RUNNER_TEMP) -ne [IO.Path]::GetPathRoot($Root)) { $other = $env:RUNNER_TEMP }
+    if (-not $other) {
+        Write-Host '     skipped: no folder on another volume (set TPF3MP_TEST_OTHER_VOLUME)'
+        return
+    }
+    $s = New-Setup 'junction'
+    $far = Join-Path $other ('tpf3mp-install-test-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $far | Out-Null
+    cmd /c mklink /J "$($s.Data)" "$far" | Out-Null
+    Check ($LASTEXITCODE -eq 0) "a junction to $far"
+    try {
+        Assert-OpenFileRefused $s
+    }
+    finally {
+        # Not through Remove-Item: Windows PowerShell deletes what a
+        # junction points to.
+        cmd /c rmdir "$($s.Data)" | Out-Null
+        Remove-Item -LiteralPath $far -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Test 'refuses while the game runs' {

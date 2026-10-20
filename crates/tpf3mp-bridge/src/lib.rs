@@ -82,7 +82,10 @@ pub use session::{Begin, Game, Load, Notice, SaveOrder, Session, SessionError, S
 /// listed server in [`LobbyAction::Join`]; 28 the release's trusted servers
 /// in [`LobbyView::servers`] before a room list
 /// is fetched, so the game's invite form can ask for an explicit region.
-pub const BRIDGE_VERSION: u32 = 29;
+/// Upstream version 29 carries the agreed world-check scan plan in
+/// [`ToHook::Begin`]; ReedME version 29 carried room identity and producing-world
+/// epochs instead. Version 30 combines both incompatible layouts.
+pub const BRIDGE_VERSION: u32 = 30;
 /// Most servers the room list names ([`LobbyRoomList::servers`]).
 pub const MAX_LOBBY_SERVERS: usize = 8;
 /// The link name the agent creates and the hook opens, unless told
@@ -108,6 +111,7 @@ pub enum ToHook {
     /// own commands by it when the room orders them.
     Begin {
         room: tpf3mp_proto::RoomId,
+        scan_plan: tpf3mp_proto::ScanPlan,
         rules: RulesName,
         steps_per_second: u16,
         checkpoint_interval: u32,
@@ -1017,7 +1021,12 @@ mod tests {
 
     #[test]
     fn only_the_same_version_is_accepted() {
+        assert_eq!(BRIDGE_VERSION, 30);
         assert!(check_version(BRIDGE_VERSION).is_ok());
+        assert!(
+            check_version(29).is_err(),
+            "both incompatible version-29 layouts are refused"
+        );
         assert!(check_version(BRIDGE_VERSION + 1).is_err());
     }
 }
