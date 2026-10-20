@@ -1,5 +1,5 @@
 {
-  "recorded_utc": "2026-10-20T09:03:20.053435+00:00",
+  "recorded_utc": "2026-10-20T09:12:00.561204+00:00",
   "fork_baseline": "9261e8eafd4cec315c2c91d817533ceabefc3b28",
   "shared_baseline": "538733611cc5e4c8ea30d48513d5b0df761db05a",
   "upstream_dev": "02829e3608011351789b6ca0117093177f64b201",
@@ -10,7 +10,7 @@
   "action_schema_version": 28,
   "lua_contract_version": 15,
   "room_log_format": 11,
-  "code_tree_sha256": "d47ee117ac19e4771bdbad1a27ce17c32f3288627ef32a87138a5ea24ad56d77",
+  "code_tree_sha256": "16e84ad4d0c63b951fcc7ad026b3304d804e580f3a2606684529e5dff78e2388",
   "code_tree_hash_scope": "Sorted tracked and nonignored task files under crates/, mod/, profiles/, tools/, .github/, deploy/, packaging/, plus root Cargo.toml, Cargo.lock and rust-toolchain.toml; path NUL raw SHA256 digest for each file.",
   "local_checks": {
     "workspace_tests": {
@@ -30,6 +30,13 @@
     },
     "pending_offer_regression_fails_without_new_guard": true,
     "loan_fixture_unequal_cooldown_reproduction_and_boundaries": true,
+    "unix_installer_cases": {
+      "passed": 7,
+      "failed": 0,
+      "multicall_original_failure_reproduced": true,
+      "multicall_repaired_suite_passed": true,
+      "production_installer_unchanged": true
+    },
     "tpfre": {
       "passed": 49,
       "failed": 0,
@@ -230,8 +237,8 @@
   },
   "local_evidence": {
     "target/reedme-oct20-final-workspace-tests.log": {
-      "sha256": "8c3ec2b52399a49cfcc5df591fec0ddccaa46fd509201226188bd48fdb992885",
-      "bytes": 171022
+      "sha256": "c2d986173fc2aa440bd568fd8b92cdc1fe0d4f603ab2f30cea7a61806df9c08b",
+      "bytes": 171604
     },
     "/tmp/tpf3mp-pending-offer-regression.log": {
       "sha256": "edadf01f749820c5e72de7076abc757f6a93115a742ba58b50cab17c020e1669",
@@ -245,9 +252,21 @@
       "sha256": "9e67b2068b2e30979ca985a06bca91c823ee757ca198ec471687af5ceb948fb5",
       "bytes": 27081
     },
+    "target/reedme-oct20-unix-installer-fixture.log": {
+      "sha256": "3ccaf79a2678f5cf40c1a6482c547ca1fe32f1a8f41fa89d7d6f7993e6f06562",
+      "bytes": 497
+    },
+    "target/reedme-coreutils-compat/baseline.log": {
+      "sha256": "9612bd99a7d4e2b53fd837101ca5392407c017f154719234f6ee5ae6c3d30eca",
+      "bytes": 1212
+    },
+    "target/reedme-coreutils-compat/fixed.log": {
+      "sha256": "f5ff8068289d75fc0a83171cdbd48c8f65c7db8db94faf8b473bdc4ea28457d0",
+      "bytes": 497
+    },
     "target/reedme-oct20-final-linux-clippy.log": {
-      "sha256": "d8bff8ede68f3ff0a7faa86d14aa1f018ec0584733b48d173e83cc249b79aa34",
-      "bytes": 183
+      "sha256": "6c9e74bbb126ef412cf4011eb8f43a7585dfadb262eddddf49729bc52b1be743",
+      "bytes": 764
     },
     "target/reedme-oct20-final-windows-clippy.log": {
       "sha256": "6e8f414513989d7523579b8cdcc04c52b4bf3b510f829b08393abca55af32256",

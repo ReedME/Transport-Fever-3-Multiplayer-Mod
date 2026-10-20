@@ -43,6 +43,13 @@ boundary, first-company-only refresh and eventual second-company refresh.
 Forged-offer, native-offer preservation, single-booking and company-isolation
 assertions remain. Production finance code was unchanged by this correction.
 
+Hosted Ubuntu 26.04 exposed another fixture assumption: its multicall
+`sleep` exits if copied under an arbitrary basename. The installer test now
+keeps the `sleep` name, proves the simulated game's PID and command path are
+live, and retains the running-game refusal and no-mutation assertions. All
+seven cases pass locally; an isolated multicall simulator reproduces the old
+failure and passes with the repair. Installer production behavior is unchanged.
+
 ## Wire, persistence and governance
 
 The candidate uses protocol **24**, IPC bridge **30**, action schema **28**,

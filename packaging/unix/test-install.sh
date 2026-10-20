@@ -155,13 +155,24 @@ says_when_steam_has_no_mods_folder() {
 
 refuses_while_the_game_runs() {
   setup running
-  cp "$(command -v sleep)" "$GAME/Running"
-  "$GAME/Running" 30 &
+  # Multicall coreutils (Ubuntu 26.04) dispatches by argv[0], so keep the
+  # sleep basename. The installer checks the game folder, not its name.
+  cp "$(command -v sleep)" "$GAME/sleep"
+  "$GAME/sleep" 30 &
   local game=$!
+  trap "kill $game 2>/dev/null || true; wait $game 2>/dev/null || true" EXIT
   sleep 0.5
+  OUTPUT="fake game pid=$game executable=$GAME/sleep"
+  check 'the fake game remains running' kill -0 "$game"
+  local command
+  command=$(ps -p "$game" -o args=)
+  OUTPUT="fake game pid=$game command=$command"
+  check 'the fake game is visible under its game folder' test "$command" = "$GAME/sleep 30"
+  printf '%s\n' "$OUTPUT"
   install
   kill "$game" 2>/dev/null || true
   wait "$game" 2>/dev/null || true
+  trap - EXIT
   check 'refused' code 1
   check 'says to close the game' grep -q 'Close Transport Fever 3' <<<"$OUTPUT"
   check 'no mod' [ ! -e "$MODS/tpf3mp_1" ]
